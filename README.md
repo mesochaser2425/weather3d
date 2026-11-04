@@ -1,25 +1,29 @@
 # Weather3D
 
-A 3D weather simulation that runs in your browser, on your own graphics card. Choose any place on Earth and a month, then watch fronts, thunderstorms, clouds, rain and snow develop over the real terrain, for days or years of simulated time.
+A while ago, I was sitting with my friend, pondering if there was any possibility of creating something like Niels Daemen's "2D Weather Sandbox" but in 3D. It seemed to me that it was pretty much impossible, especially at the time we were talking. The biggest obstacle was, of course, the fact that I have close to no knowledge of professional programming. So while I have my own negative thoughts about AI usage in most cases, I felt that this was the right thing to use it on.
 
-**[▶ Open Weather3D](https://mesochaser2425.github.io/weather3d/)** – nothing to install, no account.
+It goes without saying that this project is funded 100% out of my own pocket, and it is free to use or edit in any way, shape or form. I have always believed in open-source science, and anything made with AI in particular should not be monetized.
 
-You need a current Chrome or Edge on a computer with a WebGPU graphics card; it is not made for phones. All the computing happens on your machine, so speed depends on your card. On an RTX 5060 Ti, a simulated day on a 500 × 500 km map takes about 20 s at maximum speed. Starting takes about a minute.
+Now you can check out the simulation for yourself. It's still in its early form, so expect bugs (which I am happy to hear about).
+
+**[▶ Open Weather3D](https://mesochaser2425.github.io/weather3d/)** – here you can open the simulation in your browser.
+
+You need a current Chrome or Edge on a computer with a WebGPU graphics card; it will not work on phones. All the computing happens on your PC, so the simulation speed will depend on your card. On my RTX 5060 Ti, a simulated day on a 500 × 500 km map takes about 20 s at maximum speed. Starting takes a minute or so.
 
 ![The satellite view of a simulated summer day over southern Poland and the Tatra Mountains](docs/screenshot.png)
 
-The weather is simulated, not forecast. The model creates its own weather that fits the place and the season; it does not use current observations.
+All of the weather is simulated by a separate synoptic model. It creates weather that fits the place and the season, and it does not use current observations.
 
-## What you can do
+## Features
 
-- Pick the area on a terrain map, from 5 km to a few thousand kilometres across, and the start month.
-- Switch between map layers: temperature, rain and snow, radar, satellite images, wind, CAPE, soil, snow cover and many more.
-- Look at the clouds in a 3D view and fly through them.
-- Read soundings, hodographs and vertical cross-sections, or place weather stations and save their data as CSV.
-- Compare months, seasons and years in the climate analysis.
-- Paint terrain, water and surface types while the simulation runs; save the state to a file or a link.
+- You can pick the starting area on a terrain map, change its size and pick the starting month.
+- Switch between map layers like temperature, rain and snow, radar, satellite images, wind, CAPE, soil, snow cover and many more.
+- Look at the clouds in a 3D view and fly through them. I must note that the cloud system is still a little bit janky.
+- Dynamic soundings, hodographs and vertical cross-sections. Weather stations that record the data, with an easy-to-use CSV export system.
+- You can compare months, seasons and years in the climate analysis tab.
+- If you don't want real terrain, you can paint it, as well as water and surface types, while the simulation runs. You can also save the state to a file or a link.
 
-## Run it yourself
+## If you want to run it locally
 
 Requires Node.js 20.19 or newer.
 
@@ -32,7 +36,7 @@ On Windows you can double-click `start.bat` instead. `npm run build` creates a s
 
 Map data comes straight from the providers listed below, so terrain and land cover need an internet connection. The climate data is built in.
 
-## How it works
+## How does it work?
 
 The simulation runs in WebGPU compute shaders. Grid spacing ranges from 100 m to 25 km, with 50 vertical levels up to 20 km by default.
 
