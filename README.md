@@ -10,7 +10,24 @@ Now you can check out the simulation for yourself. It's still in its early form,
 
 You need a current Chrome or Edge on a computer with a WebGPU graphics card; it will not work on phones. All the computing happens on your PC, so the simulation speed will depend on your card. On my RTX 5060 Ti, a simulated day on a 500 × 500 km map takes about 20 s at maximum speed. Starting takes a minute or so.
 
-![The satellite view of a simulated summer day over southern Poland and the Tatra Mountains](docs/screenshot.png)
+<table>
+  <tr>
+    <td width="50%"><img src="docs/satellite.png" alt="Simulated clouds over Poland, seen as a satellite image"></td>
+    <td width="50%"><img src="docs/temperature.png" alt="Map of the air temperature near the ground over Poland, with isotherms"></td>
+  </tr>
+  <tr>
+    <td>Satellite view</td>
+    <td>Temperature near the ground</td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/surface.png" alt="Map of the surface type over Poland: fields, forests, towns and the Baltic Sea"></td>
+    <td width="50%"><img src="docs/view3d.png" alt="3D view of the sky above a hazy landscape with cloud shadows on the ground"></td>
+  </tr>
+  <tr>
+    <td>Surface type</td>
+    <td>3D view</td>
+  </tr>
+</table>
 
 All of the weather is simulated by a separate synoptic model. It creates weather that fits the place and the season, and it does not use current observations.
 
