@@ -1,0 +1,800 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Weather3D</title>
+  <link rel="icon" type="image/svg+xml" href="/logo-icon.svg" />
+  <style>
+    /* czcionka z projektu użytkownika (Jura, SIL OFL – public/fonts/OFL-Jura.txt) */
+    @font-face { font-family: 'Jura'; font-style: normal; font-display: swap; font-weight: 300 700; src: url(/fonts/jura-latin-ext-wght-normal.woff2) format('woff2');
+      unicode-range: U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF; }
+    @font-face { font-family: 'Jura'; font-style: normal; font-display: swap; font-weight: 300 700; src: url(/fonts/jura-latin-wght-normal.woff2) format('woff2');
+      unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD; }
+    /* paleta z projektu użytkownika (Figma): tło #1E1E1E, panele #0C0C27, wnętrza #000012, kafle #D9D9D9, podpisy kafli #005D63;
+       akcent – fiolet z logo (#4F46E5 … #6366F1) */
+    :root {
+      color-scheme: dark;
+      --bg: #1e1e1e; --panel: #0c0c27; --panel2: #000012; --panel3: #1b1b42; --line: #22224a; --line2: #38386e;
+      --text: #f1f2f8; --muted: #a2a7c0; --dim: #6f7596; --accent: #818cf8; --accent2: #4f46e5;
+      --tile: #d9d9d9; --tile-hi: #efefef; --tile-ink: #005d63;
+      --warn: #ffb547; --err: #ff7a7a; --ok: #5fd17a; --radius: 10px; --shadow: 0 10px 30px rgba(0,0,0,.45);
+      --top: 50px; --rail: 94px; --drawer: 384px; --ana: 440px;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; }
+    body { background: var(--bg); color: var(--text); font: 500 13px/1.42 'Jura', 'Segoe UI', system-ui, -apple-system, sans-serif;
+      accent-color: var(--accent2); overflow: hidden; }
+    button, select, input { font: inherit; color: inherit; }
+    b { font-weight: 700; }
+
+    /* ---------- górny pasek ---------- */
+    #top { height: var(--top); display: flex; align-items: center; gap: 12px; padding: 0 14px; background: var(--panel);
+      position: relative; z-index: 20; }
+    #brand { width: calc(var(--rail) - 26px); flex: none; display: flex; justify-content: center; }
+    #brand img { display: block; width: 36px; height: 36px; }
+    #clock { display: flex; align-items: baseline; gap: 10px; padding: 3px 12px; background: var(--panel2); }
+    #clockTime { font: 600 22px/1 ui-monospace, "Cascadia Mono", Consolas, monospace; letter-spacing: .02em; }
+    #clockDate { color: var(--muted); white-space: nowrap; }
+    #clockSun { color: var(--warn); font-weight: 700; white-space: nowrap; }
+    .seg { display: inline-flex; background: var(--panel2); overflow: hidden; }
+    .seg button { border: 0; background: transparent; padding: 5px 11px; cursor: pointer; color: var(--muted); white-space: nowrap; }
+    .seg button + button { border-left: 1px solid var(--line); }
+    .seg button:hover { color: var(--text); background: var(--panel3); }
+    .seg button.on { background: var(--tile); color: var(--tile-ink); font-weight: 700; }
+    .iconbtn { border: 0; background: var(--panel2); padding: 5px 11px; cursor: pointer; white-space: nowrap; }
+    .iconbtn:hover { background: var(--panel3); }
+    .iconbtn.sm { padding: 3px 9px; font-size: 12px; }
+    .iconbtn.on { background: var(--tile); color: var(--tile-ink); font-weight: 700; }
+    .iconbtn.rec { background: #5a1d22; color: #ffd7da; animation: blink 1.2s infinite; }
+    @keyframes blink { 50% { opacity: .65; } }
+    #runCtl { display: flex; gap: 6px; align-items: center; }
+    #chips { display: flex; gap: 6px; margin-left: auto; overflow: hidden; min-width: 0; flex: 1 1 auto; justify-content: flex-end; }
+    .chip { background: var(--panel2); padding: 2px 9px; color: var(--muted); white-space: nowrap; font-size: 12px; }
+    .chip b { color: var(--text); }
+    @media (max-width: 1500px) { #chipScaleBox, #chipGpuBox { display: none; } }
+    @media (max-width: 1250px) { #chipAirBox, #chipRainBox { display: none; } }
+    #helpBtn { width: 30px; height: 30px; padding: 0; font-weight: 700; }
+
+    /* ---------- układ: pasek zakładek | mapa | panel analiz ---------- */
+    #app { position: relative; height: calc(100vh - var(--top)); display: grid; grid-template-columns: var(--rail) minmax(0, 1fr) var(--ana); }
+    body.noana #app { grid-template-columns: var(--rail) minmax(0, 1fr) 0; }
+    body.noana #ana { display: none; }
+
+    /* pasek zakładek wg projektu: zaokrąglony panel z kaflami; klik otwiera wysuwany panel nad mapą, ponowny klik go chowa */
+    #rail { display: flex; flex-direction: column; padding: 8px; z-index: 15; min-height: 0; overflow-y: auto; scrollbar-width: none; }
+    #tabs { background: var(--panel); border-radius: var(--radius); display: flex; flex-direction: column; gap: 9px; padding: 10px 6px; flex: none; }
+    #tabs button { border: 0; background: var(--tile); color: var(--tile-ink); width: 100%; aspect-ratio: 158 / 151; padding: 0 1px; cursor: pointer;
+      font-size: 9.5px; line-height: 1.2; font-weight: 700; letter-spacing: .02em; text-transform: uppercase;
+      display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 5px; }
+    #tabs button svg { width: 30px; height: auto; display: block; }
+    #tabs button:hover { background: var(--tile-hi); }
+    body.drawer #tabs button.on { background: var(--tile-ink); color: #fff; }
+    body.drawer #tabs button.on svg path { fill: #fff; }
+
+    /* zakładka wg szablonu „Weather”: wiersz tytułu (szary prostokąt + napis), ciemne pola, biały tekst */
+    #side { position: absolute; left: var(--rail); top: 8px; bottom: 8px; width: var(--drawer); background: var(--panel); border-radius: var(--radius);
+      box-shadow: var(--shadow); z-index: 14; display: flex; flex-direction: column; min-height: 0;
+      transform: translateX(calc(-100% - var(--rail) - 10px)); transition: transform .18s ease; }
+    body.drawer #side { transform: none; }
+    .tab { display: none; padding: 7px 7px 12px; overflow-y: auto; flex-direction: column; gap: 10px; flex: 1; min-height: 0; scrollbar-width: thin; scrollbar-color: var(--line2) transparent; }
+    .tab.on { display: flex; }
+    .col { display: flex; flex-direction: column; gap: 10px; flex: none; }
+    .thead { display: flex; align-items: center; gap: 9px; min-height: 31px; flex: none; }
+    .tmark { width: 16px; height: 31px; background: var(--tile); flex: none; display: block; }
+    .ttl { font-size: 13.5px; letter-spacing: .05em; text-transform: uppercase; color: #fff; white-space: nowrap; }
+    .tsub { color: var(--muted); font-size: 12px; letter-spacing: .02em; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .tclose { border: 0; background: transparent; color: var(--muted); font-size: 20px; line-height: 1; cursor: pointer; padding: 2px 6px; margin-left: auto; flex: none; }
+    .tclose:hover { color: #fff; }
+    /* przełącznik pionowy (MODE): szary prostokąt z projektu z suwakiem */
+    .vsw { width: 16px; height: 31px; padding: 0; border: 0; background: var(--tile); cursor: pointer; position: relative; flex: none; }
+    .vsw::after { content: ''; position: absolute; left: 3px; right: 3px; top: 3px; height: 11px; background: var(--tile-ink); transition: top .12s ease; }
+    .vsw.off::after { top: 17px; }
+    .box { background: var(--panel2); padding: 9px 10px; display: flex; flex-direction: column; gap: 8px; flex: none; }
+    .strip { background: var(--panel2); padding: 6px 10px; display: flex; align-items: center; gap: 10px; min-height: 29px; flex: none; }
+    .strip .slbl { letter-spacing: .05em; text-transform: uppercase; font-size: 12px; white-space: nowrap; }
+    .strip input[type=range] { flex: 1; min-width: 0; }
+    .strip b { white-space: nowrap; min-width: 44px; text-align: right; }
+    .tab h4 { margin: 0; font-size: 12px; font-weight: 500; text-transform: uppercase; letter-spacing: .05em; color: #fff; }
+    details.more { background: var(--panel2); padding: 7px 10px; }
+    details.more > summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+    details.more[open] > summary { margin-bottom: 8px; }
+    details.more > div { display: flex; flex-direction: column; gap: 10px; }
+    .box details.more { padding: 0; }
+    .hint { color: var(--muted); font-size: 12px; }
+    label { display: flex; flex-direction: column; gap: 3px; }
+    label.row { flex-direction: row; align-items: center; gap: 8px; }
+    .lbl { display: flex; justify-content: space-between; gap: 8px; color: var(--muted); }
+    .lbl b { color: var(--text); white-space: nowrap; }
+    input[type=range] { width: 100%; }
+    select, input[type=date], input[type=text], input[type=number] { width: 100%; background: var(--panel3); border: 0; border-radius: 0; padding: 6px 8px; }
+    select option, select optgroup { background: var(--panel); }
+    .btns { display: flex; gap: 6px; flex-wrap: wrap; }
+    .btn { flex: 1; border: 0; background: var(--panel3); padding: 7px 8px; cursor: pointer; }
+    .btn:hover { background: var(--line2); }
+    .btn.primary { background: var(--tile); color: var(--tile-ink); font-weight: 700; }
+    .btn.primary:hover { background: var(--tile-hi); }
+    .btn.primary:disabled { opacity: .5; cursor: default; }
+    .btn.on { background: var(--tile); color: var(--tile-ink); font-weight: 700; }
+    .btn.sm { flex: none; padding: 4px 9px; font-size: 12px; white-space: nowrap; }
+    #anaKind { display: flex; }
+    #anaKind button { flex: 1; }
+    .mongrid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+    .mongrid .btn { padding: 7px 2px; font-size: 11.5px; }
+    #monTab { width: 100%; border-collapse: collapse; font-size: 11px; font-variant-numeric: tabular-nums; }
+    #monTab th { color: var(--dim); font-weight: 700; text-align: right; padding: 3px 2px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+    #monTab td { text-align: right; padding: 3px 2px; color: var(--muted); white-space: nowrap; }
+    #monTab th:first-child, #monTab td:first-child { text-align: left; }
+    #monTab tbody tr { cursor: pointer; }
+    #monTab tbody tr:hover td { background: var(--panel3); color: var(--text); }
+    #monTab tbody tr.on td { background: var(--tile); color: var(--tile-ink); }
+    #monTab tbody tr.sec td { cursor: default; background: none; color: var(--dim); font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; padding-top: 8px; }
+    #monTab tfoot td { border-top: 1px solid var(--line); color: var(--text); font-weight: 700; }
+    #cprev { width: 100%; aspect-ratio: 1.15; background: var(--panel); display: block; }
+    #sndIdx { display: grid; grid-template-columns: 1fr; gap: 3px; font-size: 12px; }
+    #sndIdx div { display: flex; justify-content: space-between; color: var(--muted); }
+    #sndIdx b { color: var(--text); }
+    #dirty { color: var(--warn); font-size: 12px; min-height: 1.2em; }
+    #perf { font: 12px/1.6 ui-monospace, Consolas, monospace; white-space: pre; overflow-x: auto; color: #c9d1dc; }
+    /* mapa synoptyczna i prognoza: proporcje z projektu (mapa ~86.5% szerokości panelu, kwadrat) */
+    .synw { width: 90%; align-self: center; display: flex; flex-direction: column; gap: 6px; }
+    .synbar { display: flex; gap: 6px; align-items: center; }
+    .synbar select { flex: 1; min-width: 0; }
+    .synopts { display: flex; flex-wrap: wrap; gap: 4px; }
+    .chipb { border: 0; background: var(--panel3); color: var(--muted); padding: 2px 7px; font-size: 11px; cursor: pointer; }
+    .chipb:hover { color: #fff; }
+    .chipb.on { background: var(--tile); color: var(--tile-ink); font-weight: 700; }
+    #csynBox { position: relative; }
+    #csyn { width: 100%; aspect-ratio: 1; background: var(--panel2); display: block; cursor: grab; touch-action: none; }
+    #csyn.drag { cursor: grabbing; }
+    .zbtns { position: absolute; right: 5px; top: 5px; display: flex; flex-direction: column; gap: 3px; }
+    .zbtns button { width: 22px; height: 22px; padding: 0; border: 0; background: rgba(217,217,217,.9); color: var(--tile-ink); font-weight: 700; cursor: pointer; line-height: 1; }
+    .zbtns button:hover { background: #fff; }
+    #cfc { width: 100%; aspect-ratio: 1.73; background: var(--panel2); display: block; }
+    #wxNow { font-size: 12px; line-height: 1.5; min-height: 120px; padding: 10px 11px; display: block; }
+    #wxNow .amn { font-size: 13.5px; font-weight: 700; letter-spacing: .03em; }
+    #wxNow .k { color: var(--muted); }
+    .synleg { display: flex; flex-wrap: wrap; gap: 4px 10px; color: var(--muted); font-size: 11px; }
+    .synleg i { display: inline-block; width: 10px; height: 10px; margin-right: 4px; vertical-align: -1px; }
+    #gridLx, #gridLy { width: 100%; }
+    /* lista warstw (wzór: Meteologix – zakładki u góry, rozwijane grupy) */
+    #layTabs { display: flex; flex: none; }
+    #layTabs button { flex: 1; padding: 7px 4px; }
+    #layGroups, #layMostList { display: flex; flex-direction: column; gap: 4px; }
+    .lyq { width: 100%; text-align: left; background: var(--panel2); border: 0; padding: 9px 11px; font-weight: 700; color: #fff; cursor: pointer; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+    .lyq:hover { background: var(--panel3); }
+    .lyq.on { background: var(--tile); color: var(--tile-ink); }
+    .lyq kbd { font: 10px ui-monospace, monospace; color: var(--dim); }
+    .lyq.on kbd { color: var(--tile-ink); }
+    .lyr { display: flex; align-items: center; gap: 10px; flex: none; }
+    .lystar { font-style: normal; font-size: 16px; line-height: 1; color: var(--dim); cursor: pointer; padding: 0 2px; flex: none; }
+    .lystar:hover { color: #fff; }
+    .lystar.on { color: #ffc83d; }
+    .lyi.on .lystar, .lyq.on .lystar { color: var(--tile-ink); }
+    .lygrp { background: var(--panel2); }
+    .lyh { width: 100%; text-align: left; background: none; border: 0; padding: 9px 11px; font-weight: 700; color: #fff; cursor: pointer; display: flex; justify-content: space-between; gap: 8px; }
+    .lyh:hover { background: var(--panel3); }
+    .lyh::after { content: '▸'; color: var(--dim); }
+    .lygrp.open > .lyh::after { content: '▾'; }
+    .lygrp.has > .lyh { box-shadow: inset 3px 0 0 var(--tile); }
+    .lyb { display: none; padding: 0 0 6px; }
+    .lygrp.open > .lyb { display: block; }
+    .lyi { display: flex; justify-content: space-between; align-items: center; gap: 8px; width: 100%; text-align: left; background: none; border: 0; padding: 5px 11px 5px 18px; color: var(--muted); cursor: pointer; }
+    .lyi:hover { color: #fff; background: var(--panel3); }
+    .lyi.on { background: var(--tile); color: var(--tile-ink); font-weight: 700; }
+    #layInfo dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; font-size: 12px; }
+    #layInfo dt { color: var(--muted); }
+    #layInfo dd { margin: 0; }
+    /* ekran wczytywania i strona tytułowa */
+    #loadScr { position: fixed; inset: 0; z-index: 90; background: var(--bg); display: none; flex-direction: column; align-items: center; justify-content: center; gap: 18px; }
+    #loadScr.on { display: flex; }
+    #loadScr img { width: 150px; height: 150px; }
+    #loadMsg { color: var(--muted); font-size: 14px; min-height: 1.5em; text-align: center; max-width: 80vw; }
+    #titleScr { position: fixed; inset: 0; z-index: 80; background: var(--bg); display: none; flex-direction: column; padding: 14px; gap: 12px; }
+    #titleScr.on { display: flex; }
+    #titleScr header { display: flex; align-items: center; gap: 14px; flex: none; }
+    #titleScr header img { width: 72px; height: 72px; display: block; }
+    #titleScr h4 { margin: 0; font-size: 12px; font-weight: 500; text-transform: uppercase; letter-spacing: .05em; color: #fff; }
+    #titleScr h1 { margin: 0; font-size: 26px; font-weight: 500; letter-spacing: .06em; text-transform: uppercase; }
+    #titleScr header span { color: var(--muted); }
+    .tt-body { flex: 1; min-height: 0; display: flex; gap: 12px; }
+    .tt-map { flex: 1; min-width: 0; position: relative; background: var(--panel); border-radius: var(--radius); padding: 7px; display: flex; flex-direction: column; gap: 6px; }
+    #ttMap { flex: 1; min-height: 0; width: 100%; display: block; touch-action: none; cursor: grab; }
+    .tt-hint { color: var(--muted); font-size: 12px; flex: none; padding: 0 3px; }
+    .tt-hint a, #helpBox a { color: #aab8ff; }
+    .tt-net { position: absolute; left: 50%; top: 18px; transform: translateX(-50%); background: rgba(12,12,39,.95); color: var(--warn); padding: 7px 12px; }
+    .tt-side { width: 384px; flex: none; background: var(--panel); border-radius: var(--radius); padding: 7px; display: flex; flex-direction: column; gap: 10px; overflow-y: auto; }
+    #ttRes { display: flex; }
+    #ttRes button { flex: 1; padding: 5px 2px; }
+    #ttMonths { display: grid; grid-template-columns: repeat(6, 1fr); gap: 6px; }
+    #ttMonths button { border: 0; background: var(--tile); color: var(--tile-ink); padding: 9px 0; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .03em; cursor: pointer; }
+    #ttMonths button:hover { background: var(--tile-hi); }
+    #ttMonths button.on { background: var(--tile-ink); color: #fff; }
+    #ttPlace { font-size: 14px; font-weight: 700; }
+    #ttStart { flex: none; padding: 13px 8px; font-size: 16px; letter-spacing: .08em; text-transform: uppercase; }
+    #ttFlat { flex: none; }
+    /* sondaż */
+    #csnd { width: 100%; display: block; background: #fff; flex: none; }
+    #sndFull { position: fixed; inset: 0; z-index: 70; background: #fff; display: none; }
+    #sndFull.on { display: block; }
+    #csndF { position: absolute; left: 0; top: 0; width: 100%; height: 100%; display: block; }
+    #sndBar { position: absolute; right: 12px; top: 10px; display: flex; gap: 6px; align-items: center; }
+    #sndBar .seg { background: #eceef4; }
+    #sndBar .seg button { color: #333; }
+    #sndBar .seg button:hover { background: #dfe2ea; color: #000; }
+    #sndBar .seg button.on { background: var(--tile-ink); color: #fff; }
+    #sndClose { border: 0; background: #eceef4; color: #222; font-size: 18px; width: 30px; height: 28px; cursor: pointer; }
+    #sndClose:hover { background: #dfe2ea; }
+
+    /* ---------- mapa ---------- */
+    #main { display: flex; flex-direction: column; min-width: 0; min-height: 0; padding: 10px 12px 10px; gap: 8px; }
+    #err { position: fixed; left: 50%; top: 16px; transform: translateX(-50%); z-index: 95; width: max-content; max-width: calc(100vw - 32px); max-height: calc(100vh - 32px);
+      box-sizing: border-box; overflow: auto; color: var(--err); white-space: pre-wrap; background: #2a1517; padding: 10px 14px; border-radius: 6px; box-shadow: var(--shadow); }
+    #err:empty { display: none; }
+    #mapHead { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-height: 30px; }
+    #mapHead h3 { margin: 0; font-size: 13px; font-weight: 700; }
+    #mapHead .sub { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 420px; }
+    .ctl { display: flex; gap: 12px; align-items: center; color: var(--muted); font-size: 12px; flex-wrap: wrap; }
+    .ctl label { flex-direction: row; align-items: center; gap: 6px; }
+    .ctl input[type=range] { width: 110px; }
+    .ctl b { color: var(--text); min-width: 50px; display: inline-block; }
+    #mapHead .tools { display: flex; gap: 6px; }
+    #mapBox { position: relative; flex: 1 1 auto; min-height: 0; display: flex; align-items: center; justify-content: center; }
+    #mapInner { position: relative; }
+    canvas.gpu { display: block; width: 100%; height: 100%; background: #000; }
+    #cxy { touch-action: none; cursor: crosshair; }
+    #mapBox:fullscreen { background: #000; }
+    #legXY { flex: 0 1 460px; min-width: 260px; margin: 0 0 0 auto; }
+    #legXY .note { display: none; }
+    #scale { position: absolute; left: 12px; bottom: 12px; color: #fff; font-size: 11px; text-shadow: 0 1px 2px #000; pointer-events: none; }
+    #scale i { display: block; height: 5px; border: 2px solid #fff; border-top: 0; margin-top: 2px; filter: drop-shadow(0 1px 1px #000); }
+    #zoomTxt { display: block; margin-top: 3px; opacity: 0.85; }
+    #north { position: absolute; right: 10px; top: 8px; color: #fff; font: 600 12px/1.1 system-ui; text-align: center; text-shadow: 0 1px 2px #000; pointer-events: none; }
+    #tip { position: absolute; pointer-events: none; background: rgba(12, 12, 39, .96);
+      padding: 7px 10px; font-size: 12px; line-height: 1.55; white-space: nowrap; display: none; z-index: 5; box-shadow: 0 4px 14px rgba(0,0,0,.45); }
+    #tip .k { color: var(--muted); }
+    #probe { position: absolute; width: 14px; height: 14px; margin: -7px 0 0 -7px; border: 2px solid #fff; border-radius: 50%;
+      box-shadow: 0 0 0 2px rgba(0,0,0,.55), 0 0 8px rgba(0,0,0,.6); pointer-events: none; display: none; }
+    #probe::after { content: ''; position: absolute; left: 4px; top: 4px; width: 2px; height: 2px; background: #fff; border-radius: 50%; }
+    .stmark { position: absolute; pointer-events: none; transform: translate(-5px, -5px); z-index: 3; }
+    .stmark i { display: block; width: 10px; height: 10px; background: #ffd34d; border: 2px solid #1a1a1a; border-radius: 2px; box-shadow: 0 0 4px rgba(0,0,0,.7); }
+    .stmark span { position: absolute; left: 13px; top: -4px; color: #fff; font-size: 11px; font-weight: 600; white-space: nowrap; text-shadow: 0 1px 2px #000, 0 0 3px #000; }
+    .stmark.sel i { background: #ff7a3d; }
+    /* miejscowości (OpenStreetMap): kropka wg wielkości, nazwa dużych stale, pozostałych po najechaniu; klik – stacja */
+    .city { position: absolute; pointer-events: none; }   /* bez z-index: kropki (2) pod stacjami (3), nazwy miast (4) na wierzchu */
+    .city i { display: block; position: relative; z-index: 2; pointer-events: auto; cursor: copy; border-radius: 50%; background: #fff; border: 1.5px solid #111;
+      box-shadow: 0 0 3px rgba(0,0,0,.8); }
+    .city.c2 i { width: 9px; height: 9px; transform: translate(-6px, -6px); }
+    .city.c1 i { width: 6px; height: 6px; transform: translate(-4.5px, -4.5px); }
+    .city.c0 i { width: 4px; height: 4px; transform: translate(-3.5px, -3.5px); border-width: 1px; }
+    .city span { position: absolute; z-index: 4; left: 7px; top: -9px; color: #fff; font-size: 11px; white-space: nowrap; display: none;
+      text-shadow: 0 1px 2px #000, 0 0 3px #000, 0 0 1px #000; }
+    .city span em { font-style: normal; font-weight: 400; opacity: .85; display: none; }
+    .city.lab span { display: block; font-weight: 700; font-size: 12px; }
+    .city i:hover + span { display: block; z-index: 6; }
+    .city i:hover + span em { display: inline; }
+    .city i:hover { background: #ffd34d; }
+    body.addst #cxy { cursor: copy; }
+
+    /* ---------- legendy ---------- */
+    .leg { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 2px 10px; align-items: center; margin-top: 6px; font-size: 12px; }
+    .leg .lo, .leg .hi { color: var(--muted); font-variant-numeric: tabular-nums; }
+    .leg .bar { height: 10px; border-radius: 3px; }
+    .leg .ticks { grid-column: 2; position: relative; height: 14px; color: var(--dim); font-size: 10px; }
+    .leg .ticks span { position: absolute; transform: translateX(-50%); top: 0; }
+    .leg .note { grid-column: 1 / -1; color: var(--dim); font-size: 11px; }
+    .ax { display: flex; justify-content: space-between; color: var(--dim); font-size: 11px; margin-top: 3px; }
+
+    /* ---------- panel analiz ---------- */
+    #ana { background: var(--panel); display: flex; flex-direction: column; min-height: 0; margin: 8px 8px 8px 0; border-radius: var(--radius); overflow: hidden; }
+    #anaHead { display: flex; align-items: center; gap: 8px; padding: 8px 8px 0; }
+    #anaHead .seg { flex: 1; }
+    #anaHead .seg button { flex: 1; }
+    .apanel { display: none; flex-direction: column; gap: 8px; padding: 10px 12px 14px; overflow-y: auto; flex: 1; }
+    .apanel.on { display: flex; }
+    .apanel h3 { margin: 0; font-size: 13px; font-weight: 700; }
+    .apanel .sub { color: var(--muted); font-size: 12px; }
+    #cxz { height: auto; aspect-ratio: 1.6; }
+    #cprof { display: block; width: 100%; aspect-ratio: 1.3; background: var(--panel2); }
+    #profInfo { color: var(--muted); font-size: 12px; line-height: 1.55; }
+    #profInfo b { color: var(--text); }
+    #cmet, #cmetSt { display: block; width: 100%; aspect-ratio: 2.0; background: var(--panel2); }
+    .mh { margin: 8px 0 0; font-size: 13px; font-weight: 700; }
+    .mh .sub { color: var(--muted); font-size: 12px; font-weight: 400; margin-left: 6px; }
+    #stTable { width: 100%; border-collapse: collapse; font-size: 12px; }
+    #stTable th { text-align: left; color: var(--dim); font-weight: 700; font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; padding: 4px 4px; border-bottom: 1px solid var(--line); }
+    #stTable td { padding: 5px 4px; border-bottom: 1px solid var(--line); vertical-align: top; }
+    #stTable td b { display: block; white-space: nowrap; }
+    #stTable td small { display: block; color: var(--dim); font-size: 10.5px; white-space: nowrap; }
+    #stTable tr[data-n] { cursor: pointer; }
+    #stTable tr[data-n]:hover td { background: var(--panel3); }
+    #stTable tr.sel td { background: rgba(99, 102, 241, .22); }
+    #stTable td.empty { color: var(--muted); padding: 12px 4px; }
+    .stdel { border: 0; background: transparent; color: var(--dim); cursor: pointer; font-size: 15px; padding: 0 4px; }
+    .stdel:hover { color: var(--err); }
+
+    /* ---------- okna ---------- */
+    #toast { position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%) translateY(20px); background: rgba(12,12,39,.97);
+      border-radius: var(--radius); padding: 9px 16px; box-shadow: var(--shadow); opacity: 0; pointer-events: none;
+      transition: opacity .25s, transform .25s; z-index: 60; font-size: 13px; }
+    #toast.on { opacity: 1; transform: translateX(-50%) translateY(0); }
+    #helpDlg, #worldDlg { position: fixed; inset: 0; background: rgba(5, 7, 12, 0.78); z-index: 55; display: none; align-items: center; justify-content: center; }
+    #helpDlg.on, #worldDlg.on { display: flex; }
+    #helpBox { background: var(--panel); border-radius: var(--radius); padding: 18px 22px; width: min(820px, 94vw);
+      max-height: 92vh; overflow: auto; box-shadow: var(--shadow); line-height: 1.55; }
+    #helpBox h3 { margin: 0 0 8px; } #helpBox h4 { margin: 14px 0 4px; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .06em; }
+    #helpBox kbd { font: 11px ui-monospace, monospace; background: var(--panel3); padding: 1px 6px; }
+    #helpBox .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 24px; font-size: 13px; }
+    #worldBox { background: var(--panel); border-radius: var(--radius); padding: 14px; width: min(1100px, 96vw); max-height: 96vh; overflow: auto; }
+    #worldMaps { display: flex; gap: 12px; flex-wrap: wrap; }
+    #worldMaps .zbox { flex: 1 1 420px; min-width: 280px; aspect-ratio: 1; overflow: hidden; background: var(--panel2); touch-action: none; }
+    #worldMaps canvas { display: block; width: 100%; height: 100%; transform-origin: 0 0; cursor: crosshair; }
+    #worldInfo { margin: 10px 0; font-size: 13px; line-height: 1.5; }
+
+    /* wąskie ekrany: panel analiz pod mapą, przewijanie strony */
+    @media (max-width: 1100px) {
+      body { overflow: auto; }
+      #app { height: auto; grid-template-columns: var(--rail) minmax(0, 1fr); }
+      #main { height: calc(100vh - var(--top)); }
+      #ana { grid-column: 1 / -1; margin: 8px; }
+      body.noana #app { grid-template-columns: var(--rail) minmax(0, 1fr); }
+    }
+  </style>
+</head>
+<body class="">
+  <div id="top">
+    <div id="brand"><img src="/logo-icon.svg" alt="Weather3D" title="Weather3D" /></div>
+    <div id="clock" title="Local solar time"><span id="clockTime">--:--</span><span id="clockDate"></span><span id="clockSun"></span></div>
+    <div id="runCtl">
+      <button id="pause" class="iconbtn" title="Pause / resume (space)">⏸ Pause</button>
+      <div class="seg" id="speedSeg">
+        <button data-speed="288" title="One day in 5 minutes">288×</button>
+        <button data-speed="720" class="on" title="One day in 2 minutes">720×</button>
+        <button data-speed="1440" title="One day in 1 minute">1440×</button>
+        <button data-speed="2880" title="One day in 30 seconds">2880×</button>
+        <button data-speed="5760" title="One day in 15 seconds (if the GPU keeps up)">5760×</button>
+        <button data-speed="max" title="As fast as the GPU allows">max</button>
+      </div>
+      <input type="hidden" id="speed" value="720" />
+      <button id="reset" class="iconbtn" title="Restart (R)">⟲</button>
+    </div>
+    <div id="chips">
+      <span class="chip" id="chipScaleBox">scale <b id="chipScale">–</b></span>
+      <span class="chip" id="chipAirBox">air mass <b id="chipAir">–</b></span>
+      <span class="chip">T 2 m <b id="chipT2">–</b></span>
+      <span class="chip">clouds <b id="chipCloud">–</b></span>
+      <span class="chip" id="chipRainBox">max rain <b id="chipRain">–</b></span>
+      <span class="chip">speed <b id="chipSpeed">–</b></span>
+      <span class="chip" id="chipGpuBox">GPU <b id="chipGpu">–</b></span>
+    </div>
+    <button id="anaBtn" class="iconbtn on" title="Analysis panel: cross-section, probe, stations (A)">◨ Analysis</button>
+    <button id="helpBtn" class="iconbtn" title="Help and keyboard shortcuts (H)">?</button>
+  </div>
+
+  <div id="worldDlg">
+    <div id="worldBox">
+      <h4 style="margin-top:0">Choose a place: click the world map, then refine on the region map <span class="k" style="font-weight:400">(mouse wheel – zoom, drag – pan, double-click – whole map)</span></h4>
+      <div id="worldMaps"><div class="zbox"><canvas id="cworld"></canvas></div><div class="zbox"><canvas id="cregion"></canvas></div></div>
+      <div id="worldInfo">Terrain: AWS Terrain Tiles (SRTM, GMTED, ETOPO1). Climate: built-in station climatology (GHCN_CAMS, GPCC) and NCEP/NCAR reanalysis, data from NOAA PSL; refined near the ground in the background with ERA5 normals (Open-Meteo).</div>
+      <div class="btns"><button id="worldApply" class="btn primary" disabled>Load terrain and climate of this place</button><button id="worldClose" class="btn">Close</button></div>
+    </div>
+  </div>
+  <div id="helpDlg"><div id="helpBox">
+    <h3>Weather3D – help</h3>
+    <div class="hint">3D atmosphere simulation on the graphics card. The tiles on the left open the menu tabs; a second click (or Esc) hides
+      them. The centre shows the map or the 3D view; on the right is the analysis panel (vertical cross-section, probe, stations) – the
+      “Analysis” button or the A key. Click the map to place the probe; hover to see the values near the ground.</div>
+    <h4>Keyboard shortcuts</h4>
+    <div class="cols">
+      <div><kbd>1</kbd>–<kbd>0</kbd> most used layers</div><div><kbd>space</kbd> pause / resume</div>
+      <div><kbd>R</kbd> restart</div><div><kbd>V</kbd> map ↔ 3D view</div>
+      <div><kbd>F</kbd> full-screen map</div><div><kbd>P</kbd> save image (PNG)</div>
+      <div><kbd>S</kbd> sounding: probe ↔ domain mean</div><div><kbd>W</kbd> wind arrows</div>
+      <div><kbd>A</kbd> analysis panel</div><div><kbd>M</kbd> menu (last tab)</div>
+      <div><kbd>↑</kbd> <kbd>↓</kbd> height of the horizontal section</div><div><kbd>H</kbd> / <kbd>?</kbd> this help, <kbd>Esc</kbd> close</div>
+    </div>
+    <div class="hint" style="margin-top:8px">Mouse on the map: wheel – zoom (up to 16×), drag – pan the zoomed map, double-click – whole map.
+      The same on the synoptic map and on the maps in the place-selection window.</div>
+    <h4>Map scale</h4>
+    <div class="hint">≤ 40 km – microscale (thermals, single cumulus clouds, microclimate); ≤ 400 km – mesoscale (storms, breezes,
+      foehn, valleys); larger – synoptic scale (fronts, lows, highs). Size and detail: Settings → Grid.</div>
+    <h4>Where to find things</h4>
+    <div class="hint">Weather – mode, current air mass, synoptic map and 7-day forecast. Atmosphere – sounding from the probe point or the
+      domain mean, with a full-screen view. Terrain – relief, brush (height, water, surface types), surface, hydrology. Layers – all map
+      layers in expandable groups. Climate analysis – maps and a table of months, seasons and years. Settings – place, date, grid, map
+      overlays, saving and loading. Stations (analysis panel) – any number of measuring points with a table, meteogram and CSV export.</div>
+    <h4>The synoptic model</h4>
+    <div class="hint">Primitive equations on the GPU: a channel around the whole latitude circle, 75 km grid, 12 levels up to 16 km. Lows, highs and
+      fronts form by themselves from baroclinic instability – heat and moisture exchange with land and ocean, condensation with precipitation,
+      and convection. The domain lies inside it: air from this model enters through the boundaries, together with clouds and precipitation.</div>
+    <h4>Data and licences</h4>
+    <div class="hint">Terrain: Terrain Tiles on AWS (SRTM, GMTED, ETOPO1, EU-DEM and others). Land cover: © ESA WorldCover project 2021 / Contains modified Copernicus Sentinel data (2021)
+      processed by ESA WorldCover consortium (CC BY 4.0), read from Microsoft Planetary Computer. Places: GeoNames (CC BY 4.0). Climate: weather data by
+      <a href="https://open-meteo.com/" target="_blank" rel="noopener">Open-Meteo.com</a> (CC BY 4.0; ERA5, Copernicus Climate Change Service); NCEP/NCAR Reanalysis, GHCN_CAMS, GPCC and GPCP data
+      provided by the NOAA PSL, Boulder, Colorado, USA, from their website at <a href="https://psl.noaa.gov" target="_blank" rel="noopener">https://psl.noaa.gov</a>.
+      Weather3D is free software under the MIT licence: <a href="https://github.com/mesochaser2425/weather3d" target="_blank" rel="noopener">source code, all sources and licences</a>.</div>
+    <div class="btns" style="margin-top:14px"><button id="helpClose" class="btn primary">Close</button></div>
+  </div></div>
+  <div id="toast"></div>
+  <div id="err"></div>
+
+  <div id="loadScr" class="on"><img src="/logo.svg" alt="Weather3D" /><div id="loadMsg">Starting…</div></div>
+
+  <div id="titleScr">
+    <header><img src="/logo.svg" alt="Weather3D" /><div><h1>Weather3D</h1><span>Choose the map size, the start month and the area – then start.</span></div></header>
+    <div class="tt-body">
+      <div class="tt-map">
+        <canvas id="ttMap" title="Wheel – zoom · drag – pan · click – move the area here · drag the area or its corners – move / resize · double-click – fit the area"></canvas>
+        <div class="tt-hint">Wheel – zoom · drag the map – pan · click – move the area here · drag the white frame or its corners – move / resize</div>
+        <div class="tt-hint">Terrain: Terrain Tiles on AWS · Land cover: © ESA WorldCover project 2021 / Contains modified Copernicus Sentinel data (2021) processed by ESA WorldCover consortium · <a href="https://github.com/mesochaser2425/weather3d#data-sources" target="_blank" rel="noopener">All sources and licences</a></div>
+        <div class="tt-net" id="ttNet" style="display:none">Terrain tiles are not available (no internet?). You can still start on flat terrain.</div>
+      </div>
+      <div class="tt-side">
+        <div class="box">
+          <h4>Map size</h4>
+          <div style="display:flex; gap:8px">
+            <label style="flex:1"><span class="lbl">Width (W–E) [km]</span><input id="ttLx" type="number" min="5" max="5000" step="any" /></label>
+            <label style="flex:1"><span class="lbl">Height (S–N) [km]</span><input id="ttLy" type="number" min="5" max="5000" step="any" /></label>
+          </div>
+          <div class="synopts" id="ttSizes"></div>
+          <label><span class="lbl">Detail (cells on the longer side; more = slower)</span><div class="seg" id="ttRes"></div></label>
+          <label><span class="lbl">Grid spacing</span><select id="ttDx"></select></label>
+          <div class="hint" id="ttInfo"></div>
+        </div>
+        <div class="box">
+          <h4>Start month</h4>
+          <div id="ttMonths"></div>
+        </div>
+        <div class="box">
+          <h4>Area centre</h4>
+          <div id="ttPlace"></div>
+        </div>
+        <button id="ttStart" class="btn primary">Start</button>
+        <button id="ttFlat" class="btn" title="No download: flat terrain, climate of Kraków">Start on flat terrain</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="sndFull">
+    <canvas id="csndF"></canvas>
+    <div id="sndBar">
+      <div class="seg" data-sndsrc><button data-p="point" title="Sounding at the probe point (click the map)">Point</button><button data-p="mean" title="Mean over the visible domain">Domain mean</button></div>
+      <div class="seg" data-sndpar><button data-c="ml" title="Mixed-layer parcel (0–500 m)">ML</button><button data-c="sb" title="Surface-based parcel">SB</button><button data-c="mu" title="Most-unstable parcel">MU</button></div>
+      <button id="sndClose" title="Close (Esc)">×</button>
+    </div>
+  </div>
+
+  <div id="app">
+    <nav id="rail">
+      <div id="tabs">
+        <button data-tab="wx" class="on" title="Weather and synoptic model"><svg viewBox="65 1765 58 38" aria-hidden="true"><path d="M85.9749 1780.28C86.2565 1780.28 86.5374 1780.29 86.8173 1780.31C88.1631 1775.71 91.5716 1772.07 95.9428 1770.37C94.0022 1767.36 90.6294 1765.38 86.7892 1765.38C81.1533 1765.38 76.5158 1769.66 75.9527 1775.15C75.1625 1774.9 74.3227 1774.77 73.453 1774.77C68.7848 1774.77 65 1778.55 65 1783.22C65 1787.89 68.7848 1791.67 73.4529 1791.67H73.5374C74.0939 1785.3 79.4575 1780.28 85.9749 1780.28Z" fill="#000"/><path d="M114.236 1785.1C114.233 1785.1 114.23 1785.1 114.225 1785.1C114.23 1784.95 114.236 1784.81 114.236 1784.66C114.236 1777.64 108.548 1771.95 101.53 1771.95C94.9562 1771.95 89.5482 1776.94 88.8902 1783.35C87.9686 1783.06 86.9906 1782.91 85.9749 1782.91C80.5302 1782.91 76.1164 1787.32 76.1164 1792.77C76.1164 1798.21 80.5302 1802.62 85.9749 1802.62H114.236C119.076 1802.62 123 1798.7 123 1793.86C123 1789.02 119.076 1785.1 114.236 1785.1Z" fill="#000"/></svg>Weather</button>
+        <button data-tab="atm" title="Sounding from the probe point or the domain mean">Atmosphere</button>
+        <button data-tab="ter" title="Terrain, brush and surface">Terrain</button>
+        <button data-tab="view" title="All map layers">Layers</button>
+        <button data-tab="mon" title="Climate analysis: months, seasons and years">Climate<br>analysis</button>
+        <button data-tab="set" title="Place, date, grid, map overlays, save and load">Settings</button>
+      </div>
+    </nav>
+
+    <aside id="side">
+      <div class="tab on" data-panel="wx">
+        <div class="thead">
+          <button id="wxSw" class="vsw" title="Switch mode: synoptic model / fixed air mass"></button>
+          <span class="ttl">Mode</span><span class="tsub" id="wxModeName"></span>
+          <button id="wxRoll" class="btn sm" title="New random weather from the synoptic model (restarts)">New weather</button>
+          <button class="tclose" title="Close the menu (Esc)">×</button>
+        </div>
+        <select id="wxMode" hidden>
+          <option value="syn">Synoptic model</option>
+          <option value="const">Fixed air mass</option>
+        </select>
+        <div class="box" id="wxNow">–</div>
+        <div class="strip" id="tanomStrip" title="Temperature anomaly of the whole troposphere, relative humidity unchanged">
+          <span class="slbl">Anomaly</span><input id="tanom" type="range" min="-6" max="6" step="0.5" value="0" /><b id="tanomV"></b>
+        </div>
+        <div class="col" id="wxSyn">
+          <div class="synw">
+            <div class="synbar"><select id="synLevel" title="What the synoptic map shows"></select></div>
+            <div class="synopts" id="synOpts"></div>
+            <div id="csynBox">
+              <canvas id="csyn" title="Mouse wheel – zoom, drag – pan, double-click – default view"></canvas>
+              <span id="synZoomTxt"></span>
+              <div class="zbtns"><button id="synZp" title="Zoom in">+</button><button id="synZm" title="Zoom out">−</button></div>
+            </div>
+            <div id="synLeg"></div>
+          </div>
+          <div class="synw">
+            <h4>7-day forecast – domain centre</h4>
+            <canvas id="cfc"></canvas>
+            <div class="synleg" id="fcLeg"></div>
+          </div>
+        </div>
+        <div class="col" id="wxConst" style="display:none">
+          <div class="box">
+            <h4>Air mass</h4>
+            <div class="hint">Move the sliders and watch the start sounding. The model takes them after “Apply”.</div>
+            <select id="airmass"></select>
+            <canvas id="cprev"></canvas>
+            <div id="sndIdx"></div>
+            <label><span class="lbl">Air-mass temperature near the ground (mixed) <b id="tsfcV"></b></span>
+              <input id="tsfc" type="range" min="-10" max="40" step="0.5" value="24" /></label>
+            <label><span class="lbl">Lapse rate <b id="lapseV"></b></span>
+              <input id="lapse" type="range" min="4" max="9.5" step="0.1" value="6.5" /></label>
+            <label><span class="lbl">Relative humidity, lower layer <b id="rhLowV"></b></span>
+              <input id="rhLow" type="range" min="10" max="100" step="1" value="65" /></label>
+            <label><span class="lbl">Relative humidity, above <b id="rhHighV"></b></span>
+              <input id="rhHigh" type="range" min="5" max="100" step="1" value="40" /></label>
+            <details class="more"><summary>Inversion, night, tropopause</summary><div>
+              <label><span class="lbl">Inversion height <b id="zinvV"></b></span>
+                <input id="zinv" type="range" min="0" max="5" step="0.1" value="2.4" /></label>
+              <label><span class="lbl">Inversion temperature rise <b id="dinvV"></b></span>
+                <input id="dinv" type="range" min="0" max="8" step="0.5" value="3" /></label>
+              <label><span class="lbl">Night cooling near the ground <b id="tnightV"></b></span>
+                <input id="tnight" type="range" min="0" max="12" step="0.5" value="6" /></label>
+              <label><span class="lbl">Tropopause <b id="ztropV"></b></span>
+                <input id="ztrop" type="range" min="8" max="16" step="0.5" value="12" /></label>
+            </div></details>
+            <div id="dirty"></div>
+            <div class="btns"><button id="applyAir" class="btn primary">Apply and restart</button><button id="revertAir" class="btn">Revert</button></div>
+          </div>
+          <div class="box">
+            <h4>Wind and high pressure (applied at once)</h4>
+            <label><span class="lbl">Geostrophic wind <b id="windV"></b></span>
+              <input id="wind" type="range" min="0" max="25" step="0.5" value="3" /></label>
+            <label><span class="lbl">Direction (from) <b id="wdirV"></b></span>
+              <input id="wdir" type="range" min="0" max="355" step="5" value="270" /></label>
+            <label><span class="lbl">Large-scale subsidence (high) <b id="wlsV"></b></span>
+              <input id="wls" type="range" min="0" max="2" step="0.1" value="0.4" /></label>
+          </div>
+        </div>
+      </div>
+
+      <div class="tab" data-panel="atm">
+        <div class="thead"><i class="tmark"></i><span class="ttl">Sounding</span><span class="tsub" id="sndSub"></span>
+          <button id="sndExpand" class="btn sm" title="Show the sounding full screen">⛶ Full screen</button>
+          <button class="tclose" title="Close the menu (Esc)">×</button></div>
+        <div class="strip">
+          <div class="seg" data-sndsrc><button data-p="point" title="Sounding at the probe point (click the map)">Point</button><button data-p="mean" title="Mean over the visible domain">Domain mean</button></div>
+          <div class="seg" data-sndpar style="margin-left:auto"><button data-c="ml" title="Mixed-layer parcel (0–500 m)">ML</button><button data-c="sb" title="Surface-based parcel">SB</button><button data-c="mu" title="Most-unstable parcel">MU</button></div>
+        </div>
+        <canvas id="csnd"></canvas>
+        <div class="hint">Click the map to move the probe. Layout after the thundeR soundings (Czernecki, Taszarek, Szuster); computed by Weather3D.</div>
+      </div>
+
+      <div class="tab" data-panel="ter">
+        <div class="thead"><i class="tmark"></i><span class="ttl">Terrain</span><button class="tclose" title="Close the menu (Esc)">×</button></div>
+        <div class="box">
+          <h4>Relief (a change restarts)</h4>
+          <select id="shape"></select>
+          <label><span class="lbl">Highest point <b id="hillsV"></b></span>
+            <input id="hills" type="range" min="0" max="8000" step="50" value="0" /></label>
+          <label><span class="lbl">Sea level (terrain below = water) <b id="seaV"></b></span>
+            <input id="sea" type="range" min="0" max="8000" step="10" value="0" /></label>
+          <div class="btns"><button id="newTerrain" class="btn">Random</button><button id="loadImg" class="btn">Load image…</button><button id="saveImg" class="btn">Save PNG</button></div>
+          <input id="imgFile" type="file" accept="image/*" hidden />
+        </div>
+        <div class="box">
+          <h4>Brush</h4>
+          <label class="row"><input id="paint" type="checkbox" /> Paint on the map (left button: raise / add, right button: lower / remove)</label>
+          <label><span class="lbl">Paint with</span><select id="paintWhat"></select></label>
+          <label><span class="lbl">Brush radius <b id="brushV"></b></span>
+            <input id="brush" type="range" min="0.5" max="6" step="0.25" value="2" /></label>
+        </div>
+        <div class="box">
+          <h4>Surface (a change restarts)</h4>
+          <select id="landuse"></select>
+          <label><span class="lbl">Mean soil moisture <b id="soilV"></b></span>
+            <input id="soil" type="range" min="0" max="100" step="5" value="60" /></label>
+          <details class="more"><summary>Water and hydrology</summary><div>
+            <label class="row" title="Rain and snowmelt soak into the soil at a limited rate; the excess and groundwater runoff flow over the terrain (D8 network with filled depressions) to rivers, lakes and the sea. On terrain from the world map rivers follow the real valleys. Map: “Runoff and rivers”."><input id="hydro" type="checkbox" /> Hydrology: surface runoff and rivers</label>
+            <label><span class="lbl">Water temperature at start <b id="waterV"></b></span>
+              <input id="water" type="range" min="0" max="30" step="0.5" value="20" /></label>
+          </div></details>
+        </div>
+      </div>
+
+      <div class="tab" data-panel="view">
+        <div class="thead"><i class="tmark"></i><span class="ttl">Layers</span><button class="tclose" title="Close the menu (Esc)">×</button></div>
+        <div class="seg" id="layTabs"><button data-l="most" class="on">Most used</button><button data-l="all">All</button><button data-l="info">Model information</button></div>
+        <div class="col" id="layMost">
+          <div><h4>Most used</h4>
+            <div class="hint">Click a star to add or remove a layer at once; layers you use a lot also join the list by themselves. Keys 1–0 switch the first ten from anywhere.</div></div>
+          <div id="layMostList"></div>
+          <button id="layMostReset" class="btn sm" style="align-self:flex-start; display:none" title="Remove the layers added from your use (they can come back with further use)">Forget learned layers</button>
+        </div>
+        <div class="col" id="layAll" style="display:none">
+          <div><h4>All parameters</h4>
+            <div class="hint">All map layers sorted into groups. Click a group to expand it, a layer to show it on the map, its star to add it to Most used.</div></div>
+          <div id="layGroups"></div>
+        </div>
+        <div class="box" id="layInfo" style="display:none"></div>
+        <select id="fieldH" hidden></select>
+        <select id="accWin" hidden>
+          <option value="0">since the start of the simulation</option><option value="7">last 7 days</option>
+          <option value="30">last 30 days</option><option value="60">last 60 days</option>
+          <option value="90">last 90 days</option></select>
+      </div>
+
+      <div class="tab" data-panel="mon">
+        <div class="thead"><i class="tmark"></i><span class="ttl">Climate analysis</span><button class="tclose" title="Close the menu (Esc)">×</button></div>
+        <div class="box">
+          <div class="seg" id="anaKind"><button data-k="m" class="on">Months</button><button data-k="s">Seasons</button><button data-k="y">Years</button></div>
+          <label><span class="lbl">Period <b id="monV"></b></span>
+            <input id="monSel" type="range" min="0" max="0" step="1" value="0" /></label>
+        </div>
+        <div class="box">
+          <h4>Map</h4>
+          <div class="mongrid" id="monBtns"></div>
+        </div>
+        <div class="box">
+          <h4>Visible domain</h4>
+          <table id="monTab"><thead><tr><th>Period</th><th title="Mean temperature">T</th><th title="Mean daily maximum">Tx</th><th title="Mean daily minimum">Tn</th><th title="Precipitation">P</th><th title="Snow (water equivalent)">S</th><th title="Absolute T max: the highest temperature anywhere in the visible domain">TXx</th><th title="Absolute T min: the lowest temperature anywhere in the visible domain">TNn</th><th title="Highest daily precipitation anywhere in the visible domain">Rx1d</th></tr></thead>
+            <tbody></tbody><tfoot></tfoot></table>
+          <div class="hint">Domain means: T, mean daily max Tx and min Tn [°C], precipitation P and snow S (water) [mm]. Extremes anywhere in the domain: absolute TXx and TNn [°C], highest daily precipitation Rx1d [mm].
+            * – period in progress. Click a row – map of that period. “Total” – the whole run. A restart clears the saved months.</div>
+        </div>
+      </div>
+
+      <div class="tab" data-panel="set">
+        <div class="thead"><i class="tmark"></i><span class="ttl">Settings</span><button class="tclose" title="Close the menu (Esc)">×</button></div>
+        <div class="box">
+          <h4>Place and climate (a change restarts)</h4>
+          <select id="location"></select>
+          <div class="btns"><button id="worldOpen" class="btn primary">Choose a place on the world map…</button></div>
+          <div class="btns"><button id="worldLast" class="btn">Load the last place (no download)</button></div>
+          <div class="btns"><button id="toTitle" class="btn" title="Choose the map size, start month and area again">Back to the start page…</button></div>
+          <input id="lon" type="number" value="20" hidden /><input id="tbias" type="number" value="0" hidden />
+          <label><span class="lbl">Date</span><input id="date" type="date" value="2026-06-21" /></label>
+          <label><span class="lbl">Start hour (solar time, at restart) <b id="hourV"></b></span>
+            <input id="hour" type="range" min="0" max="23.5" step="0.5" value="6" /></label>
+          <details class="more"><summary>Manual climate (latitude, continentality, humidity)</summary><div>
+            <label><span class="lbl">Latitude <b id="latV"></b></span>
+              <input id="lat" type="range" min="-80" max="80" step="0.01" value="50" /></label>
+            <label><span class="lbl">Continentality (annual range) <b id="contV"></b></span>
+              <input id="cont" type="range" min="0.5" max="2.5" step="0.1" value="1.1" /></label>
+            <label><span class="lbl">Climate humidity (desert … humid) <b id="humV"></b></span>
+              <input id="hum" type="range" min="0" max="1" step="0.05" value="0.75" /></label>
+          </div></details>
+          <label class="row" title="The synoptic model has a systematic bias. The target profile gets a correction: mean from data (normals near the ground, climatology of 1.5 / 3 / 5.6 km) minus the mean of a separate copy of the model with its own weather – the constant bias goes, weather anomalies stay."><input id="climcorr" type="checkbox" checked /> Climate correction from data (ground, 1.5 / 3 / 5.6 km)</label>
+          <div class="hint" id="ccInfo">–</div>
+        </div>
+        <div class="box">
+          <h4>Grid and resolution</h4>
+          <div style="display:flex; gap:8px">
+            <label style="flex:1"><span class="lbl">Width (W–E) [km]</span><input id="gridLx" type="number" min="5" max="5000" step="any" /></label>
+            <label style="flex:1"><span class="lbl">Height (S–N) [km]</span><input id="gridLy" type="number" min="5" max="5000" step="any" /></label>
+          </div>
+          <label><span class="lbl">Detail (cells on the longer side; more = slower)</span><select id="gridRes"></select></label>
+          <label><span class="lbl">Grid spacing</span><select id="gridDx"></select></label>
+          <label><span class="lbl">Domain boundaries</span><select id="gridBc">
+            <option value="open">Open – a part of a larger system (data from the synoptic model)</option>
+            <option value="per">Periodic – what leaves on one side comes back on the other</option></select></label>
+          <div class="hint" id="gridInfo"></div>
+          <div class="btns"><button id="gridApply" class="btn primary">Apply grid (reloads the page)</button></div>
+        </div>
+        <div class="box">
+          <h4>Map overlays</h4>
+          <label class="row"><input id="tipOn" type="checkbox" checked /> Tooltip with values under the cursor</label>
+          <label class="row"><input id="reliefShade" type="checkbox" checked /> Terrain shading</label>
+          <label class="row"><input id="reliefIso" type="checkbox" checked /> Contour lines (every 50–500 m)</label>
+          <label class="row"><input id="windArrows" type="checkbox" /> Wind arrows (W)</label>
+          <label class="row" title="Places above 1000 inhabitants (GeoNames, CC BY 4.0) – only on real terrain from the world map. Dot size and labels depend on the map zoom; other names on hover. Clicking a dot adds a weather station."><input id="cityOn" type="checkbox" checked /> Cities and villages (click – station)</label>
+          <label class="row"><input id="gridLines" type="checkbox" checked /> Helper grid (not on satellite images)</label>
+          <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center"><span class="lbl">Cloud levels:</span>
+            <label class="row"><input id="clLow" type="checkbox" checked /> low</label>
+            <label class="row"><input id="clMid" type="checkbox" checked /> middle</label>
+            <label class="row"><input id="clHigh" type="checkbox" checked /> high</label></div>
+        </div>
+        <div class="box">
+          <h4>Cross-sections</h4>
+          <label class="row"><input id="overlay" type="checkbox" checked /> Clouds and rain on cross-sections</label>
+          <label><span class="lbl">Cloud opacity on cross-sections (0 = outlines only) <b id="cloudAlphaV"></b></span>
+            <input id="cloudAlpha" type="range" min="0" max="100" step="5" value="50" /></label>
+          <label><span class="lbl">Contrast of perturbation fields (w, u, v, θ', p') <b id="rangeV"></b></span>
+            <input id="range" type="range" min="-2" max="2" step="0.1" value="0" /></label>
+        </div>
+        <div class="box">
+          <h4>Save and load</h4>
+          <div class="hint">Saves all settings (grid, place, date, air mass, terrain – also painted, surface, weather from the synoptic model, stations). The link opens exactly the same start.</div>
+          <div class="btns"><button id="stSave" class="btn">Save file</button><button id="stLoad" class="btn">Load file…</button><button id="stLink" class="btn primary">Copy link</button></div>
+          <input id="stFile" type="file" accept=".json,application/json" hidden />
+          <div class="hint" id="stInfo"></div>
+        </div>
+        <div class="box">
+          <h4>Diagnostics</h4>
+          <div id="perf">starting…</div>
+        </div>
+      </div>
+    </aside>
+
+    <section id="main">
+      <div id="mapHead">
+        <div class="seg" id="viewSeg"><button data-v="map" class="on">Map</button><button data-v="3d">3D</button></div>
+        <h3 id="xyTitle">Map</h3><span class="sub" id="xyInfo"></span>
+        <div class="ctl" id="ctl3d" style="display:none" title="drag: rotate · wheel: zoom · double-click: default view">
+          <label>exaggeration <input id="exag3" type="range" min="-2" max="2" step="0.25" value="0" /><b id="exag3V"></b></label>
+          <label title="Semi-transparent pink layer at the height of the 0 °C isotherm"><input id="v3frz" type="checkbox" /> 0 °C</label>
+          <label title="Clouds cut along the vertical cross-section line; vertical velocity on the plane: red up, blue down"><input id="v3cut" type="checkbox" /> section</label>
+          <label title="New 3D view (work in progress): 1:1 scale – exaggeration only from the slider, cloud shapes independent of exaggeration; untick to compare with the old one"><input id="v3new" type="checkbox" /> new</label>
+          <button id="flyBtn" class="iconbtn sm" title="Free camera at 1:1 scale (L): WASD – move, space/E – up, C/Q – down, drag – look around, wheel – speed, Shift ×5, Esc – end">✈ Fly</button>
+          <b id="flyV"></b></div>
+        <div class="ctl" id="zsCtl"><label>height <input id="zs" type="range" min="50" max="12000" step="50" value="1000" /><b id="zsV"></b></label></div>
+        <div class="leg" id="legXY"><span class="lo"></span><div class="bar"></div><span class="hi"></span><div class="ticks"></div><div class="note"></div></div>
+        <div class="tools"><button id="snapBtn" class="iconbtn sm" title="Save an image of the map / 3D view (P)">📷</button>
+          <button id="recBtn" class="iconbtn sm" title="Record a timelapse of the map / 3D view (WebM file)">⏺ Record</button>
+          <button id="fsBtn" class="iconbtn sm" title="Full screen (F)">⛶</button></div>
+      </div>
+      <div id="mapBox">
+        <div id="mapInner">
+          <canvas id="cxy" class="gpu"></canvas>
+          <div id="north">N<br>▲</div>
+          <div id="scale"><span id="scaleTxt"></span><i id="scaleBar"></i><span id="zoomTxt"></span></div>
+          <div id="tip"></div>
+          <div id="probe" title="Probe"></div>
+        </div>
+      </div>
+    </section>
+
+    <aside id="ana">
+      <div id="anaHead"><div class="seg" id="anaSeg">
+        <button data-a="xz" class="on">Cross-section</button><button data-a="prof">Probe</button><button data-a="st">Stations</button></div></div>
+
+      <div class="apanel on" data-ap="xz">
+        <h3>Vertical cross-section <span class="sub" id="xzInfo"></span></h3>
+        <select id="fieldV" title="Field on the vertical cross-section"></select>
+        <div class="ctl">
+          <label>y <input id="ys" type="range" min="0" max="100" step="0.5" value="50" /><b id="ysV"></b></label>
+          <label>top <input id="zt" type="range" min="1" max="20" step="0.5" value="6" /><b id="ztV"></b></label>
+        </div>
+        <canvas id="cxz" class="gpu"></canvas>
+        <div class="ax"><span>x = 0 km</span><span id="xzTop"></span><span class="xmax"></span></div>
+        <div class="leg" id="legXZ"><span class="lo"></span><div class="bar"></div><span class="hi"></span><div class="ticks"></div><div class="note"></div></div>
+        <div class="hint">The section line is marked on the map.</div>
+      </div>
+
+      <div class="apanel" data-ap="prof">
+        <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap">
+          <h3>Vertical profile</h3>
+          <div class="seg" id="profSeg"><button data-p="point" class="on">Probe</button><button data-p="mean">Mean</button></div>
+        </div>
+        <span class="sub" id="profSub">probe at a point (click the map) · dots: parcel from the ground</span>
+        <canvas id="cprof"></canvas>
+        <div id="profInfo"></div>
+        <h3 class="mh">Probe meteogram <span class="sub">3 days · T, Td, clouds, precipitation, pressure, wind</span></h3>
+        <canvas id="cmet"></canvas>
+      </div>
+
+      <div class="apanel" data-ap="st">
+        <div class="hint">Weather stations at chosen map points: live readings, measurement history, meteogram and spreadsheet export (CSV).
+          The station list is remembered in the browser and in saved states.</div>
+        <input id="stName" type="text" placeholder="name of the new station (optional)" maxlength="40" />
+        <div class="btns"><button id="stAdd" class="btn primary">+ Add station (click the map)</button><button id="stAddProbe" class="btn">At the probe</button><button id="stPeak" class="btn" title="Station on a summit: click the map near a mountain – the station goes to the highest point of the real terrain within ~1 grid cell (min. 2 km). Station height from the detailed terrain; a station above the model ground measures the model air at its own height">⛰ Summit</button></div>
+        <table id="stTable"></table>
+        <div style="display:flex; gap:8px; align-items:center"><h3 class="mh" id="stMetTitle" style="flex:1">Meteogram</h3>
+          <select id="stRange" style="width:auto"><option value="d3">3 days (every 10 min)</option><option value="d120">up to 120 days (hourly)</option><option value="all">whole period (daily)</option></select></div>
+        <canvas id="cmetSt"></canvas>
+        <h3 class="mh">Spreadsheet export</h3>
+        <div class="hint">The further back, the coarser: every 10 min – the last 3 days, hourly means – 120 days, daily summaries (Tmin, Tmax,
+          precipitation, snow, wind, pressure, cloud cover, sunshine, snow depth, fog) – the whole run, for long-term studies. History counts from the start (a restart clears it).</div>
+        <div class="btns"><select id="stCsvKind" style="flex:1"><option value="day">daily – whole period</option><option value="hour">hourly – up to 120 days</option><option value="min10">every 10 min – 3 days</option></select>
+          <button id="stCsv" class="btn primary" style="flex:0 0 auto">Save CSV</button></div>
+        <div class="btns"><button id="stClear" class="btn">Remove all stations</button></div>
+      </div>
+    </aside>
+  </div>
+  <script>
+    // Strona otwarta wprost z pliku albo bez serwera Vite: skrypt główny się nie załaduje.
+    (function () {
+      var hint = 'This page must be opened through the Vite server.\n' +
+        '1. In the project folder double-click start.bat (or run in a terminal: npm run dev).\n' +
+        '2. Open the address shown in the window in Chrome (usually http://localhost:5173).';
+      var noLoad = function () { document.getElementById('loadScr').classList.remove('on'); };
+      if (location.protocol === 'file:') { noLoad(); document.getElementById('err').textContent = hint; return; }
+      setTimeout(function () {
+        if (!window.__started) { noLoad(); document.getElementById('err').textContent = 'The script did not load.\n' + (/^(localhost|127\.)/.test(location.hostname) ? hint : 'Check your connection and reload the page.'); }
+      }, 5000);
+    })();
+  </script>
+  <script type="module" src="/src/boot.js"></script>
+</body>
+</html>

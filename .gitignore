@@ -1,0 +1,6 @@
+node_modules/
+dist/
+Weather3D_zmiany_*/
+Weather3D_zmiany_*.zip
+dist_old
+dist_t

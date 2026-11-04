@@ -1,0 +1,11 @@
+window.__h = 6; window.__f = 20;
+sim.stop();
+sim.set('date', '2026-07-10');
+await sim.dem(52.7, 10.2, 1.0, 0.8);
+sim.stop(); await sim.roll(window.__sd || 2); sim.stop();
+const a = await sim.run(1), b = await sim.run(1), dt = (b.simHours - a.simHours) * 3600;
+await sim.run(Math.round((window.__h || 13) * 3600 / dt));
+sim.set('fieldH', window.__f ?? 23); sim.set('windArrows', true);
+await sim.draw();
+await new Promise((r) => setTimeout(r, 1500));
+log('ok');

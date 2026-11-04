@@ -1,0 +1,19 @@
+{
+  "name": "weather3d",
+  "version": "1.0.0",
+  "description": "3D weather simulation in the browser (WebGPU)",
+  "license": "MIT",
+  "scripts": {
+    "dev": "vite --open",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "type": "module",
+  "devDependencies": {
+    "vite": "^8.3.4"
+  },
+  "private": true,
+  "dependencies": {
+    "geotiff": "^2.1.3"
+  }
+}
