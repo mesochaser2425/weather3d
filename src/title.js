@@ -2,6 +2,9 @@
 // bez przeładowania strony, więc wszystko rusza od razu z wybranymi ustawieniami. Zapamiętane w przeglądarce (w3d-title).
 import { tile, demColor, lonLatToTile, tileToLonLat } from './geo.js';
 import { NICE_DX, RES_OPTS, planGrid } from './gridplan.js';
+import { openRun, stashRun, resumeUrl } from './runfile.js';
+import { MANIP_RAIN, MANIP_VAR, fmtT, fmtX, manipQuery } from './manip.js';
+import { toD, fromD, unitD, fmDx, isImp, setImp, onUnits } from './units.js';
 
 const $ = (id) => document.getElementById(id);
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -18,7 +21,7 @@ $('titleScr').classList.add('on');
 // ---------- ustawienia ----------
 for (const km of SIZES) {
   const b = document.createElement('button');
-  b.className = 'chipb'; b.textContent = `${km} km`; b.dataset.km = km;
+  b.className = 'chipb'; b.dataset.km = km;
   b.onclick = () => { st.lx = km; st.ly = km; fitView(); ui(); };
   $('ttSizes').appendChild(b);
 }
@@ -29,7 +32,7 @@ for (const r of RES_OPTS) {
   $('ttRes').appendChild(b);
 }
 $('ttDx').add(new Option('automatic (from the detail)', 'auto'));
-for (const d of NICE_DX) $('ttDx').add(new Option(d < 1000 ? `${d} m` : `${d / 1000} km`, d));
+for (const d of NICE_DX) $('ttDx').add(new Option('', d));
 $('ttDx').onchange = () => { st.dx = $('ttDx').value; ui(); };
 MONTHS.forEach((m, i) => {
   const b = document.createElement('button');
@@ -38,19 +41,33 @@ MONTHS.forEach((m, i) => {
   $('ttMonths').appendChild(b);
 });
 for (const [id, k] of [['ttLx', 'lx'], ['ttLy', 'ly']]) {
-  $(id).addEventListener('change', () => { st[k] = Math.min(5000, Math.max(5, +$(id).value || st[k])); fitView(); ui(); });
+  $(id).addEventListener('change', () => { const v = +$(id).value; st[k] = Math.min(5000, Math.max(5, v ? fromD(v, 'km') : st[k])); fitView(); ui(); });
 }
+// manipulacja atmosfery: nie zapamiętywana, każda sesja startuje od neutralnych nastaw (ustawione kiedyś +6 K zostawało potem niezauważone)
+const manT = () => +$('ttTan').value, manR = () => MANIP_RAIN[+$('ttRain').value], manV = () => MANIP_VAR[+$('ttVar').value];
+function manUi() {
+  const lab = (id, t, on) => { $(id).textContent = t; $(id).style.color = on ? '#ff9a3c' : ''; };
+  lab('ttTanV', fmtT(manT()), manT() !== 0); lab('ttRainV', fmtX(manR()), manR() !== 1); lab('ttVarV', fmtX(manV()), manV() !== 1);
+}
+for (const id of ['ttTan', 'ttRain', 'ttVar']) $(id).addEventListener('input', manUi);
+manUi();
 const fmtLL = (lat, lon) => `${Math.abs(lat).toFixed(2)}°${lat >= 0 ? 'N' : 'S'} ${Math.abs(lon).toFixed(2)}°${lon >= 0 ? 'E' : 'W'}`;
 function ui() {
   const g = plan();
-  $('ttLx').value = String(Math.round(st.lx));
-  $('ttLy').value = String(Math.round(st.ly));
+  $('ttLx').value = String(Math.round(toD(st.lx, 'km')));
+  $('ttLy').value = String(Math.round(toD(st.ly, 'km')));
+  const uKm = unitD('km');
+  $('ttLxL').textContent = `Width (W–E) [${uKm}]`;
+  $('ttLyL').textContent = `Height (S–N) [${uKm}]`;
+  for (const b of $('ttSizes').children) b.textContent = `${Math.round(toD(+b.dataset.km, 'km'))} ${uKm}`;
+  for (const o of $('ttDx').options) if (o.value !== 'auto') o.textContent = fmDx(+o.value);
+  for (const b of $('ttUnits').children) b.classList.toggle('on', (b.dataset.u === 'imperial') === isImp());
   for (const b of $('ttSizes').children) b.classList.toggle('on', +b.dataset.km === Math.round(st.lx) && +b.dataset.km === Math.round(st.ly));
   for (const b of $('ttRes').children) b.classList.toggle('on', +b.dataset.r === st.res);
   for (const b of $('ttMonths').children) b.classList.toggle('on', +b.dataset.m === st.month);
   $('ttDx').value = String(st.dx);
-  const sp = g.dx < 1000 ? `${g.dx} m` : `${g.dx / 1000} km`, secs = 30 * g.cost;
-  $('ttInfo').innerHTML = `Grid spacing <b>${sp}</b> · <b>${g.nx} × ${g.ny}</b> cells · map <b>${Math.round(g.nx * g.dx / 1000)} × ${Math.round(g.ny * g.dx / 1000)} km</b><br>`
+  const sp = fmDx(g.dx), secs = 30 * g.cost;
+  $('ttInfo').innerHTML = `Grid spacing <b>${sp}</b> · <b>${g.nx} × ${g.ny}</b> cells · map <b>${Math.round(toD(g.nx * g.dx / 1000, 'km'))} × ${Math.round(toD(g.ny * g.dx / 1000, 'km'))} ${uKm}</b><br>`
     + `${g.sc.name[0].toUpperCase()}${g.sc.name.slice(1)}: ${g.sc.use}<br>One day at max speed ≈ <b${secs > 45 ? ' style="color:var(--warn)"' : ''}>${secs < 100 ? secs.toFixed(0) : Math.round(secs / 10) * 10} s</b> (RTX 5060 Ti)`;
   $('ttPlace').textContent = fmtLL(st.lat, st.lon);
   savePref();
@@ -146,7 +163,7 @@ function draw() {
   ctx.strokeRect(xa, ya, xb - xa, yb - ya);
   ctx.fillStyle = '#d9d9d9'; ctx.strokeStyle = '#005d63'; ctx.lineWidth = 1.5;
   for (const [x, y] of [[xa, ya], [xb, ya], [xa, yb], [xb, yb]]) { ctx.fillRect(x - 5, y - 5, 10, 10); ctx.strokeRect(x - 5, y - 5, 10, 10); }
-  const lab = `${Math.round(r.lx)} × ${Math.round(r.ly)} km`;
+  const lab = `${Math.round(toD(r.lx, 'km'))} × ${Math.round(toD(r.ly, 'km'))} ${unitD('km')}`;
   ctx.font = "700 13px Jura, 'Segoe UI', sans-serif"; ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
   const lx = (xa + xb) / 2, ly = Math.max(16, ya - 8), tw = ctx.measureText(lab).width;
   ctx.fillStyle = 'rgba(12,12,39,0.85)'; ctx.fillRect(lx - tw / 2 - 6, ly - 16, tw + 12, 18);
@@ -238,15 +255,30 @@ async function start(place) {
   const g = plan();
   savePref();
   const a = place ? `${st.lat.toFixed(3)},${st.lon.toFixed(3)},${st.month}` : `,,${st.month}`;
-  history.replaceState(null, '', `${location.pathname}?dx=${g.dx}&nx=${g.nx}&ny=${g.ny}&start=${a}`);
+  history.replaceState(null, '', `${location.pathname}?dx=${g.dx}&nx=${g.nx}&ny=${g.ny}&start=${a}${manipQuery(manT(), manR(), manV())}`);
   $('titleScr').classList.remove('on');
   $('loadScr').classList.add('on');
   await import('./main.js');
 }
 $('ttStart').onclick = () => start(true);
 $('ttFlat').onclick = () => start(false);
+// zapisany przebieg: plik do pamięci przeglądarki, adres z siatką przebiegu (main.js wczyta go od razu, bez rozbiegu)
+$('ttResume').onclick = () => $('ttRunFile').click();
+$('ttRunFile').onchange = async () => {
+  const file = $('ttRunFile').files[0];
+  $('ttRunFile').value = '';
+  if (!file) return;
+  try {
+    const { meta } = await openRun(file);
+    $('ttRunInfo').textContent = `Loading the run saved at ${meta.date}…`;
+    await stashRun(file);
+    location.href = resumeUrl(meta);
+  } catch (e) { $('ttRunInfo').textContent = `Could not load the file: ${e.message}`; }
+};
 document.addEventListener('keydown', (e) => { if (e.key === 'Enter' && $('titleScr').classList.contains('on') && e.target.tagName !== 'INPUT' && e.target.tagName !== 'BUTTON' && e.target.tagName !== 'SELECT') start(true); });
 
+for (const b of $('ttUnits').children) b.onclick = () => setImp(b.dataset.u === 'imperial');
+onUnits(() => { if ($('titleScr').classList.contains('on')) { manUi(); ui(); } });
 ui();
 fitView();
 // czcionka dojdzie po pierwszym rysowaniu – podpis wymiarów

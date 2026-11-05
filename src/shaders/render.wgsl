@@ -466,14 +466,23 @@ fn cuDisp2(xy: vec2f) -> vec4f {
   let b = mix(V.cuD2[u32(ty.y) * n + u32(tx.x)], V.cuD2[u32(ty.y) * n + u32(tx.y)], tx.z);
   return mix(a, b, ty.z);
 }
-// wm – udział chmur piętra średniego (wzór płynie z wiatrem średnim 0–6 km zamiast wiatru warstwy cumulusów)
+// wm – udział chmur piętra średniego: dwa osobne wzory (niskie płyną z wiatrem warstwy cumulusów, średnie z wiatrem średnim 0–6 km)
+// o częściach powierzchni fc·(1 − wm) i fc·wm. Wcześniej jeden wzór z przesunięciem mieszanym wg wm: przesunięcia wzorów różnią się
+// o dziesiątki km (różnica wiatrów × okres pokolenia, w MAX ~4 h), a wm zmienia się na 1–2 oczkach, więc wzór ściskał się w poprzek
+// tego przejścia kilkanaście razy – cienkie, poskręcane białe smugi wzdłuż granicy pięter.
+// Pętla po obu wzorach i pokoleniach, granice zależne od wm: drugi wzór liczony tylko w przejściu (jak blobMask w widokach 3D)
 fn cuBlob(X: f32, Y: f32, fc: f32, wm: f32) -> f32 {
   let xy = vec2f((X - f32(MG)) * DX, (Y - f32(MG)) * DY);
-  let d = mix(cuDisp(xy), cuDisp2(xy), wm);
+  let dl = cuDisp(xy);
+  let dh = cuDisp2(xy);
   var m = 0.0;
-  for (var g = 0u; g < 2u; g++) {
+  let t1 = select(4u, 2u, wm <= 0.01);
+  for (var t = select(0u, 2u, wm >= 0.99); t < t1; t++) {
+    let mid = t >= 2u;
+    let g = t & 1u;
+    let d = select(dl, dh, mid);
     let gq = cuGen(xy, select(d.xy, d.zw, g == 1u), V.cuPh, V.blobS, g);
-    let sh = cuShape(gq.xy, fc, gq.z);
+    let sh = cuShape(gq.xy + select(vec2f(0.0), CU_MID, mid), fc * select(1.0 - wm, wm, mid), gq.z);
     let mk = 1.0 - smoothstep(sh.y - 0.06, sh.y + 0.06, sh.x);
     m = max(m, mk * (0.75 + 0.5 * clamp(1.0 - sh.x / max(sh.y, 1e-3), 0.0, 1.0)));
   }

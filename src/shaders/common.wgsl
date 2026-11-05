@@ -151,6 +151,8 @@ fn cuGen(xy: vec2f, d: vec2f, ph0: f32, S: f32, g: u32) -> vec3f {
   let q = (xy - d) / S + off;
   return vec3f(q, tau);
 }
+// przesunięcie wzoru chmur piętra średniego względem niskich (w bokach siatki): osobny układ kłębów, gdy oba piętra są w jednym miejscu
+const CU_MID: vec2f = vec2f(37.3, 53.9);
 // położenie w kaflach przesunięcia (środki kafli w (i + 0.5)·L/n): indeksy i0, i1 i waga
 fn cuTile(x: f32, L: f32, n: f32) -> vec3f {
   let f = clamp(x / L * n - 0.5, 0.0, n - 1.0);

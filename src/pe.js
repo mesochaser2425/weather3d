@@ -256,6 +256,29 @@ export class PEModel {
     return m;
   }
 
+  // model z pełnego zapisu przebiegu: info – saveInfo(), data – { S, wk, dg } (tablice f32); opts.land – ląd, morze, teren i klimat podłoża z pliku (bez mapy świata)
+  static async restore(device, opts, info, data) {
+    const nx = channelCells(info.lat);
+    if (nx !== NXP) setWidth(nx);
+    if (NXP !== info.nxp || NYP !== info.nyp || NZP !== info.nzp) throw new Error('the file needs a different synoptic model grid');
+    const sh = await getShared(device);
+    const m = new PEModel(sh, { ...opts, forcV: info.forcV ?? 1, lat: info.lat, lon: info.lon, cont: info.cont, hum: info.hum, seed: info.seed, doy: info.doy, doyRef: info.doyRef, tRef: info.tRef, hour0: info.hour0,
+      geo: info.geoLon === null ? null : { lon: info.geoLon } });
+    if (m.wkLen !== info.wkLen) { m.destroy(); throw new Error('the file comes from an incompatible version (synoptic model layout)'); }
+    Object.assign(m, { p: 0, time: info.time, hslot: info.hslot, nhist: info.nhist });
+    device.queue.writeBuffer(m.S[0], 0, data.S);
+    device.queue.writeBuffer(m.wk, 0, data.wk);
+    device.queue.writeBuffer(m.dg, 0, data.dg);
+    m.writeUniforms();
+    return m;
+  }
+
+  // opis modelu do pełnego zapisu przebiegu (bufory S, wk i dg czyta main.js)
+  saveInfo() {
+    return { lat: this.lat, lon: this.lon, cont: this.cont, hum: this.hum, seed: this.seed, doy: this.doy, doyRef: this.doyRef, tRef: this.tRef, hour0: this.hour0,
+      forcV: this.forcV, time: this.time, hslot: this.hslot, nhist: this.nhist, geoLon: this.geo ? this.geo.lon : null, nxp: NXP, nyp: NYP, nzp: NZP, wkLen: this.wkLen };
+  }
+
   constructor(sh, opts, from = null) {
     this.sh = sh;
     const d = sh.device, U = GPUBufferUsage;
@@ -276,7 +299,10 @@ export class PEModel {
     this.ub = d.createBuffer({ size: 4 * USLOT, usage: U.UNIFORM | U.COPY_DST });
     this.doyRef = opts.doyRef ?? opts.doy;   // data odpowiadająca chwili tRef modelu
     this.tRef = opts.tRef ?? 0;
+    this.varAt = opts.varAt ?? null;   // manipulacja atmosfery: zmienność pogody w chwili t [s czasu symulacji, ujemne – rozbieg]
+    this.forcV = opts.forcV ?? null;   // wartość użyta w ostatnich wymuszeniach
     this.hour0 = opts.hour0 ?? opts.hour ?? 12;   // godzina słoneczna w środku kanału (domena) w chwili tRef
+    if (opts.land) Object.assign(this, opts.land);
     if (from) {
       // własna kopia tablic wymuszeń (pory roku: każda kopia może być w innym dniu)
       this.vzData = from.vzData.slice(); this.vzOff = from.vzOff; this.sea = from.sea; this.encl = from.encl; this.tNorm = from.tNorm;
@@ -382,6 +408,25 @@ export class PEModel {
       v[off.BW + j] = dw < NBND ? ((NBND - dw) / NBND) ** 2 / 86400 : 0;
       // szerokość pasa (położenie słońca liczy pe_rad z godziny w uniformach)
       v[off.SLAT + j] = Math.sin(latY(y) * Math.PI / 180); v[off.CLAT + j] = Math.cos(latY(y) * Math.PI / 180);
+    }
+    // Manipulacja atmosfery „zmienność pogody” (V): kontrast południkowy temperatury w celu regulatora średniej strefowej i w profilu ścian (wokół średniej
+    // z kanału na danym poziomie, ważonej cos φ) i wiatr zachodni celu × V, do ~10 km, wyżej zanika. Większy kontrast to silniejsza chwiejność baroklinowa:
+    // głębsze niże i silniejsze fronty, a nie przesunięcie klimatu (kopia do korekty klimatu ma to samo, więc korekta zabiera ewentualną zmianę średniej).
+    // W rozbiegu i przy konstruktorze – wartość z chwili ujemnej (start) albo z pliku zapisu.
+    const VF = this.time === undefined ? (this.forcV ?? (this.varAt ? this.varAt(-1) : 1)) : (this.varAt ? this.varAt(this.time - this.tRef) : 1);
+    this.forcV = VF;
+    if (VF !== 1) {
+      for (let k = 0; k < NZP; k++) {
+        const vk = 1 + (VF - 1) * (1 - Math.min(1, Math.max(0, (ZC[k] - 10000) / 4000)));
+        let sw = 0, sz = 0, se = 0;
+        for (let j = 0; j < NYP; j++) { const w = v[off.CLAT + j]; sw += w; sz += w * v[off.ZCT + j * NZP + k]; se += w * v[off.TEQ + j * NZP + k]; }
+        for (let j = 0; j < NYP; j++) {
+          const q = j * NZP + k;
+          v[off.ZCT + q] = sz / sw + vk * (v[off.ZCT + q] - sz / sw);
+          v[off.TEQ + q] = se / sw + vk * (v[off.TEQ + q] - se / sw);
+          v[off.UCT + q] *= vk;
+        }
+      }
     }
     if (!this.sea) this.makeSea(latY);
     // długość geograficzna kolumny (jak w makeSea; bez geografii – null)

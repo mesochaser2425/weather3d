@@ -11,9 +11,12 @@ import { FIELDS, FIELDS_3D, FIELDS_MAP, LAYER_GROUPS, rangeFor, legendCss, RADAR
 import { WXS, WX_CMAP0, WX_WGSL, WX_INDEX, wxTicks, wxColor, wxLegendCss } from './wxscales.js';
 const tempColor = (t) => wxColor('temp', t);
 const radarColor = (r) => wxColor('prate', r);
-import { drawProfile, drawMeteogram } from './profile.js';
+import { drawProfile, drawMeteogram, newView, attachView, MET_L, MET_R } from './profile.js';
 import { analyzeSounding, renderSounding } from './sounding.js';
 import { createStations } from './stations.js';
+import { toD, fromD, unitD, nD, fm, fT, fdT, fmH, fmZ, fmDx, fmVis, rnd, isImp, setImp, onUnits } from './units.js';
+import { MANIP_RAIN, MANIP_VAR, fmtT, fmtX, nearest, manipQuery, seg, segAt } from './manip.js';
+import { packRun, openRun, jsonPack, jsonUnpack, stashRun, stashedRun, clearStash, resumeUrl } from './runfile.js';
 import commonSrc from './shaders/common.wgsl?raw';
 import simSrc from './shaders/sim.wgsl?raw';
 import renderSrc from './shaders/render.wgsl?raw';
@@ -82,15 +85,18 @@ async function init() {
   for (const [k, a] of Object.entries(AIRMASSES)) $('airmass').add(new Option(a.name, k));
   for (const [k, n] of Object.entries(SHAPES)) $('shape').add(new Option(n, k));
   for (const [k, n] of Object.entries(LANDUSE)) $('landuse').add(new Option(n, k));
-  for (const id of FIELDS_3D) $('fieldV').add(new Option(`${FIELDS[id].name} [${FIELDS[id].unit}]`, id));
+  // nazwa grupy warstw: wysokość poziomu ciśnienia w jednostkach na ekranie
+  const lyGrName = (n) => (isImp() ? n.replace(/~([\d,]+) m/, (_, x) => `~${(Math.round(+x.replace(',', '') * 3.28084 / 100) * 100).toLocaleString('en-US')} ft`) : n);
+  const fieldOpt = (id) => `${FIELDS[id].name}${id === 29 || id === 30 ? '' : ` [${unitD(FIELDS[id].unit)}]`}`;
+  for (const id of FIELDS_3D) $('fieldV').add(new Option(fieldOpt(id), id));
   const g3 = document.createElement('optgroup'); g3.label = 'Surface maps';
   for (const id of FIELDS_MAP) {
-    const o = new Option(`${FIELDS[id].name}${id === 29 || id === 30 ? '' : ` [${FIELDS[id].unit}]`}`, id);
+    const o = new Option(fieldOpt(id), id);
     o.hidden = id >= 80 && id <= 88;           // mapy miesięczne – wybierane w zakładce Miesiące (krótsza lista)
     g3.appendChild(o);
   }
   const g4 = document.createElement('optgroup'); g4.label = 'Horizontal section at height';
-  for (const id of FIELDS_3D) g4.appendChild(new Option(`${FIELDS[id].name} [${FIELDS[id].unit}]`, id));
+  for (const id of FIELDS_3D) g4.appendChild(new Option(fieldOpt(id), id));
   $('fieldH').append(g3, g4);
   $('fieldH').value = '20';
   $('fieldV').value = '0';
@@ -136,7 +142,7 @@ async function init() {
   const paramBuf = buf(SLOT * MAX_STEPS, U.UNIFORM | U.COPY_DST, 'params');
   const TG_SLOT = 4 * N + 15 * NXY;                // pola docelowe jednego terminu (3D: θ', q_v, u, v; 2D: u_g, v_g, p, w, geometria frontu ×8, diagnostyka ×3)
   const NF = kfrOf(grid) * NXY;                    // wyostrzenie frontów Φ (θ', q_v, u, v) na poziomach poniżej ~7 km, dwa bufory na zmianę
-  const tgtBuf = buf((3 * TG_SLOT + 8 * NF) * 4, U.STORAGE | U.COPY_SRC, 'targets');
+  const tgtBuf = buf((3 * TG_SLOT + 8 * NF) * 4, U.STORAGE | U.COPY_SRC | U.COPY_DST, 'targets');
   device.queue.writeBuffer(vgBuf, 0, grid.data);
 
   // --- Potoki obliczeniowe ---
@@ -505,7 +511,48 @@ async function init() {
   const tgW = (a) => { const u = Math.min(1, Math.max(0, a)); return [0.5 * (1 - u) * (1 - u), 0.5 + u - u * u, 0.5 * u * u]; };
   const drv = { mode: 'syn', seed: 1 + Math.floor(Math.random() * 1e6), key: '', start: null, model: null,
     tA: 0, slot: 0, pg0: null, cls: null, fc: [], fcModel: null, synDirty: false, lastDraw: 0 };
-  const climKey = () => [num('lat'), num('cont'), num('hum'), dayOfYear($('date').value), drv.seed, $('location').value === 'custom' ? num('lon') : 'x', num('tbias'), num('hour')].join('|');
+  const climKey = () => [num('lat'), num('cont'), num('hum'), dayOfYear($('date').value), drv.seed, $('location').value === 'custom' ? num('lon') : 'x', num('tbias'), num('hour'), MANIP_VAR[num('manipV')]].join('|');
+  // Manipulacja atmosfery (zakładka Weather, strona tytułowa): T – anomalia temperatury [K], R – mnożnik opadu, V – zmienność pogody. Przy starcie działa od razu
+  // (stan początkowy, rozbieg modelu synoptycznego), a zmiana w trakcie przebiegu wchodzi liniowo przez wybrany czas (odcinek from → to w t0…t1). Ten sam odcinek
+  // widzą kopie modelu synoptycznego w swoim czasie, więc prognoza już pokazuje to, co nadchodzi. log – historia nastaw (ostatni wiersz CSV).
+  const manip = { T: seg(0), R: seg(1), V: seg(1), log: [] };
+  {
+    const q = new URLSearchParams(location.search);
+    if (q.has('tan')) $('tanom').value = +q.get('tan');
+    if (q.has('rnf')) $('manipR').value = nearest(MANIP_RAIN, +q.get('rnf'));
+    if (q.has('vrf')) $('manipV').value = nearest(MANIP_VAR, +q.get('vrf'));
+  }
+  const manipTarget = () => ({ T: num('tanom'), R: MANIP_RAIN[num('manipR')], V: MANIP_VAR[num('manipV')] });
+  const mAt = (k, t) => (drv.mode === 'syn' ? segAt(manip[k], t) : (k === 'T' ? 0 : 1));
+  const manipVarAt = (t) => segAt(manip.V, t);
+  // start przebiegu: od razu pełne nastawy
+  function manipFlat() {
+    const m = manipTarget();
+    for (const k of ['T', 'R', 'V']) manip[k] = seg(m[k]);
+    manip.log = [{ t: 0, ...m }];
+  }
+  // suwak w trakcie przebiegu: od bieżącej wartości do nowej przez czas „kick-in”
+  function manipApply() {
+    const m = manipTarget(), now = sim.time, ramp = +$('manipRamp').value * 86400;
+    for (const k of ['T', 'R', 'V']) if (manip[k].to !== m[k]) manip[k] = { from: segAt(manip[k], now), to: m[k], t0: now, t1: now + ramp };
+    const last = manip.log[manip.log.length - 1];
+    if (last && now - last.t < 1800) Object.assign(last, m); else manip.log.push({ t: now, ...m });
+    manipUi();
+  }
+  function manipUi() {
+    const m = manipTarget(), now = sim.time, on = (id, x) => { $(id).style.color = x ? '#ff9a3c' : ''; };
+    $('tanomV').textContent = fmtT(m.T); on('tanomV', m.T !== 0);
+    $('manipRV').textContent = fmtX(m.R); on('manipRV', m.R !== 1);
+    $('manipVV').textContent = fmtX(m.V); on('manipVV', m.V !== 1);
+    const left = Math.max(manip.T.t1, manip.R.t1, manip.V.t1) - now;
+    const txt = left > 0 ? `Kicking in, ${left >= 86400 ? `${(left / 86400).toFixed(1)} days` : `${Math.max(1, Math.round(left / 3600))} h`} left. Now ${fmtT(+segAt(manip.T, now).toFixed(1))}, precipitation ${fmtX(segAt(manip.R, now))}, variability ${fmtX(segAt(manip.V, now))}.` : '';
+    if ($('manipNow').textContent !== txt) $('manipNow').textContent = txt;
+  }
+  // ostatni wiersz CSV: historia nastaw (bez niej raportu z przebiegu nie da się jednoznacznie opisać)
+  function manipCsv() {
+    if (!manip.log.some((e) => e.T !== 0 || e.R !== 1 || e.V !== 1)) return 'atmosphere manipulation none';
+    return `atmosphere manipulation ${manip.log.map((e) => `day ${Math.floor(e.t / 86400) + 1}: T ${e.T} K, precip x${e.R}, variability x${e.V}`).join(' | ')}`;
+  }
   const nextFrame = () => new Promise((r) => requestAnimationFrame(() => r()));
   function constParams() {
     const [u0, v0] = windUV();
@@ -519,7 +566,8 @@ async function init() {
     if (pg) device.queue.writeBuffer(vgBuf, grid.off.PGRID * 4, pg);
     const ab = new ArrayBuffer(PARAM_BYTES);
     new Uint32Array(ab)[22] = slot;
-    new Float32Array(ab)[31] = drv.mode === 'syn' ? num('tanom') : 0;     // anomalia temperatury (suwak Pogoda)
+    new Float32Array(ab)[31] = mAt('T', sim.time);     // manipulacja atmosfery: anomalia temperatury, mnożnik opadu
+    new Float32Array(ab)[33] = mAt('R', sim.time);
     device.queue.writeBuffer(paramBuf, 0, ab);
     const enc = device.createCommandEncoder();
     const pass = enc.beginComputePass();
@@ -803,7 +851,7 @@ async function init() {
     enc.copyBufferToBuffer(dayTmp, 0, sfcBuf, S.TMIN * NXY * 4, NXY * 4);
     enc.clearBuffer(sfcBuf, S.SUNH * NXY * 4, NXY * 4);
     device.queue.submit([enc.finish()]);
-    if (mon.pending) { const p = mon.pending; mon.pending = null; monFinish(p); }
+    if (mon.pending) { const p = mon.pending; mon.pending = null; mon.finishing = monFinish(p); }
     monUi();
     accBase();
   }
@@ -1024,8 +1072,8 @@ async function init() {
     const tb = $('monTab').tBodies[0];
     if (mon.key < 0) return;                                  // przed pierwszym startem (zakładka otwarta z zapamiętanego widoku)
     const cur = monCur();
-    const fx = (v, d = 1) => Number.isFinite(v) ? v.toFixed(d) : '–';
-    const cells = (a) => a ? [fx(a.t), fx(a.tx), fx(a.tn), fx(a.p, 0), fx(a.s, 0), fx(a.tX), fx(a.tN), fx(a.pD, 0)] : Array(8).fill('–');
+    const fx = (v, u, d = 1) => Number.isFinite(v) ? nD(v, u, d) : '–';
+    const cells = (a) => a ? [fx(a.t, '°C'), fx(a.tx, '°C'), fx(a.tn, '°C'), fx(a.p, 'mm', 0), fx(a.s, 'mm', 0), fx(a.tX, '°C'), fx(a.tN, '°C'), fx(a.pD, 'mm', 0)] : Array(8).fill('–');
     const secs = [['m', 'Months'], ['s', 'Seasons'], ['y', 'Years']].map(([k, name]) => ({ k, name, ps: periods(k) }));
     const nRows = secs.reduce((s, x) => s + 1 + x.ps.length, 0);
     if (full || tb.rows.length !== nRows) {
@@ -1068,7 +1116,7 @@ async function init() {
     if (!pr) return '–';
     const v = j * NXD + i, at = (f) => perField(pr, f, v)[0];
     const t = at(80), tx = at(81), tn = at(82), p = at(83), s = at(85), ax = at(86), an = at(87), pd = at(88);
-    return `T ${t.toFixed(1)} °C (${tn.toFixed(1)} … ${tx.toFixed(1)}) · precip. ${p.toFixed(1)} mm (rain ${Math.max(0, p - s).toFixed(1)}, snow ${s.toFixed(1)}) · absolute ${an.toFixed(1)} … ${ax.toFixed(1)} °C · max day ${pd.toFixed(1)} mm`;
+    return `T ${fT(t)} (${nD(tn, '°C', 1)} … ${nD(tx, '°C', 1)}) · precip. ${fm(p, 'mm', 1)} (rain ${nD(Math.max(0, p - s), 'mm', 1)}, snow ${nD(s, 'mm', 1)}) · absolute ${nD(an, '°C', 1)} … ${fT(ax)} · max day ${pd.toFixed(1)} mm`;
   }
   // skala sumy opadu rozciągana z długością okresu: progi WX Charts (0.1 … 2000 mm, pomyślane dla ~16 dób) × (dni/16)^0.7 –
   // doba: do ~290 mm, 7 dni ~1100, 30 dni ~3100, 90 dni ~6000 (okres „od startu” – liczba dób symulacji, co najmniej 1)
@@ -1120,7 +1168,7 @@ async function init() {
     if ($('location').value === 'custom') {
       try { const w = await worldDem(); geo = { lon: num('lon'), elev: (la, lo) => worldElev(w, la, lo) }; } catch { geo = null; }
     }
-    const m = await PEModel.create(device, { lat: num('lat'), lon: num('lon'), cont: num('cont'), hum: num('hum'), doy: dayOfYear($('date').value), hour: num('hour'),   // godzina startu: słońce w PE zgodne z domeną
+    const m = await PEModel.create(device, { varAt: manipVarAt, lat: num('lat'), lon: num('lon'), cont: num('cont'), hum: num('hum'), doy: dayOfYear($('date').value), hour: num('hour'),   // godzina startu: słońce w PE zgodne z domeną
       seed: drv.seed, geo, nest: { vgBuf, pgOff: grid.off.PGRID, ...NODES } });
     await m.spinup(SPIN, (f) => { $('wxNow').textContent = `The synoptic model is spinning up: ${Math.round(SPIN * f)} / ${SPIN} days…`; });
     // korekta klimatu: kopia modelu z zaburzonym stanem i innym losowaniem rdzenia arktycznego (własna pogoda) liczy CC_START dób
@@ -1147,6 +1195,7 @@ async function init() {
   function reset() { resetting = resetting.then(doReset).catch((e) => fail(String(e.stack || e))); return resetting; }
   async function doReset() {
     sim.busy = true;
+    manipFlat();
     if (drv.mode === 'syn') {
       await prepareModel();
       // w czasie rozbiegu użytkownik mógł wybrać scenariusz albo stałą masę – wtedy ten restart
@@ -1190,6 +1239,7 @@ async function init() {
     new Float32Array(ab)[20] = 0;
     new Uint32Array(ab)[21] = 0;
     new Float32Array(ab)[23] = snd.cool(0, num('hour'));
+    new Float32Array(ab)[33] = 1;
     device.queue.writeBuffer(paramBuf, 0, ab);
     const enc = device.createCommandEncoder();
     const pass = enc.beginComputePass();
@@ -1290,7 +1340,8 @@ async function init() {
       // słońce w każdym oczku: szerokość środka, deklinacja, kąt godzinny w środku mapy
       f[28] = lat; f[29] = 23.44 * Math.PI / 180 * Math.sin(2 * Math.PI * (284 + ck.doy) / 365); f[30] = (ck.hour - 12) * 15 * Math.PI / 180;
       f[27] = $('hydro').checked ? 1 : 0;                                         // hydrologia
-      f[31] = drv.mode === 'syn' ? num('tanom') : 0;                              // anomalia temperatury dużej skali
+      f[31] = mAt('T', t);                                                        // manipulacja atmosfery: anomalia temperatury dużej skali, mnożnik opadu
+      f[33] = mAt('R', t);
       // zmiana deklinacji [rad/dobę] – fenologia (dzień się wydłuża / skraca)
       f[32] = 23.44 * Math.PI / 180 * 2 * Math.PI / 365 * Math.cos(2 * Math.PI * (284 + ck.doy) / 365);
     }
@@ -1746,7 +1797,7 @@ async function init() {
       F.pos[2] = Math.min(30000, Math.max(groundAt(F.pos[0], F.pos[1]) + 20, F.pos[2]));
     }
     const v = F.speed * (F.keys.has('shift') ? 5 : 1);
-    $('flyV').textContent = `${v >= 1000 ? (v / 1000).toFixed(1) + ' km/s' : Math.round(v) + ' m/s'} · ${(F.pos[2] / 1000).toFixed(2)} km a.s.l.`;
+    $('flyV').textContent = `${isImp() ? fm(v, 'm/s') : v >= 1000 ? (v / 1000).toFixed(1) + ' km/s' : Math.round(v) + ' m/s'} · ${isImp() ? fmH(F.pos[2]) : (F.pos[2] / 1000).toFixed(2) + ' km'} a.s.l.`;
   }
   sim.fly = (on, pos, yaw, pitch) => { setFly(on); if (on && pos) { v3.fly.pos = pos.slice(); v3.fly.yaw = yaw ?? 0; v3.fly.pitch = pitch ?? 0; } };
 
@@ -1816,7 +1867,7 @@ async function init() {
   const PREF_CHECKS = ['tipOn', 'overlay', 'reliefShade', 'reliefIso', 'windArrows', 'cityOn', 'gridLines', 'clLow', 'clMid', 'clHigh', 'v3frz', 'v3cut', 'v3new'];
   function savePrefs() {
     try {
-      const p = { tab: curTab(), layT: layTabCur, layOpen: [...document.querySelectorAll('#layGroups .lygrp.open')].map((g) => g.dataset.g), synView: $('synLevel').value, synO: syn.o, ana: curAna(), anaOn: !document.body.classList.contains('noana'), profMode: sim.profModePref || 'point',
+      const p = { tab: curTab(), layT: layTabCur, layOpen: [...document.querySelectorAll('#layGroups .lygrp.open')].map((g) => g.dataset.g), synView: $('synLevel').value, synO: syn.o, manipOpen: $('manipBox').open, ana: curAna(), anaOn: !document.body.classList.contains('noana'), profMode: sim.profModePref || 'point',
         checks: Object.fromEntries(PREF_CHECKS.map((id) => [id, $(id).checked])), cloudAlpha: $('cloudAlpha').value,
         collapsed: [...document.querySelectorAll('.view')].map((v) => v.classList.contains('collapsed')) };
       localStorage.setItem('w3d-ui', JSON.stringify(p));
@@ -1836,6 +1887,7 @@ async function init() {
     for (const g of p.layOpen || []) document.querySelector(`.lygrp[data-g="${g}"]`)?.classList.add('open');
     if (p.synView && SYN_VIEWS[p.synView]) $('synLevel').value = p.synView;
     if (p.synO) Object.assign(syn.o, p.synO);
+    if (p.manipOpen === false) $('manipBox').open = false;
     synUi();
     if (p.anaOn === false) setAna(false);
     (p.collapsed || []).forEach((c, n) => { const v = document.querySelectorAll('.view')[n]; if (v) v.classList.toggle('collapsed', !!c); });
@@ -1869,7 +1921,7 @@ async function init() {
   for (const gr of LAYER_GROUPS) {
     const g = document.createElement('div'), h = document.createElement('button'), bd = document.createElement('div');
     g.className = 'lygrp'; g.dataset.g = gr.name;
-    h.className = 'lyh'; h.textContent = gr.name;
+    h.className = 'lyh'; h.dataset.n = gr.name; h.textContent = lyGrName(gr.name);
     h.onclick = () => { g.classList.toggle('open'); savePrefs(); };
     bd.className = 'lyb';
     g.append(h, bd);
@@ -1878,7 +1930,7 @@ async function init() {
       const it = typeof raw === 'number' ? { id: raw } : raw, f = FIELDS[it.id], b = document.createElement('button');
       b.className = 'lyi';
       b.innerHTML = `<span>${it.name || f.short || f.name}</span>`;
-      b.title = `${f.name}${f.unit ? ` [${f.unit}]` : ''}`;
+      b.title = `${f.name}${f.unit ? ` [${unitD(f.unit)}]` : ''}`;
       const nm = it.name || f.short || f.name;
       const L = { el: b, g, id: it.id, acc: it.acc, p: gr.p, z: gr.z, label: gr.p ? `${nm} · ${gr.p} hPa` : gr.z ? `${nm} · at height` : nm,
         key: `${it.id}${it.acc !== undefined ? `~${it.acc}` : ''}${gr.p ? `@${gr.p}` : ''}${gr.z ? '@z' : ''}` };
@@ -2008,12 +2060,12 @@ async function init() {
     }
   }, 1000);
   layMostBuild();
-  {
+  function layInfoBuild() {
     const km = (x) => +(x / 1000).toFixed(2);
     const rows = [
-      ['Domain', `${km(NXD * CFG.DX)} × ${km(NYD * CFG.DY)} km (${NXD} × ${NYD} cells)`],
-      ['Grid spacing', CFG.DX < 1000 ? `${CFG.DX} m` : `${km(CFG.DX)} km`],
-      ['Vertical', `${NZ} levels up to ${km(CFG.HTOP)} km`],
+      ['Domain', `${+nD(km(NXD * CFG.DX), 'km', 2)} × ${+nD(km(NYD * CFG.DY), 'km', 2)} ${unitD('km')} (${NXD} × ${NYD} cells)`],
+      ['Grid spacing', fmDx(CFG.DX)],
+      ['Vertical', `${NZ} levels up to ${fmZ(km(CFG.HTOP))}`],
       ['Time step', `${DT} s`],
       ['Boundaries', CFG.OPEN ? `open: hidden margin of ${MG} cells, then a ${CFG.NE}-cell relaxation zone` : 'periodic'],
       ['Dynamics', 'anelastic, non-hydrostatic; Arakawa C grid; semi-Lagrangian advection; FFT + conjugate gradient pressure solver'],
@@ -2025,6 +2077,7 @@ async function init() {
     ];
     $('layInfo').innerHTML = `<h4>Model information</h4><dl>${rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('')}</dl>`;
   }
+  layInfoBuild();
 
   // --- prędkość, pauza, restart ---
   document.querySelectorAll('#speedSeg button').forEach((b) => b.addEventListener('click', () => {
@@ -2101,19 +2154,20 @@ async function init() {
     if (sim.vmask) st.vmask = Array.from(sim.vmask);
     if (sim.lwet) st.lwet = Array.from(sim.lwet, (x) => Math.round(100 * x));
     st.stations = stations.exportList();
+    st.manip = manip;
     if (sh === 'dem' && sim.demLL) st.demLL = sim.demLL;            // środek terenu z DEM (gęstszy teren do obrazu)
     return st;
   }
-  function setState(st) {
-    const g = st.grid || {};
-    const gnx = g.nx || g.n, gny = g.ny || g.n;
-    if (g.dx !== CFG.DX || gnx !== NXD || gny !== NYD || (g.mg ?? MG) !== MG || (g.bc === 'per') === CFG.OPEN) return false;   // inna siatka
+  // ustawienia, ziarna, masa powietrza, teren i maski ze stanu (zapis ustawień i pełny zapis przebiegu)
+  function applyStateUi(st) {
     if (st.ui.location === 'custom') ensureCustom(`Custom: ${(+st.ui.lat).toFixed(2)}°, ${(+st.ui.lon).toFixed(2)}°`);
     for (const el of stEls()) {
       if (!(el.id in st.ui)) continue;
       if (el.type === 'checkbox') el.checked = st.ui[el.id]; else el.value = st.ui[el.id];
     }
     CLIM.bias = num('tbias');
+    if (st.manip) Object.assign(manip, st.manip); else manipFlat();
+    gridSync();
     sim.seed = st.seed;
     drv.seed = st.synSeed;
     drv.mode = st.mode;
@@ -2124,6 +2178,12 @@ async function init() {
     sim.lmask = st.lmask && st.lmask.length === NXV * NYV ? Int8Array.from(st.lmask) : null;
     sim.vmask = st.vmask && st.vmask.length === NXV * NYV ? Int8Array.from(st.vmask) : null;
     sim.lwet = st.lwet && st.lwet.length === NXV * NYV ? Float32Array.from(st.lwet, (x) => x / 100) : null;
+  }
+  function setState(st) {
+    const g = st.grid || {};
+    const gnx = g.nx || g.n, gny = g.ny || g.n;
+    if (g.dx !== CFG.DX || gnx !== NXD || gny !== NYD || (g.mg ?? MG) !== MG || (g.bc === 'per') === CFG.OPEN) return false;   // inna siatka
+    applyStateUi(st);
     if (st.stations) stations.importList(st.stations);
     applyTerrain();
     applyLand();
@@ -2172,6 +2232,188 @@ async function init() {
     catch { $('stInfo').textContent = url; }
   };
 
+  // --- pełny zapis przebiegu (plik .w3drun, runfile.js) ---
+  // Bufory GPU i stan JS z tej samej chwili (przerwa w krokach tylko na odczyt), kompresja już przy działającej symulacji. Profile, teren, siatka parametrów i poprawki korekty
+  // klimatu w buforze vg – odtwarzane z ustawień, więc po zmianie układu tego bufora w nowej wersji plik dalej się wczytuje; pola przy gruncie po nazwach (nowe pola startują od zera).
+  // Kopia prognozy nie jest zapisywana: model jest deterministyczny, więc po wczytaniu kopia modelu głównego nadrabia 7 dób w tle (ok. minuty).
+  const runDate = () => new Date(Date.UTC(sim.year, 0, sim.doy0 + Math.floor((sim.startHour * 3600 + sim.time) / 86400 + 1e-6))).toISOString().slice(0, 10);
+  async function buildRunFile(onProgress) {
+    await resetting;
+    if (sim.busy) throw new Error('the simulation is still starting');
+    sim.saving = true;
+    const reads = [], chunks = [];
+    const meta = { app: 'weather3d', v: 1, created: new Date().toISOString(), search: location.search,
+      grid: { dx: CFG.DX, nx: NXD, ny: NYD, mg: MG, nz: NZ, dt: DT, bc: CFG.OPEN ? 'open' : 'per' } };
+    try {
+      await device.queue.onSubmittedWorkDone();
+      await mon.finishing;
+      await drv.ccWait;
+      const syn = drv.mode === 'syn' && drv.model, m = drv.model, c = drv.ccModel;
+      const enc = device.createCommandEncoder();
+      const want = (name, b) => { const rb = buf(b.size, U.MAP_READ | U.COPY_DST, 'runRead'); enc.copyBufferToBuffer(b, 0, rb, 0, b.size); reads.push({ name, rb }); };
+      for (const [n, b] of [['state', stateBuf], ['tmp', tmpBuf], ['work', workBuf], ['sfc', sfcBuf], ['tgt', tgtBuf], ['acc', accBuf]]) want(n, b);
+      if (syn) for (const [p, x] of [['pe', m], ['cc', c]]) if (x) { want(`${p}.S`, x.S[x.p]); want(`${p}.wk`, x.wk); want(`${p}.dg`, x.dg); }
+      device.queue.submit([enc.finish()]);
+      Object.assign(meta, { date: runDate(), time: sim.time });
+      const keepFrom = sim.time - CC_WIN - 86400;      // próbki korekty klimatu poza oknem nie są już potrzebne
+      const js = { st: getState(), clim: { ...CLIM }, speed: $('speed').value, sfcNames: SFC, lens: { STATE_LEN, TG_SLOT, NF },
+        sim: { time: sim.time, step: sim.step, startHour: sim.startHour, doy0: sim.doy0, year: sim.year, waterUser: !!sim.waterUser, accInfo: sim.accInfo, probe: sim.probe },
+        drv: { tA: drv.tA, slot: drv.slot, startTime: syn ? drv.start.time : 0, startHalfDiur: syn ? drv.start.halfDiur : 0 },
+        acc: { days: [...acc.days], last: acc.last },
+        mon: { key: mon.key, t0: mon.t0, days: mon.days, dayT0: mon.dayT0, list: mon.list.map((x) => ({ key: x.key, days: x.days, secs: x.secs, avg: x.avg })) },
+        cc: { off: cc.off, nodes: cc.nodes.map((nd) => ({ norm: nd.norm, hasN: nd.hasN, corr: nd.corr, fq: nd.fq, fqa: nd.fqa, fp: nd.fp, smp: nd.smp.filter((x) => x.t >= keepFrom) })) },
+        cuc: { ...cuc, U: [...cuc.U], D: [...cuc.D], U2: [...cuc.U2], D2: [...cuc.D2], N: [...cuc.N], sfcT: null },
+        meteo: { hist: meteo.hist, col: meteo.col },
+        pe: syn ? { main: m.saveInfo(), cc: c ? c.saveInfo() : null } : null };
+      const sf = stations.exportFull();
+      chunks.push({ name: 'js', data: jsonPack(js) }, { name: 'stLive', data: jsonPack({ sel: sf.sel, live: sf.live }) }, { name: 'stHist', data: jsonPack(sf.hist, 4) });
+      // miesiące analiz: 5 × Int16 + 3 × Uint16 na oczko widocznej części
+      const nv = NXD * NYD, mb = new Uint8Array(16 * nv * mon.list.length);
+      mon.list.forEach((x, i) => [...x.T, ...x.P].forEach((a, k) => mb.set(new Uint8Array(a.buffer, a.byteOffset, a.byteLength), (i * 8 + k) * 2 * nv)));
+      chunks.push({ name: 'mon', data: mb });
+      // teren i mokradła dokładnie (w zapisie ustawień zaokrąglone – inne nachylenia i inne pola docelowe przy gruncie)
+      chunks.push({ name: 'hv', data: sim.hv.slice() });
+      if (sim.lwet) chunks.push({ name: 'lwet', data: sim.lwet.slice() });
+      if (syn) {
+        chunks.push({ name: 'land.sea', data: m.sea }, { name: 'land.encl', data: m.encl }, { name: 'land.hgt', data: m.hgt });
+        if (m.lc) chunks.push({ name: 'land.Ts', data: m.lc.Ts }, { name: 'land.ha', data: m.lc.ha }, { name: 'land.ta', data: m.lc.ta });
+      }
+    } finally { sim.saving = false; }
+    await Promise.all(reads.map((r) => r.rb.mapAsync(GPUMapMode.READ)));
+    for (const r of reads) {
+      chunks.push({ name: r.name, data: new Float32Array(r.rb.getMappedRange().slice(0)) });
+      r.rb.unmap(); r.rb.destroy();
+    }
+    return { blob: await packRun(meta, chunks, onProgress), name: `weather3d_run_${meta.date}_${CFG.DX}m.w3drun` };
+  }
+  $('runSave').onclick = async () => {
+    const el = $('runInfo'), t0 = performance.now();
+    $('runSave').disabled = true;
+    el.textContent = 'Saving…';
+    try {
+      const { blob, name } = await buildRunFile((f) => { el.textContent = `Compressing… ${Math.round(100 * f)}%`; });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 120000);
+      el.textContent = `Saved ${name} (${(blob.size / 1048576).toFixed(0)} MB, ${((performance.now() - t0) / 1000).toFixed(0)} s). The run continues.`;
+    } catch (e) { el.textContent = `Could not save the run: ${e.message}`; }
+    $('runSave').disabled = false;
+  };
+  $('runLoad').onclick = () => $('runFile').click();
+  $('runFile').onchange = async () => {
+    const file = $('runFile').files[0], el = $('runInfo');
+    $('runFile').value = '';
+    if (!file) return;
+    let stopped = false;
+    try {
+      const { meta } = await openRun(file);
+      if (sim.time > 0 && !confirm(`Load the run saved at ${meta.date}? The current run will be lost unless you saved it.`)) return;
+      el.textContent = 'Loading…';
+      stopped = !sim.halted;
+      sim.halted = true;
+      await stashRun(file);
+      location.href = resumeUrl(meta);
+    } catch (e) {
+      if (stopped) { sim.halted = false; requestAnimationFrame(frame); }
+      el.textContent = `Could not load the file: ${e.message}`;
+    }
+  };
+  // start strony z adresem ?resume: plik z pamięci przeglądarki zamiast restartu (bez rozbiegu modelu synoptycznego)
+  async function resumeRun() {
+    try {
+      const file = await stashedRun();
+      if (!file) throw new Error('the saved run was not found in this browser – load the file again');
+      status('loading the saved run…');
+      const { meta, read, text } = await openRun(file), g = meta.grid;
+      if (g.dx !== CFG.DX || g.nx !== NXD || g.ny !== NYD || g.mg !== MG || g.nz !== NZ || g.dt !== DT || (g.bc === 'per') === CFG.OPEN) throw new Error('the file needs a different grid');
+      const js = jsonUnpack(await text('js'));
+      if (js.lens.STATE_LEN !== STATE_LEN) throw new Error('the file comes from an incompatible version (atmosphere layout)');
+      // ustawienia, teren, pokrycie, stan bazowy
+      applyStateUi(js.st);
+      Object.assign(CLIM, js.clim);                // (dokładna poprawka klimatu miejsca – suwak ją zaokrągla)
+      const hv = await read('hv'), lw = await read('lwet');
+      if (hv && hv.length === NXV * NYV) sim.hv.set(hv);
+      if (lw && lw.length === NXV * NYV) sim.lwet = lw;
+      $('speed').value = js.speed;
+      document.querySelectorAll('#speedSeg button').forEach((x) => x.classList.toggle('on', x.dataset.speed === js.speed));
+      $('wxMode').value = drv.mode;
+      sim.waterUser = js.sim.waterUser;
+      rebuildBase();
+      if ($('shape').value === 'dem' && js.st.ui.location === 'custom') loadDemHi(...(js.st.demLL || [num('lat'), num('lon')]));
+      // korekta klimatu: normy, próbki i poprawki w węzłach
+      ccGen++;
+      cc.off = js.cc.off; cc.busy = false;
+      js.cc.nodes.forEach((x, t) => {
+        const nd = cc.nodes[t];
+        Object.assign(nd, x);
+        nd.free = baseClim(...ccLL(nd)).free;
+      });
+      ccSrc();
+      ccUpload();
+      if ($('location').value === 'custom' && cc.nodes.some((nd) => !nd.hasN)) ccLoad(ccGen);
+      // model synoptyczny i jego kopia do korekty klimatu; kopia prognozy – od nowa z modelu głównego (nadrabia w tle)
+      if (js.pe) {
+        status('loading the saved run: synoptic model…');
+        const Ts = await read('land.Ts');
+        const land = { sea: await read('land.sea'), encl: await read('land.encl'), hgt: await read('land.hgt'), ...(Ts ? { lc: { Ts, ha: await read('land.ha'), ta: await read('land.ta') } } : {}) };
+        const opts = { varAt: manipVarAt, land, nest: { vgBuf, pgOff: grid.off.PGRID, ...NODES } };
+        const mk = async (p, info) => PEModel.restore(device, opts, info, { S: await read(`${p}.S`), wk: await read(`${p}.wk`), dg: await read(`${p}.dg`) });
+        drv.model = await mk('pe', js.pe.main);
+        drv.ccModel = js.pe.cc ? await mk('cc', js.pe.cc) : null;
+        drv.start = { time: js.drv.startTime, halfDiur: js.drv.startHalfDiur, destroy() {} };   // chwila startu przebiegu; restart liczy nowy rozbieg (drv.key pusty)
+        drv.key = '';
+        drv.fcModel = drv.model.clone(); drv.fc = []; drv.fcBusy = false; drv.ccBusy = false;
+        const enc = device.createCommandEncoder(), pass = enc.beginComputePass();
+        drv.model.encodeParams(pass);
+        pass.end();
+        device.queue.submit([enc.finish()]);
+        refreshCenter();
+      } else device.queue.writeBuffer(vgBuf, grid.off.PGRID * 4, paramGrid(sampler()));
+      // bufory GPU
+      status('loading the saved run: atmosphere and ground…');
+      const q = device.queue, ok = (a, b) => a && a.byteLength === b.size;
+      for (const [n, b] of [['state', stateBuf], ['tmp', tmpBuf]]) q.writeBuffer(b, 0, await read(n));
+      const wk = await read('work');
+      if (ok(wk, workBuf)) q.writeBuffer(workBuf, 0, wk);
+      const sf0 = await read('sfc'), sf = new Float32Array(NSF * NXY);
+      js.sfcNames.forEach((n, i) => { if (n in S) sf.set(sf0.subarray(i * NXY, (i + 1) * NXY), S[n] * NXY); });
+      q.writeBuffer(sfcBuf, 0, sf);
+      const tg = await read('tgt');
+      if (ok(tg, tgtBuf)) q.writeBuffer(tgtBuf, 0, tg);
+      else if (js.pe) { buildSlot(0); buildSlot(1); buildSlot(2); }
+      const ac = await read('acc');
+      if (ok(ac, accBuf)) { q.writeBuffer(accBuf, 0, ac); for (const [k, v] of js.acc.days) acc.days.set(k, v); acc.last = js.acc.last; }
+      // czas, miesiące analiz, stacje, widok
+      Object.assign(sim, { time: js.sim.time, step: js.sim.step, startHour: js.sim.startHour, doy0: js.sim.doy0, year: js.sim.year, debt: 0, accInfo: js.sim.accInfo, probe: js.sim.probe });
+      drv.tA = js.drv.tA; drv.slot = js.drv.slot;
+      const nv = NXD * NYD, mb = await read('mon');
+      const arr = (T, i, k) => new T(mb.buffer.slice(mb.byteOffset + (i * 8 + k) * 2 * nv, mb.byteOffset + (i * 8 + k + 1) * 2 * nv));
+      mon.list = js.mon.list.map((x, i) => ({ ...x, T: [0, 1, 2, 3, 4].map((k) => arr(Int16Array, i, k)), P: [5, 6, 7].map((k) => arr(Uint16Array, i, k)) }));
+      Object.assign(mon, { key: js.mon.key, t0: js.mon.t0, days: js.mon.days, dayT0: js.mon.dayT0, pending: null });
+      const stL = jsonUnpack(await text('stLive'));
+      stations.importFull({ sel: stL.sel, live: stL.live, hist: jsonUnpack(await text('stHist')) });
+      const cu = js.cuc;
+      Object.assign(cuc, { ph: cu.ph, Te: cu.Te, rate: cu.rate, nx: cu.nx, ny: cu.ny, gen: cu.gen, gmax: cu.gmax, sfcT: null });
+      for (const k of ['U', 'D', 'U2', 'D2', 'N']) cuc[k].set(cu[k]);
+      meteo.hist = js.meteo.hist; meteo.col = js.meteo.col;
+      const qs = new URLSearchParams(location.search);
+      if (qs.has('hold')) sim.halted = true;       // testy: bez pętli klatek
+      sim.stats = null; drv.synDirty = true;
+      $('monSel').max = String(Math.max(0, periods().length - 1)); $('monSel').value = $('monSel').max;
+      monUi(); monShow(); labels(); drawPreview(); synUi();
+      sim.busy = false;
+      $('loadScr').classList.remove('on');
+      qs.delete('resume'); qs.delete('hold');
+      history.replaceState(null, '', `${location.pathname}?${qs}`);
+      await clearStash();
+      toast(`Run loaded: ${meta.date}. It continues from here.`, 6000);
+    } catch (e) { fail(`Could not load the run: ${e.message}`); console.error(e); }
+  }
+
   // --- edytor masy powietrza: podgląd na żywo, zastosowanie przyciskiem ---
   function applyAirmassPreset() {
     const a = AIRMASSES[$('airmass').value];
@@ -2190,17 +2432,17 @@ async function init() {
       Td.push(dewpoint(q, s2.pres(z)) - 273.15);
     });
     drawProfile($('cprev'), { z: ix.prof.z, T, Td, parcel: ix.prof.parcel, top: Math.min(14000, pr.ztrop * 1000 + 1000), xmin: -60 });
-    const km = (z) => (z === null ? '—' : `${(z / 1000).toFixed(1)} km`);
+    const km = (z) => (z === null ? '—' : isImp() ? fmH(z) : `${(z / 1000).toFixed(1)} km`);
     const rows = [
-      ['T / Td at start', `${T[0].toFixed(0)} / ${Td[0].toFixed(0)} °C`],
-      ['T / Td in the afternoon', `${ix.tSfc.toFixed(0)} / ${ix.tdSfc.toFixed(0)} °C`],
+      ['T / Td at start', `${nD(T[0], '°C')} / ${fT(Td[0], 0)}`],
+      ['T / Td in the afternoon', `${nD(ix.tSfc, '°C')} / ${fT(ix.tdSfc, 0)}`],
       ['cloud base (LCL)', km(ix.lcl)],
       ['free convection (LFC)', km(ix.lfc)],
       ['CAPE', `${Math.round(ix.cape)} J/kg`],
       ['CIN', ix.cin === null ? '— (no free convection)' : `${Math.round(ix.cin)} J/kg`],
       ['cloud tops (EL)', km(ix.el)],
-      ['0 °C isotherm', km(ix.frz)],
-      ['precipitable water', `${ix.pw.toFixed(0)} mm`],
+      [`${isImp() ? '32 °F' : '0 °C'} isotherm`, km(ix.frz)],
+      ['precipitable water', fm(ix.pw, 'mm')],
     ];
     $('sndIdx').innerHTML = rows.map(([k, v]) => `<div>${k} <b>${v}</b></div>`).join('');
     $('dirty').textContent = airDirty() ? 'Changes not applied – the model still runs the previous air mass.' : '';
@@ -2292,11 +2534,11 @@ async function init() {
   function selectPoint(lat, lon) {
     wsel.lat = Math.max(-80, Math.min(80, lat)); wsel.lon = ((lon + 540) % 360) - 180;
     drawWorldMap(); drawRegionMap();
-    const c = placeClimate(wsel.lat, wsel.lon), mon = c.T.map((t) => t.toFixed(0)).join(' · ');
+    const c = placeClimate(wsel.lat, wsel.lon), mon = c.T.map((t) => nD(t, '°C')).join(' · ');
     wsel.clim = c;
-    $('worldInfo').innerHTML = `<b>${fmtLL(wsel.lat, wsel.lon)}</b> · elevation ~${Math.round(c.elev)} m · climate <b>${c.koppen.code}</b> – ${c.koppen.name} (${c.src})<br>`
-      + `annual mean <b>${c.tAnn.toFixed(1)} °C</b>, precipitation <b>${Math.round(c.Pa)} mm/year</b> · monthly temperatures: ${mon} °C<br>`
-      + `in the model: continentality <b>${c.cont.toFixed(2)}</b>, climate humidity <b>${c.hum.toFixed(2)}</b>, temperature correction <b>${c.bias >= 0 ? '+' : ''}${c.bias.toFixed(1)} K</b>`;
+    $('worldInfo').innerHTML = `<b>${fmtLL(wsel.lat, wsel.lon)}</b> · elevation ~${fmH(c.elev)} · climate <b>${c.koppen.code}</b> – ${c.koppen.name} (${c.src})<br>`
+      + `annual mean <b>${fT(c.tAnn)}</b>, precipitation <b>${fm(c.Pa, 'mm')}/year</b> · monthly temperatures: ${mon} ${unitD('°C')}<br>`
+      + `in the model: continentality <b>${c.cont.toFixed(2)}</b>, climate humidity <b>${c.hum.toFixed(2)}</b>, temperature correction <b>${fdT(c.bias, 1, true)}</b>`;
     $('worldApply').disabled = false;
   }
   const canvasXY = (cv, e) => { const r = cv.getBoundingClientRect(); return [(e.clientX - r.left) / r.width * cv.width, (e.clientY - r.top) / r.height * cv.height]; };
@@ -2685,7 +2927,7 @@ async function init() {
     $, S, NX, NXY, MG, NXD, NYD, DX: CFG.DX, DY: CFG.DY,
     // czas kopii pól przy gruncie (nie bieżący czas symulacji) – inaczej próbka sprzed północy trafiała do nowej doby
     sfc: () => sim.sfc, time: () => sim.sfcT ?? sim.time, clock, toast: (m) => toast(m), mapInner: $('mapInner'),
-    csvMeta: () => `Weather3D; grid ${CFG.DX / 1000} km; visible ${CFG.NXV} x ${CFG.NYV}; levels ${CFG.NZ}; centre ${num('lat').toFixed(2)} ${num('lon').toFixed(2)}; start ${$('date').value}; weather seed ${drv.seed ?? ''}; climate correction ${ccOn() ? cc.src : 'off'}`,
+    csvMeta: () => `Weather3D; grid ${CFG.DX / 1000} km; visible ${CFG.NXV} x ${CFG.NYV}; levels ${CFG.NZ}; centre ${num('lat').toFixed(2)} ${num('lon').toFixed(2)}; start ${$('date').value}; weather seed ${drv.seed ?? ''}; climate correction ${ccOn() ? cc.src : 'off'}; ${manipCsv()}`,
     // położenie na ekranie [%] punktu domeny (ułamki fx w prawo, fy w górę) przy bieżącym zoomie
     mapPos: (fx, fy) => [(fx - mz.x) * mz.s * 100, (1 - fy - mz.y) * mz.s * 100],
     probe: () => sim.probe,
@@ -2763,18 +3005,18 @@ async function init() {
     const lc = sim.veg ? VEG_NAMES[sim.veg[col]] : '';
     const row = (k, val) => `<span class="k">${k}</span> <b>${val}</b>`;
     tip.innerHTML = [
-      row('position', `${((i - MG + 0.5) * CFG.DX / 1000).toFixed(1)}, ${((j - MG + 0.5) * CFG.DY / 1000).toFixed(1)} km`),
+      row('position', `${nD((i - MG + 0.5) * CFG.DX / 1000, 'km', 1)}, ${nD((j - MG + 0.5) * CFG.DY / 1000, 'km', 1)} ${unitD('km')}`),
       // wysokość prawdziwego terenu (gęstszy DEM), a w nawiasie gruntu modelu – średniej z oczka
-      row('terrain', demHiOk() ? `${Math.round(realHxy(hv.x, hv.y))} m a.s.l. (model ${Math.round(sim.h[col])} m), ${lc}` : `${Math.round(sim.h[col])} m a.s.l., ${lc}`),
-      row('T 2 m', `${t2.toFixed(1)} °C`) + ' · ' + row('Td', `${td2.toFixed(1)} °C`) + ' · ' + row('RH', `${rh.toFixed(0)}%`),
-      row('feels like', `${feelsLike(t2, rh, v('U10')).toFixed(0)} °C`) + ' · ' + row('today', `${v('TMIN').toFixed(1)} … ${v('TMAX').toFixed(1)} °C`) + ' · ' + row('sunshine', `${v('SUNH').toFixed(1)} h`),
-      row('wind 10 m', `${v('U10').toFixed(1)} m/s`) + ' · ' + row('gusts', `${v('GUST').toFixed(0)} m/s`),
-      row('ground', `${(v('TS') - 273.15).toFixed(1)} °C`) + ' · ' + row('solar', `${Math.round(v('SW'))} W/m²`),
-      row('greenness', `${(100 * v('GRN')).toFixed(0)}%`) + ' · ' + row('snow', `${(100 * v('SND')).toFixed(0)} cm`),
-      row('precip.', `${v('PR').toFixed(1)} mm/h`) + ' · ' + row('total', `${v('PACC').toFixed(1)} mm`) + (v('QOUT') > 0.05 ? ' · ' + row('discharge', `${v('QOUT') < 10 ? v('QOUT').toFixed(1) : Math.round(v('QOUT'))} m³/s`) : ''),
+      row('terrain', demHiOk() ? `${fmH(realHxy(hv.x, hv.y))} a.s.l. (model ${fmH(sim.h[col])}), ${lc}` : `${fmH(sim.h[col])} a.s.l., ${lc}`),
+      row('T 2 m', fT(t2)) + ' · ' + row('Td', fT(td2)) + ' · ' + row('RH', `${rh.toFixed(0)}%`),
+      row('feels like', fT(feelsLike(t2, rh, v('U10')), 0)) + ' · ' + row('today', `${nD(v('TMIN'), '°C', 1)} … ${fT(v('TMAX'))}`) + ' · ' + row('sunshine', `${v('SUNH').toFixed(1)} h`),
+      row('wind 10 m', fm(v('U10'), 'm/s', 1)) + ' · ' + row('gusts', fm(v('GUST'), 'm/s')),
+      row('ground', fT(v('TS') - 273.15)) + ' · ' + row('solar', `${Math.round(v('SW'))} W/m²`),
+      row('greenness', `${(100 * v('GRN')).toFixed(0)}%`) + ' · ' + row('snow', fm(100 * v('SND'), 'cm')),
+      row('precip.', fm(v('PR'), 'mm/h', 1)) + ' · ' + row('total', fm(v('PACC'), 'mm', 1)) + (v('QOUT') > 0.05 ? ' · ' + row('discharge', `${fm(v('QOUT'), 'm³/s', v('QOUT') < 10 ? 1 : 0)}`) : ''),
       ...(monFld() ? [row('period', monTip(col))] : []),
-      row('pressure (large scale)', `${v('PSL').toFixed(1)} hPa`) + ' · ' + row('visibility', v('VIS') >= 49 ? '> 50 km' : `${v('VIS') < 1 ? Math.round(v('VIS') * 1000) + ' m' : v('VIS').toFixed(1) + ' km'}`),
-      row('CAPE', `${Math.round(v('CAPE'))} J/kg`) + (v('FLASH') > 0.01 ? ' · ' + row('lightning', `${v('FLASH').toFixed(2)} /km²/h`) : '') + (v('HAIL') > 0 ? ' · ' + row('hail', `${v('HAIL').toFixed(1)} cm`) : ''),
+      row('pressure (large scale)', fm(v('PSL'), 'hPa', 1)) + ' · ' + row('visibility', fmVis(v('VIS'))),
+      row('CAPE', `${Math.round(v('CAPE'))} J/kg`) + (v('FLASH') > 0.01 ? ' · ' + row('lightning', `${v('FLASH').toFixed(2)} /km²/h`) : '') + (v('HAIL') > 0 ? ' · ' + row('hail', fm(v('HAIL'), 'cm', 1)) : ''),
       row('radar', v('DBZ') < 5 ? '–' : `${v('DBZ').toFixed(0)} dBZ`) + (v('PHEN') > 0.5 ? ' · ' + row('phenomenon', ['', 'hoar frost', 'rime', 'freezing rain / glaze', 'fog', 'in cloud (summits, slopes)'][Math.round(v('PHEN'))]) : ''),
       row('H', `${Math.round(v('H'))} W/m²`) + ' · ' + row('LE', `${Math.round(v('LE'))} W/m²`),
     ].join('<br>');
@@ -2790,13 +3032,19 @@ async function init() {
   // siatka: wymiary domeny w km, szczegółowość albo oczko (zmiana przeładowuje stronę)
   for (const r of RES_OPTS) $('gridRes').add(new Option(`${r}`, r));
   $('gridDx').add(new Option('automatic (from the detail)', 'auto'));
-  for (const d of NICE_DX) $('gridDx').add(new Option(d < 1000 ? `${d} m` : `${d / 1000} km`, d));
-  $('gridLx').value = String(+(NXD * CFG.DX / 1000).toFixed(2));
-  $('gridLy').value = String(+(NYD * CFG.DY / 1000).toFixed(2));
+  for (const d of NICE_DX) $('gridDx').add(new Option(fmDx(d), d));
+  // pola wymiarów w jednostkach na ekranie; po wczytaniu stanu i po zmianie jednostek – z faktycznej siatki
+  const gridSync = () => {
+    $('gridLx').value = String(+toD(NXD * CFG.DX / 1000, 'km').toFixed(2));
+    $('gridLy').value = String(+toD(NYD * CFG.DY / 1000, 'km').toFixed(2));
+    $('gridLxL').textContent = `Width (W–E) [${unitD('km')}]`;
+    $('gridLyL').textContent = `Height (S–N) [${unitD('km')}]`;
+    for (const o of $('gridDx').options) if (o.value !== 'auto' && +o.value) o.textContent = fmDx(+o.value);
+  };
   $('gridRes').value = String(RES_OPTS.reduce((a, r) => (Math.abs(r - Math.max(NXD, NYD)) < Math.abs(a - Math.max(NXD, NYD)) ? r : a), 100));
   $('gridDx').value = 'auto';
   const gridPlan = () => {
-    return planGrid(num('gridLx'), num('gridLy'), num('gridRes'), $('gridDx').value, $('gridBc').value === 'per');
+    return planGrid(fromD(num('gridLx'), 'km'), fromD(num('gridLy'), 'km'), num('gridRes'), $('gridDx').value, $('gridBc').value === 'per');
   };
   const gridInfo = () => {
     const g = gridPlan(), per = $('gridBc').value === 'per', mg = g.mg, cost = g.cost, sc = g.sc;
@@ -2804,28 +3052,36 @@ async function init() {
     if (g.dx <= 400) notes.push('thermals and clouds resolved directly (LES)');
     else if (g.dx < 2000) notes.push('grey zone: convection resolved, boundary layer partly from the scheme');
     else notes.push('mesoscale: boundary layer and storms from schemes, fronts and regional systems');
-    const km = (n) => { const L = n * g.dx / 1000; return L >= 10 ? L.toFixed(0) : L.toFixed(1); };
-    $('gridInfo').textContent = `spacing ${g.dx < 1000 ? g.dx + ' m' : g.dx / 1000 + ' km'} · ${g.nx} × ${g.ny} cells · domain ${km(g.nx)} × ${km(g.ny)} km`
+    const km = (n) => { const L = toD(n * g.dx / 1000, 'km'); return L >= 10 ? L.toFixed(0) : L.toFixed(1); };
+    $('gridInfo').textContent = `spacing ${fmDx(g.dx)} · ${g.nx} × ${g.ny} cells · domain ${km(g.nx)} × ${km(g.ny)} ${unitD('km')}`
       + ` · ${sc.name.toUpperCase()} (${sc.use})`
       + ` · cost of a day ≈ ${cost.toFixed(1)}× · ${notes[0]}`
-      + (per ? ' · periodic boundaries' : ` · open boundaries: hidden margin of ${mg} cells (${km(mg)} km) fully computed, then a relaxation zone`);
+      + (per ? ' · periodic boundaries' : ` · open boundaries: hidden margin of ${mg} cells (${km(mg)} ${unitD('km')}) fully computed, then a relaxation zone`);
   };
   for (const id of ['gridLx', 'gridLy', 'gridRes', 'gridDx']) { $(id).addEventListener('input', gridInfo); $(id).addEventListener('change', gridInfo); }
+  gridSync();
   gridInfo();
   $('gridBc').value = CFG.OPEN ? 'open' : 'per';
   const startArg = () => `${$('location').value === 'custom' ? `${num('lat').toFixed(3)},${num('lon').toFixed(3)}` : ','},${+($('date').value || '2026-06').slice(5, 7) - 1}`;
-  $('gridApply').onclick = () => { const g = gridPlan(); location.search = `?dx=${g.dx}&nx=${g.nx}&ny=${g.ny}${$('gridBc').value === 'per' ? '&bc=per' : ''}&start=${startArg()}`; };
+  $('gridApply').onclick = () => { const g = gridPlan(), m = manipTarget(); location.search = `?dx=${g.dx}&nx=${g.nx}&ny=${g.ny}${$('gridBc').value === 'per' ? '&bc=per' : ''}&start=${startArg()}${manipQuery(m.T, m.R, m.V)}`; };
+  for (const id of ['tanom', 'manipR', 'manipV']) $(id).addEventListener('input', manipApply);
+  $('manipZero').onclick = () => { $('tanom').value = 0; $('manipR').value = MANIP_RAIN.indexOf(1); $('manipV').value = MANIP_VAR.indexOf(1); manipApply(); };
+  $('manipBox').addEventListener('toggle', () => savePrefs());
   $('toTitle').onclick = () => { location.href = location.pathname; };
   $('gridBc').onchange = gridInfo;
   $('ys').max = String(LY_KM);
   $('ys').value = String(LY_KM / 2);
   $('ys').step = String(CFG.DY / 1000 / 2);
-  document.querySelectorAll('.xmax').forEach((e) => { e.textContent = `x = ${L_KM} km`; });
+  const axLabels = () => {
+    document.querySelectorAll('.xmin').forEach((e) => { e.textContent = `x = 0 ${unitD('km')}`; });
+    document.querySelectorAll('.xmax').forEach((e) => { e.textContent = `x = ${Math.round(toD(L_KM, 'km'))} ${unitD('km')}`; });
+  };
+  axLabels();
   // podziałka km (z zoomem: krótszy odcinek)
   const fitScale = () => {
-    const len = niceStep(L_KM / 5 / mz.s);
-    $('scaleTxt').textContent = `${len} km`;
-    $('scaleBar').style.width = `${cxy.clientWidth * len / L_KM * mz.s}px`;
+    const len = niceStep(toD(L_KM, 'km') / 5 / mz.s);   // w jednostkach na ekranie
+    $('scaleTxt').textContent = `${len} ${unitD('km')}`;
+    $('scaleBar').style.width = `${cxy.clientWidth * len / toD(L_KM, 'km') * mz.s}px`;
   };
   sim.fitScale = fitScale;
   // mapa wpisana w dostępne miejsce z zachowaniem proporcji domeny (widok 3D – całe pole); warstwy nad mapą
@@ -2873,38 +3129,71 @@ async function init() {
   });
 
   // --- legendy ---
+  // skala o stałych klasach (WX Charts): podpisy [dół, góra, podziałka]. Imperialnie: temperatura i wiatr – okrągłe wartości w °F i mph ustawione na pasku wg klas, reszta – progi przeliczone
+  const WX_NICE = { temp: [-20, 0, 20, 32, 50, 70, 90, 110], wind: [10, 20, 30, 40, 60, 80, 100, 130] };
+  function wxLegend(i) {
+    const ws = WXS[i], n = ws.t.length, top = ws.t[n - 1];
+    if (!isImp()) return [`${ws.t[0]}`, `${top}+ ${ws.unit}`, wxTicks(i)];
+    const lab = (x) => { const v = toD(x, ws.unit); return ws.unit === '°C' || ws.unit === 'km/h' ? Math.round(v) : rnd(v); };
+    const nice = WX_NICE[ws.key];
+    // położenie wartości metrycznej na pasku: klasy równej szerokości, w klasie liniowo
+    const pos = (x) => { let k = 0; while (k < n - 2 && ws.t[k + 1] <= x) k++; return (k + Math.min(1, Math.max(0, (x - ws.t[k]) / (ws.t[k + 1] - ws.t[k])))) / (n - 1); };
+    const ticks = nice ? nice.map((v) => [v, pos(fromD(v, ws.unit))]).filter(([, q]) => q > 0.01 && q < 0.99) : wxTicks(i).map(([t, q]) => [lab(t), q]);
+    return [`${lab(ws.t[0])}`, `${lab(top)}+ ${unitD(ws.unit)}`, ticks];
+  }
+  function unitUi() {
+    $('unitBtn').textContent = isImp() ? '°F' : '°C';
+    for (const b of $('unitSeg').children) b.classList.toggle('on', (b.dataset.u === 'imperial') === isImp());
+  }
+  $('unitBtn').onclick = () => setImp(!isImp());
+  for (const b of $('unitSeg').children) b.onclick = () => setImp(b.dataset.u === 'imperial');
+  // przełącznik: wszystko, co nie odświeża się samo w pętli interfejsu
+  onUnits(() => {
+    unitUi();
+    document.querySelectorAll('.lyh').forEach((h) => { h.textContent = lyGrName(h.dataset.n); });
+    for (const sel of [$('fieldV'), $('fieldH')]) for (const o of sel.options) if (FIELDS[o.value]) o.textContent = fieldOpt(+o.value);
+    gridSync(); gridInfo(); axLabels(); fitScale(); labels();
+    document.querySelectorAll('.uT').forEach((e) => { e.textContent = unitD('°C'); });
+    document.querySelectorAll('.uP').forEach((e) => { e.textContent = unitD('mm'); });
+    if (!$('titleScr').classList.contains('on')) { synLegend(); synRedraw(); drawForecast(); drawPreview(); monTable(true); drawProf(); drawSnd(true); layInfoBuild(); }
+  });
+  unitUi();
+  document.querySelectorAll('.uT').forEach((e) => { e.textContent = unitD('°C'); });
+  document.querySelectorAll('.uP').forEach((e) => { e.textContent = unitD('mm'); });
   function updateLegends() {
     for (const [id, v] of [['legXZ', views[1]], ['legXY', views[0]]]) {
       const r = v.range || viewRange(v);
       const fd = FIELDS[r.id];
       const el = $(id);
       el.querySelector('.bar').style.background = legendCss(fd.cmap);
-      const fmt = (x) => `${+x.toFixed(Math.abs(r.hi - r.lo) < 5 ? 1 : 0)}`;
-      let lo = fmt(r.lo), hi = `${fmt(r.hi)} ${fd.unit}`, note = fd.name;
-      let ticks = legendTicks(r.lo, r.hi).filter((t) => t > r.lo + 1e-9 && t < r.hi - 1e-9).map((t) => [t, (t - r.lo) / (r.hi - r.lo)]);
+      // (przeliczenie liniowe: położenie na pasku się nie zmienia, podziałka i podpisy w jednostkach na ekranie)
+      const dl = toD(r.lo, fd.unit), dh = toD(r.hi, fd.unit), fmt = (x) => `${+x.toFixed(Math.abs(dh - dl) < 5 ? (isImp() ? 2 : 1) : 0)}`;
+      let lo = fmt(dl), hi = `${fmt(dh)} ${unitD(fd.unit)}`, note = fd.name;
+      let ticks = legendTicks(dl, dh).filter((t) => t > dl + 1e-9 && t < dh - 1e-9).map((t) => [t, (t - dl) / (dh - dl)]);
+      const dT = (t) => (isImp() ? rnd(toD(t, unitOf)) : t);   // próg stałej skali w jednostkach na ekranie
+      let unitOf = fd.unit;
       if (fd.cmap >= WX_CMAP0 && fd.cmap < WX_CMAP0 + WXS.length) {
         // skale WX Charts: równe klasy, podpisy progów
         const ws = WXS[fd.cmap - WX_CMAP0];
-        lo = `${ws.t[0]}`; hi = `${ws.t[ws.t.length - 1]}+ ${ws.unit}`;
-        ticks = wxTicks(fd.cmap - WX_CMAP0);
+        [lo, hi, ticks] = wxLegend(fd.cmap - WX_CMAP0);
         if (ws.key === 'psum') {
           // suma opadu: progi przeskalowane do okresu (podpisy zaokrąglone do 2 cyfr znaczących)
-          const fa = psumF(r.id), r2 = (x) => +(x * fa).toPrecision(x * fa < 1 ? 1 : 2);
-          lo = `${Math.max(0.1, r2(ws.t[0]))}`; hi = `${r2(ws.t[ws.t.length - 1])}+ ${ws.unit}`;
-          ticks = ticks.map(([t, q]) => [r2(t), q]);
+          const fa = psumF(r.id), r2 = (x) => { const v = toD(x * fa, 'mm'); return +v.toPrecision(v < 1 ? 1 : 2); };
+          lo = `${Math.max(isImp() ? 0.01 : 0.1, r2(ws.t[0]))}`; hi = `${r2(ws.t[ws.t.length - 1])}+ ${unitD(ws.unit)}`;
+          ticks = wxTicks(fd.cmap - WX_CMAP0).map(([t, q]) => [r2(t), q]);
         }
-        if (ws.key === 'wind') note += ' (scale in km/h: 10 m/s = 36 km/h)';
-        if (ws.key === 'prate') note += ' · rain; snow in purples: 2 … 150 mm/h of snow depth (≈ 10 × water)';
+        if (ws.key === 'wind' && !isImp()) note += ' (scale in km/h: 10 m/s = 36 km/h)';
+        if (ws.key === 'prate') note += ` · rain; snow in purples: ${nD(2, 'mm/h', 0)} … ${fm(150, 'mm/h')} of snow depth (≈ 10 × water)`;
         if (fd.cmap === WX_CMAP0 + 2 && !monFld(r.id)) note += sim.accInfo || '';
         if (monFld(r.id)) note += ` – ${$('monV').textContent}`;
       }
       if (fd.cmap === 6) {
-        lo = '0.1'; hi = '50+ mm/h';
-        ticks = RADAR_STEPS.slice(1).map((t, n) => [t, (n + 1) / RADAR_STEPS.length]);
+        unitOf = 'mm/h'; lo = `${dT(0.1)}`; hi = `${dT(50)}+ ${unitD('mm/h')}`;
+        ticks = RADAR_STEPS.slice(1).map((t, n) => [dT(t), (n + 1) / RADAR_STEPS.length]);
       }
       if (fd.cmap === 14) {
-        lo = '0.5'; hi = '2000+ mm';
-        ticks = ACC_STEPS.map((t, n) => [t, n / ACC_STEPS.length]).filter(([t], n) => n > 0 && [1, 5, 20, 50, 100, 200, 500, 1000].includes(t));
+        unitOf = 'mm'; lo = `${dT(0.5)}`; hi = `${dT(2000)}+ ${unitD('mm')}`;
+        ticks = ACC_STEPS.map((t, n) => [t, n / ACC_STEPS.length]).filter(([t], n) => n > 0 && [1, 5, 20, 50, 100, 200, 500, 1000].includes(t)).map(([t, q]) => [dT(t), q]);
         note += sim.accInfo || '';
       }
       if (fd.cmap === 15) {
@@ -2912,27 +3201,31 @@ async function init() {
         ticks = [10, 20, 30, 40, 50, 60, 70].map((t) => [t, (t - 5) / 70]);
         note += ' – ~20 dBZ drizzle / light snow, 40 downpour, > 55 hail';
       }
-      if (r.id === 55) note += ' · red contours: SRH 0–3 km every 100 m²/s² (thick 200) · arrows: shear 0–6 km (full length 30 m/s)';
+      if (r.id === 55) note += ' · red contours: SRH 0–3 km every 100 m²/s² (thick 200) · arrows: shear 0–6 km (full length ' + fm(30, 'm/s') + ')';
       if (fd.cmap === 21) note += ' · > 150 m²/s² favours supercells, > 300 – tornadoes (with high CAPE and shear)';
       if (r.id === 56) note += ' · > 1 supercells possible, > 4 – favourable';
-      if (r.id === 51) note += ' · > 20 m/s organised storms, > 25 m/s supercells';
+      if (r.id === 51) note += ` · > ${fm(20, 'm/s')} organised storms, > ${fm(25, 'm/s')} supercells`;
       if (r.id === 42) note += ' · flickering dots: lightning (density ∝ flash rate)';
-      if (fd.cmap === 20) { lo = '0.5'; hi = '1000 m³/s'; ticks = [[5, 0.3], [50, 0.6], [500, 0.91]]; note += ' – water flowing over the terrain (log scale); floods after downpours'; }
-      if (fd.cmap === 19) { lo = '0'; hi = '8 cm'; ticks = [[0.5, 0.0625], [2, 0.25], [5, 0.625]]; note += ' – yellow < 2 cm, orange 2–5 cm, purple > 5 cm'; }
-      if (fd.cmap === 17) { lo = '0 km'; hi = '10+ km'; ticks = [[1, 0.1], [5, 0.5]]; note += ' – white: fog (< 1 km), yellowish: haze'; }
+      if (fd.cmap === 20) { unitOf = 'm³/s'; lo = `${dT(0.5)}`; hi = `${dT(1000)} ${unitD('m³/s')}`; ticks = [[dT(5), 0.3], [dT(50), 0.6], [dT(500), 0.91]]; note += ' – water flowing over the terrain (log scale); floods after downpours'; }
+      if (fd.cmap === 19) { unitOf = 'cm'; lo = '0'; hi = `${dT(8)} ${unitD('cm')}`; ticks = [[dT(0.5), 0.0625], [dT(2), 0.25], [dT(5), 0.625]]; note += ` – yellow < ${fm(2, 'cm')}, orange ${nD(2, 'cm')}–${fm(5, 'cm')}, purple > ${fm(5, 'cm')}`; }
+      if (fd.cmap === 17) { unitOf = 'km'; lo = `0 ${unitD('km')}`; hi = `${dT(10)}+ ${unitD('km')}`; ticks = [[dT(1), 0.1], [dT(5), 0.5]]; note += ` – white: fog (< ${isImp() ? '0.6 mi' : '1 km'}), yellowish: haze`; }
       if (fd.cmap === 18) { lo = ''; hi = ''; ticks = []; note = 'Phenomena: grey – none · light grey – fog · purple-grey – summits and slopes in cloud · light blue – hoar frost · white – rime · crimson – freezing rain (glaze)'; }
       if (fd.cmap === 31) { lo = ''; hi = ''; ticks = []; note = `Surface type, left to right: ${VEG_NAMES.join(' · ')}`; }
       if (fd.cmap === 16) note += ' – dark: dry air (subsidence), light: moist upper troposphere and high clouds';
       if (fd.cmap === 30) { lo = 'stationary · warm'; hi = 'sharp cold'; ticks = [[0, 1 / 2], [1, 3 / 4]]; note = 'Surface fronts (axis from the synoptic model, sharpened in the domain and bent by the flow): purple – stationary (wind along the front), red – warm, light blue – gentle cold (wide precipitation band), navy – sharp cold (sudden temperature drop, lift line, possible squall line); background – T 2 m'; }
-      if (r.id === 37) { lo = 'none'; hi = 'dense'; ticks = []; note += ' – low (< 2 km) orange, middle (2–6 km) green, high (> 6 km) blue'; }
+      if (r.id === 37) { lo = 'none'; hi = 'dense'; ticks = []; note += ` – low (< ${fmZ(2)}) orange, middle (${fmZ(2)} – ${fmZ(6)}) green, high (> ${fmZ(6)}) blue`; }
       else if (fd.cmap === 9) { lo = 'ground'; hi = 'clouds'; ticks = []; note += ' – visible light, dark at night'; }
       if (fd.cmap === 10) {
-        hi = `${Math.round(sim.hmax)} m`;
-        ticks = sim.hmax > 0 ? legendTicks(0, sim.hmax).filter((t) => t > 0 && t < sim.hmax).map((t) => [t, t / sim.hmax]) : [];
+        const hd = toD(sim.hmax, 'm');
+        hi = fmH(sim.hmax);
+        ticks = hd > 0 ? legendTicks(0, hd).filter((t) => t > 0 && t < hd).map((t) => [t, t / hd]) : [];
       }
       const isoT = [0, 20, 21, 24, 46, 47].includes(r.id) && r.iso === 1;
-      if (r.iso) note += isoT ? ' · isotherms: every 1 °C dashed, every 2 °C thin, every 5 °C thick, white = 0 °C'
-        : ` · contours every ${+r.iso.toPrecision(2)} ${fd.unit}` + ([0, 20, 21, 24].includes(r.id) ? ', white = 0 °C' : '');
+      // (izolinie rysuje shader w stałych krokach w °C i hPa)
+      const dIso = fd.unit === '°C' ? (isImp() ? +(r.iso * 1.8).toFixed(1) : r.iso) : fd.unit === 'hPa' ? +toD(r.iso, 'hPa').toPrecision(2) : +toD(r.iso, fd.unit).toPrecision(2);
+      const zero = isImp() ? '32 °F' : '0 °C';
+      if (r.iso) note += isoT ? (isImp() ? ` · isotherms: every 1.8 °F dashed, every 3.6 °F thin, every 9 °F thick, white = ${zero}` : ` · isotherms: every 1 °C dashed, every 2 °C thin, every 5 °C thick, white = ${zero}`)
+        : ` · contours every ${dIso} ${unitD(fd.unit)}` + ([0, 20, 21, 24].includes(r.id) ? `, white = ${zero}` : '');
       el.querySelector('.lo').textContent = lo;
       el.querySelector('.hi').textContent = hi;
       el.querySelector('.ticks').innerHTML = ticks.map(([t, f]) => `<span style="left:${(100 * f).toFixed(2)}%">${+t.toPrecision(3)}</span>`).join('');
@@ -2948,38 +3241,37 @@ async function init() {
     $('humV').textContent = `${(100 * num('hum')).toFixed(0)}%`;
     const hr = num('hour');
     $('hourV').textContent = `${Math.floor(hr)}:${hr % 1 ? '30' : '00'}`;
-    $('tsfcV').textContent = `${num('tsfc')} °C`;
-    $('lapseV').textContent = `${num('lapse')} K/km`;
+    $('tsfcV').textContent = fT(num('tsfc'), 0);
+    $('lapseV').textContent = isImp() ? `${(num('lapse') * 0.54864).toFixed(1)} °F/1000 ft` : `${num('lapse')} K/km`;
     $('rhLowV').textContent = `${num('rhLow')} %`;
     $('rhHighV').textContent = `${num('rhHigh')} %`;
-    $('ztropV').textContent = `${num('ztrop')} km`;
-    $('zinvV').textContent = num('zinv') > 0 ? `${num('zinv')} km` : 'none';
-    $('tnightV').textContent = num('tnight') > 0 ? `−${num('tnight')} K` : 'none';
-    $('waterV').textContent = `${num('water')} °C`;
-    $('seaV').textContent = `${num('sea')} m`;
-    $('dinvV').textContent = `+${num('dinv')} K`;
-    $('windV').textContent = `${num('wind')} m/s`;
-    $('wlsV').textContent = num('wls') > 0 ? `${num('wls')} cm/s` : 'none';
+    $('ztropV').textContent = fmZ(num('ztrop'));
+    $('zinvV').textContent = num('zinv') > 0 ? fmZ(num('zinv')) : 'none';
+    $('tnightV').textContent = num('tnight') > 0 ? `−${fdT(num('tnight'), isImp() ? 1 : 0)}` : 'none';
+    $('waterV').textContent = fT(num('water'), 0);
+    $('seaV').textContent = fmH(num('sea'));
+    $('dinvV').textContent = `+${fdT(num('dinv'), isImp() ? 1 : 0)}`;
+    $('windV').textContent = fm(num('wind'), 'm/s');
+    $('wlsV').textContent = num('wls') > 0 ? fm(num('wls'), 'cm/s') : 'none';
     // ustawiona anomalia wyraźnie widoczna (pomarańczowa, z ostrzeżeniem)
-    $('tanomV').textContent = num('tanom') === 0 ? '0 K' : `${num('tanom') > 0 ? '+' : ''}${num('tanom').toFixed(1)} K`;
-    $('tanomV').style.color = num('tanom') === 0 ? '' : '#ff9a3c';
+    manipUi();
     const dirs = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
     $('wdirV').textContent = `${num('wdir')}° (${dirs[Math.round(num('wdir') / 45) % 8]})`;
     $('soilV').textContent = `${num('soil')} %`;
-    $('hillsV').textContent = `${num('hills')} m`;
-    $('brushV').textContent = `${num('brush')} km`;
+    $('hillsV').textContent = fmH(num('hills'));
+    $('brushV').textContent = `${+nD(num('brush'), 'km', 1)} ${unitD('km')}`;
     $('rangeV').textContent = `×${Math.pow(2, num('range')).toFixed(2)}`;
     $('cloudAlphaV').textContent = `${num('cloudAlpha')} %`;
-    $('zsV').textContent = `${num('zs')} m`;
-    $('ysV').textContent = `${num('ys')} km`;
-    $('ztV').textContent = `${num('zt')} km`;
+    $('zsV').textContent = fmH(num('zs'));
+    $('ysV').textContent = `${+nD(num('ys'), 'km', 1)} ${unitD('km')}`;
+    $('ztV').textContent = fmZ(num('zt'));
     const fh = num('fieldH');
     $('xyTitle').textContent = v3.on ? '3D view' : fh >= 20 ? 'Map' : 'Horizontal section';
-    $('xyInfo').textContent = v3.on ? 'clouds, terrain and sun' : fh >= 20 ? FIELDS[fh].name : `${FIELDS[fh].name} · ${num('zs')} m a.s.l.`;
+    $('xyInfo').textContent = v3.on ? 'clouds, terrain and sun' : fh >= 20 ? FIELDS[fh].name : `${FIELDS[fh].name} · ${fmH(num('zs'))} a.s.l.`;
     $('zsCtl').style.display = fh >= 20 || v3.on ? 'none' : '';
     for (const b of $('monBtns').children) b.classList.toggle('on', +b.dataset.f === fh);
-    $('xzInfo').textContent = `${FIELDS[num('fieldV')].name} · y = ${num('ys')} km`;
-    $('xzTop').textContent = `height 0 – ${num('zt')} km`;
+    $('xzInfo').textContent = `${FIELDS[num('fieldV')].name} · y = ${+nD(num('ys'), 'km', 1)} ${unitD('km')}`;
+    $('xzTop').textContent = `height 0 – ${fmZ(num('zt'))}`;
     layMark();
     markMode();
     wxModeUi();
@@ -3560,6 +3852,10 @@ async function init() {
       const s = await drv.model.readCenter();
       return { mode: drv.mode, cls: drv.cls, p: s.psl, tAnom: s.tAnom, tDay: s.tDay, u0: s.u0, v0: s.v0, w: s.w, pr: s.pr, air: s.air, fc: drv.fc.length, tA: drv.tA, slot: drv.slot };
     },
+    // okno czasu meteogramu tygodniowego [s od początku okna tygodnia] (testy)
+    fcView: () => ({ a: fcv.a, span: fcv.span, week: FC_WEEK, n: drv.fc.length }),
+    // manipulacja atmosfery: odcinki, historia i wartości w tej chwili (testy)
+    manip: () => ({ ...JSON.parse(JSON.stringify(manip)), now: { T: mAt('T', sim.time), R: mAt('R', sim.time), V: mAt('V', sim.time) }, forcV: drv.model ? drv.model.forcV : null, fcV: drv.fcModel ? drv.fcModel.forcV : null, csv: manipCsv() }),
     // bieżący stan modelu synoptycznego w środku domeny (średnia 3 × 3 oczka): T przy gruncie, ~1.5, 3, 5 km (testy)
     async peNow() {
       if (!drv.model) return null;
@@ -3571,6 +3867,28 @@ async function init() {
     async roll(seed) { drv.seed = seed; drv.mode = 'syn'; $('wxMode').value = 'syn'; await reset(); },
     set(id, value) { $(id).value = value; $(id).dispatchEvent(new Event('change')); labels(); },
     stop() { sim.halted = true; },
+    // pełny zapis przebiegu: stan gotowy, plik, sumy kontrolne buforów (testy)
+    ready() { return !sim.busy; },
+    runBlob(onProgress) { return buildRunFile(onProgress); },
+    stashRun, resumeUrl, openRun,
+    async fingerprint() {
+      const m = drv.model, c = drv.ccModel, enc = device.createCommandEncoder(), rs = [];
+      const add = (n, b) => { const rb = buf(b.size, U.MAP_READ | U.COPY_DST, 'fpRead'); enc.copyBufferToBuffer(b, 0, rb, 0, b.size); rs.push({ n, rb }); };
+      for (const [n, b] of [['state', stateBuf], ['tmp', tmpBuf], ['work', workBuf], ['sfc', sfcBuf], ['tgt', tgtBuf], ['acc', accBuf], ['vg', vgBuf]]) add(n, b);
+      if (m) { add('pe.S', m.S[m.p]); add('pe.wk', m.wk); add('pe.dg', m.dg); add('pe.vz', m.vz); }
+      if (c) { add('cc.S', c.S[c.p]); add('cc.wk', c.wk); add('cc.dg', c.dg); }
+      device.queue.submit([enc.finish()]);
+      const out = {};
+      for (const { n, rb } of rs) {
+        await rb.mapAsync(GPUMapMode.READ);
+        const a = new Uint32Array(rb.getMappedRange());
+        let h = 2166136261;
+        for (let i = 0; i < a.length; i++) { h ^= a[i]; h = Math.imul(h, 16777619); }
+        out[n] = h >>> 0;
+        rb.unmap(); rb.destroy();
+      }
+      return { time: sim.time, step: sim.step, slot: drv.slot, tA: drv.tA, months: mon.list.length, ...out };
+    },
     // wznowienie pętli klatek (po stop) i zegar cumulusów – test trybu MAX
     go() { if (sim.halted) { sim.halted = false; sim.paused = false; requestAnimationFrame(frame); } },
     cu() { return { ...cuc }; },
@@ -3627,7 +3945,7 @@ async function init() {
     $('wxModeName').textContent = on ? 'Synoptic model' : 'Fixed air mass';
     $('wxSyn').style.display = on ? '' : 'none';
     $('wxConst').style.display = on ? 'none' : '';
-    $('tanomStrip').style.display = on ? '' : 'none';
+    $('manipBox').style.display = on ? '' : 'none';
     if (on) drv.synDirty = true;
   }
 
@@ -3653,11 +3971,11 @@ async function init() {
     const dp = now && before && now !== before ? now.p - before.p : null;
     const ws = Math.hypot(s.u0, s.v0);
     $('wxNow').innerHTML = `<span class="amn" style="color:${AIRMASS_COL[c.key]}">${info[0]}</span><br><span class="k">${info[1]}</span><br><br>`
-      + `<span class="k">pressure</span> <b>${s.psl.toFixed(0)} hPa</b>${dp === null ? '' : ` (${dp >= 0 ? '+' : ''}${dp.toFixed(1)} hPa/3 h)`}`
-      + ` · <span class="k">wind</span> <b>${dirName(s.u0, s.v0)} ${ws.toFixed(0)} m/s</b><br>`
-      + `<span class="k">air-mass T anomaly</span> <b>${s.tAnom >= 0 ? '+' : ''}${s.tAnom.toFixed(1)} K</b>`
-      + ` · <span class="k">vertical motion</span> <b>${(100 * s.w).toFixed(1)} cm/s</b>`
-      + (s.pr > 0.05 ? ` · <span class="k">precip. (large scale)</span> <b>${s.pr.toFixed(1)} mm/h</b>` : '');
+      + `<span class="k">pressure</span> <b>${fm(s.psl, 'hPa')}</b>${dp === null ? '' : ` (${dp >= 0 ? '+' : ''}${(isImp() ? dp * 0.02953 : dp).toFixed(isImp() ? 2 : 1)} ${unitD('hPa')}/3 h)`}`
+      + ` · <span class="k">wind</span> <b>${dirName(s.u0, s.v0)} ${fm(ws, 'm/s')}</b><br>`
+      + `<span class="k">air-mass T anomaly</span> <b>${fdT(s.tAnom, 1, true)}</b>`
+      + ` · <span class="k">vertical motion</span> <b>${fm(100 * s.w, 'cm/s', 1)}</b>`
+      + (s.pr > 0.05 ? ` · <span class="k">precip. (large scale)</span> <b>${fm(s.pr, 'mm/h', 1)}</b>` : '');
     $('chipAir').textContent = AIRMASS_CODE[c.key];
     $('chipAir').style.color = AIRMASS_COL[c.key];
   }
@@ -3714,13 +4032,21 @@ async function init() {
   };
   const SYN_DARK = { prate: 1, cloud: 1, olr: 1, sw: 1 };          // ciemne tło – jasne izolinie i brzegi
   // legenda pod mapą: pasek skali widoku i objaśnienia nakładek
+  // opis izolinii: rysowane w stałych krokach w hPa, K i dam
+  const synCiName = (v) => {
+    if (!isImp()) return v.ciName;
+    if (/isobars/.test(v.ciName)) return `isobars every ${(v.ci * 0.02953).toFixed(2)} inHg`;
+    if (/isotherms/.test(v.ciName)) return `isotherms every ${(v.ci * 1.8).toFixed(1)} °F`;
+    if (/geopotential/.test(v.ciName)) return `geopotential every ${Math.round(v.ci * 32.8084)} ft`;
+    return v.ciName;
+  };
   function synLegend() {
     const v = SYN_VIEWS[$('synLevel').value] || SYN_VIEWS.sfc, wk = { temp: 'temp', prate: 'prate', wind: 'wind', cape: 'cape' }[v.pal];
     let bar, lo, hi, ticks = [];
     if (wk) {
       const i = WX_INDEX[wk], ws = WXS[i];
-      bar = wxLegendCss(i); lo = `${ws.t[0]}`; hi = `${ws.t[ws.t.length - 1]}+ ${ws.unit}`; ticks = wxTicks(i);
-      if (wk === 'temp') ticks = ticks.filter(([t]) => t % 12 === 0 || t === 0);
+      bar = wxLegendCss(i); [lo, hi, ticks] = wxLegend(i);
+      if (wk === 'temp' && !isImp()) ticks = ticks.filter(([t]) => t % 12 === 0 || t === 0);
     } else {
       const c = {
         cloud: ['linear-gradient(90deg, rgb(41,43,48), rgb(245,245,247))', '0', '100 %', [[50, 0.5]]],
@@ -3733,10 +4059,10 @@ async function init() {
     }
     const items = [];
     if (syn.o.hl && v.cf === 'psl') items.push('<span><b style="color:#ff5a5a">L</b> low</span><span><b style="color:#6f9bff">H</b> high</span>');
-    if (syn.o.iso) items.push(`<span>${v.ciName}</span>`);
+    if (syn.o.iso) items.push(`<span>${synCiName(v)}</span>`);
     if (syn.o.rain && v.rain) items.push(`<span><i style="background:${wxLegendCss(WX_INDEX.prate)}"></i>precipitation (hatched: showers)</span>`);
     if (syn.o.fronts) items.push('<span>darker: frontal zone</span>');
-    if (syn.o.wind) items.push(`<span>arrows: wind${v.wind ? (v.wind[0] === 'u5' ? ' ~5.6 km' : ' ~1.5 km') : ' ~1.5 km'}</span>`);
+    if (syn.o.wind) items.push(`<span>arrows: wind ~${fmZ(v.wind && v.wind[0] === 'u5' ? 5.6 : 1.5)}</span>`);
     items.push('<span>□ domain</span>');
     $('synLeg').innerHTML = `<div class="leg" style="margin-top:0"><span class="lo">${lo}</span><div class="bar" style="background:${bar}"></div><span class="hi">${hi}</span>`
       + `<div class="ticks">${ticks.map(([t, f]) => `<span style="left:${(100 * f).toFixed(1)}%">${t}</span>`).join('')}</div></div>`
@@ -3927,7 +4253,7 @@ async function init() {
           if (px < 8 || py < 8 || px > W - 8 || py > H - 8) continue;
           const col = isMin ? '#c62828' : '#1e4fd0';
           label(isMin ? 'L' : 'H', px, py, col, font1);
-          label(p0.toFixed(0), px, py + 13 * dpr, col, font2);
+          label(nD(p0, 'hPa'), px, py + 13 * dpr, col, font2);
         }
       }
     }
@@ -3940,13 +4266,51 @@ async function init() {
     ctx.fillStyle = '#fff'; ctx.font = `${Math.round(10 * dpr)}px Arial, sans-serif`; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
     ctx.shadowColor = 'rgba(0,0,0,0.8)'; ctx.shadowBlur = 2 * dpr;
     ctx.fillText('N ▲', 6 * dpr, 10 * dpr);
-    const len = niceStep(span / 6);
-    ctx.fillText(`${len / 1000} km`, 6 * dpr, H - 16 * dpr);
-    ctx.fillRect(6 * dpr, H - 9 * dpr, len / span * W, 3 * dpr);
+    const len = niceStep(toD(span / 1000, 'km') / 6);   // w jednostkach na ekranie
+    ctx.fillText(`${len} ${unitD('km')}`, 6 * dpr, H - 16 * dpr);
+    ctx.fillRect(6 * dpr, H - 9 * dpr, len / toD(span / 1000, 'km') * W, 3 * dpr);
     ctx.shadowBlur = 0;
   }
 
-  // Przebieg w środku domeny: od doby wstecz do 6 dób naprzód (model synoptyczny liczy prognozę w tle)
+  // Widok meteogramu: okno czasu w obrębie tygodnia. a – początek okna liczony od lewego końca tygodnia [s], więc okno idzie razem z zegarem
+  const FC_WEEK = 7 * 86400, FC_MIN = 12 * 3600, FC_MARGIN = 30;   // marginesy wykresu po bokach [px CSS]
+  const fcv = { span: FC_WEEK, a: 0, drag: null, raf: 0 };
+  const fcStart = () => Math.max(0, sim.time - 86400);
+  const fcRedraw = () => { if (!fcv.raf) fcv.raf = requestAnimationFrame(() => { fcv.raf = 0; drawForecast(); }); };
+  const fcClamp = () => { fcv.span = Math.min(FC_WEEK, Math.max(FC_MIN, fcv.span)); fcv.a = Math.min(FC_WEEK - fcv.span, Math.max(0, fcv.a)); };
+  // powiększenie wokół punktu fr wykresu (0…1); bez punktu – wokół „teraz”, a gdy „teraz” poza oknem, wokół środka
+  function fcZoom(f, fr) {
+    const s0 = fcv.span, s1 = Math.min(FC_WEEK, Math.max(FC_MIN, s0 * f));
+    if (fr === undefined) { const n = (sim.time - fcStart() - fcv.a) / s0; fr = n >= 0 && n <= 1 ? n : 0.5; }
+    fcv.a += fr * (s0 - s1); fcv.span = s1; fcClamp();
+    fcRedraw();
+  }
+  {
+    const cv = $('cfc'), plotW = () => Math.max(1, cv.clientWidth - 2 * FC_MARGIN);
+    cv.addEventListener('wheel', (e) => {
+      if (e.deltaY > 0 && fcv.span >= FC_WEEK) return;   // cały tydzień: kółko dalej przewija panel
+      e.preventDefault();
+      const r = cv.getBoundingClientRect();
+      fcZoom(Math.exp(e.deltaY * 0.0015), Math.min(1, Math.max(0, (e.clientX - r.left - FC_MARGIN) / plotW())));
+    }, { passive: false });
+    cv.addEventListener('pointerdown', (e) => {
+      fcv.drag = { x: e.clientX, a: fcv.a };
+      cv.setPointerCapture(e.pointerId); cv.classList.add('drag');
+    });
+    cv.addEventListener('pointermove', (e) => {
+      if (!fcv.drag) return;
+      fcv.a = fcv.drag.a - (e.clientX - fcv.drag.x) / plotW() * fcv.span; fcClamp();
+      fcRedraw();
+    });
+    const up = () => { fcv.drag = null; cv.classList.remove('drag'); };
+    cv.addEventListener('pointerup', up);
+    cv.addEventListener('pointercancel', up);
+    cv.addEventListener('dblclick', () => { fcv.span = FC_WEEK; fcv.a = 0; fcRedraw(); });
+    $('fcZp').onclick = () => fcZoom(1 / 1.5);
+    $('fcZm').onclick = () => fcZoom(1.5);
+  }
+
+  // Przebieg w środku domeny: od doby wstecz do 6 dób naprzód (model synoptyczny liczy prognozę w tle) albo wybrany wycinek tego tygodnia
   function drawForecast() {
     const cv = $('cfc');
     if (!cv.offsetParent) return;
@@ -3956,34 +4320,52 @@ async function init() {
     const ctx = cv.getContext('2d');
     ctx.clearRect(0, 0, W, H);
     if (drv.mode !== 'syn' || !drv.fc.length) return;
-    const t0 = Math.max(0, sim.time - 86400), t1 = t0 + 7 * 86400;
+    fcClamp();
+    const t0 = fcStart() + fcv.a, t1 = t0 + fcv.span;
+    // zakres osi z tego, co widać: po powiększeniu krzywe zajmują całą wysokość
     const rec = drv.fc.filter((r) => r.t >= t0 - 3 * 3600 && r.t <= t1 + 3 * 3600);
     if (rec.length < 2) return;
-    const L = 30 * dpr, R = 30 * dpr, T = 8 * dpr, B = 26 * dpr;
+    const L = FC_MARGIN * dpr, R = FC_MARGIN * dpr, T = 8 * dpr, B = 26 * dpr;
     const X = (t) => L + (t - t0) / (t1 - t0) * (W - L - R);
     let pmin = Math.min(...rec.map((r) => r.p)), pmax = Math.max(...rec.map((r) => r.p));
     if (pmax - pmin < 12) { const c = (pmax + pmin) / 2; pmin = c - 6; pmax = c + 6; }
-    let tmin = Math.min(...rec.map((r) => r.T)), tmax = Math.max(...rec.map((r) => r.T));
-    if (tmax - tmin < 8) { const c = (tmax + tmin) / 2; tmin = c - 4; tmax = c + 4; }
+    let tmin = Math.min(...rec.map((r) => toD(r.T, '°C'))), tmax = Math.max(...rec.map((r) => toD(r.T, '°C')));
+    const tRange = isImp() ? 14 : 8;
+    if (tmax - tmin < tRange) { const c = (tmax + tmin) / 2; tmin = c - tRange / 2; tmax = c + tRange / 2; }
     const yP = (p) => T + (1 - (p - pmin) / (pmax - pmin)) * (H - T - B - 10 * dpr);
     const yT = (t) => T + (1 - (t - tmin) / (tmax - tmin)) * (H - T - B - 10 * dpr);
     ctx.font = `${Math.round(10 * dpr)}px system-ui`;
     // doby
     ctx.strokeStyle = '#22224a'; ctx.fillStyle = '#a2a7c0'; ctx.textAlign = 'center';
-    for (let d = Math.ceil(t0 / 86400); d * 86400 <= t1; d++) {
-      const x = X(d * 86400 - sim.startHour * 3600);
+    const sh = sim.startHour * 3600;
+    for (let d = Math.ceil((t0 + sh) / 86400); d * 86400 - sh <= t1; d++) {
+      const x = X(d * 86400 - sh);
       if (x < L || x > W - R) continue;
       ctx.beginPath(); ctx.moveTo(x, T); ctx.lineTo(x, H - B); ctx.stroke();
       const dd = new Date(Date.UTC(sim.year, 0, sim.doy0 + d));
       ctx.fillText(dd.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', timeZone: 'UTC' }), x, H - 4 * dpr);
     }
-    // opad z modelu synoptycznego [mm/h] – słupki (pełna wysokość ~4 mm/h)
+    // godziny po powiększeniu: co 6 h do 2 dób w oknie, co 3 h do 1 doby (północ ma datę)
+    if (fcv.span <= 2 * 86400) {
+      const st = (fcv.span <= 86400 ? 3 : 6) * 3600;
+      ctx.save(); ctx.globalAlpha = 0.55;
+      for (let tt = Math.ceil((t0 + sh) / st) * st; tt - sh <= t1; tt += st) {
+        const x = X(tt - sh), hh = (tt % 86400) / 3600;
+        if (!hh || x < L || x > W - R) continue;
+        ctx.beginPath(); ctx.moveTo(x, T); ctx.lineTo(x, H - B); ctx.stroke();
+        ctx.fillText(`${String(hh).padStart(2, '0')}:00`, x, H - 4 * dpr);
+      }
+      ctx.restore();
+    }
+    ctx.save(); ctx.beginPath(); ctx.rect(L, 0, W - L - R, H); ctx.clip();   // krzywe i słupki kończą się na brzegu okna
+    // opad z modelu synoptycznego [mm/h] – słupki (pełna wysokość ~4 mm/h), szerokość rośnie z powiększeniem (zapis co 3 h)
+    const barW = Math.max(4 * dpr, 0.7 * 3 * 3600 / fcv.span * (W - L - R));
     for (const r of rec) {
       if (r.pr > 0.05) {
         const rc = radarColor(r.pr);
         ctx.fillStyle = `rgba(${rc.map((v) => Math.round(255 * v)).join(',')},0.8)`;
         const h = Math.min(1, r.pr / 4) * (H - T - B) * 0.5;
-        ctx.fillRect(X(r.t) - 2 * dpr, H - B - 10 * dpr - h, 4 * dpr, h);
+        ctx.fillRect(X(r.t) - barW / 2, H - B - 10 * dpr - h, barW, h);
       }
     }
     // pasek mas powietrza
@@ -3997,17 +4379,19 @@ async function init() {
       ctx.stroke();
     };
     line((r) => r.p, yP, '#6f8fff');
-    line((r) => r.T, yT, '#ff6b5e');
-    ctx.textAlign = 'left'; ctx.fillStyle = '#8fa6ff';
-    ctx.fillText(`${pmax.toFixed(0)} hPa`, 2 * dpr, T + 8 * dpr);
-    ctx.fillText(`${pmin.toFixed(0)}`, 2 * dpr, H - B - 14 * dpr);
-    ctx.textAlign = 'right'; ctx.fillStyle = '#e88';
-    ctx.fillText(`${tmax.toFixed(0)} °C`, W - 2 * dpr, T + 8 * dpr);
-    ctx.fillText(`${tmin.toFixed(0)}`, W - 2 * dpr, H - B - 14 * dpr);
+    line((r) => toD(r.T, '°C'), yT, '#ff6b5e');
     // teraz
     const xn = X(sim.time);
     ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5 * dpr; ctx.setLineDash([4 * dpr, 3 * dpr]);
     ctx.beginPath(); ctx.moveTo(xn, T); ctx.lineTo(xn, H - B); ctx.stroke(); ctx.setLineDash([]);
+    ctx.restore();
+    ctx.textAlign = 'left'; ctx.fillStyle = '#8fa6ff';
+    ctx.fillText(nD(pmax, 'hPa'), 2 * dpr, T + 8 * dpr);
+    ctx.fillText(unitD('hPa'), 2 * dpr, T + 20 * dpr);
+    ctx.fillText(nD(pmin, 'hPa'), 2 * dpr, H - B - 14 * dpr);
+    ctx.textAlign = 'right'; ctx.fillStyle = '#e88';
+    ctx.fillText(`${tmax.toFixed(0)} ${unitD('°C')}`, W - 2 * dpr, T + 8 * dpr);
+    ctx.fillText(`${tmin.toFixed(0)}`, W - 2 * dpr, H - B - 14 * dpr);
   }
 
   // co klatkę: prognoza w tle (kopia modelu synoptycznego 7 dób przed symulacją), odświeżenie mapy
@@ -4062,7 +4446,7 @@ async function init() {
     await drv.ccWait;
   }
   function weatherTick(full = false) {
-    if (sim.busy) return;
+    if (sim.busy || sim.saving) return;
     bgTick();
     const now = performance.now();
     // mapa synoptyczna: odczyt pól z GPU, gdy zakładka jest widoczna
@@ -4164,7 +4548,7 @@ async function init() {
     const st = sim.stats;
     const cover = st ? (100 * st[14] / (NXD * NYD)).toFixed(0) : '–';
     $('profInfo').textContent = base === null ? `No clouds. Cloud cover ${cover} %.`
-      : `Cloud base ≈ ${Math.round(base / 50) * 50} m, tops ≈ ${Math.round(top / 50) * 50} m a.s.l. Cloud cover ${cover} %.`;
+      : `Cloud base ≈ ${fmH(Math.round(base / 50) * 50)}, tops ≈ ${fmH(Math.round(top / 50) * 50)} a.s.l. Cloud cover ${cover} %.`;
   }
 
   function drawProbe() {
@@ -4197,13 +4581,13 @@ async function init() {
     drawProfile($('cprof'), { z, T, Td, cloud, parcel, wind, top: num('zt') * 1000, ground: pp.zg, parcelLabel: 'parcel from the lowest 500 m', hodo: { pts: hp, storm } });
     const i = pp.col % NX, j = Math.floor(pp.col / NX), ct = convTemp(pp);
     const sv = (n) => sim.sfc[S[n] * NXY + pp.col];
-    const f0 = (x) => (x === null || x === undefined ? '–' : `${Math.round(x / 10) * 10} m`);
+    const f0 = (x) => (x === null || x === undefined ? '–' : fmH(Math.round(x / 10) * 10));
     const t2 = pp.T2 - 273.15;
     $('profInfo').innerHTML = [
-      `<b>Probe</b> ${((i - MG + 0.5) * CFG.DX / 1000).toFixed(1)}, ${((j - MG + 0.5) * CFG.DY / 1000).toFixed(1)} km · terrain ${Math.round(pp.zg)} m`,
+      `<b>Probe</b> ${nD((i - MG + 0.5) * CFG.DX / 1000, 'km', 1)}, ${nD((j - MG + 0.5) * CFG.DY / 1000, 'km', 1)} ${unitD('km')} · terrain ${fmH(pp.zg)}`,
       `LCL ${f0(ix.lcl)} · LFC ${f0(ix.lfc)} · EL ${f0(ix.el)} a.g.l. · CAPE <b>${Math.round(ix.cape)}</b> J/kg (parcel from 2 m: ${Math.round(ixs.cape)}) · CIN ${ix.cin === null ? '–' : Math.round(ix.cin)} J/kg`,
-      `shear 0–6 km <b>${Math.hypot(sv('SHU'), sv('SHV')).toFixed(0)}</b> m/s · 0–1 km ${sv('SHR01').toFixed(0)} m/s · SRH 0–3 km <b>${Math.round(sv('SRH03'))}</b> · 0–1 km ${Math.round(sv('SRH01'))} m²/s²`,
-      ct ? `Convective T ≈ <b>${ct.tc.toFixed(1)} °C</b> (now ${t2.toFixed(1)} °C${t2 >= ct.tc - 0.3 ? ' – reached, thermals reach condensation' : `, ${(ct.tc - t2).toFixed(1)} K short`}) · 0 °C at ${f0(ix.frz)} · precipitable water ${ix.pw.toFixed(0)} mm` : '',
+      `shear 0–6 km <b>${nD(Math.hypot(sv('SHU'), sv('SHV')), 'm/s')}</b> ${unitD('m/s')} · 0–1 km ${fm(sv('SHR01'), 'm/s')} · SRH 0–3 km <b>${Math.round(sv('SRH03'))}</b> · 0–1 km ${Math.round(sv('SRH01'))} m²/s²`,
+      ct ? `Convective T ≈ <b>${fT(ct.tc)}</b> (now ${fT(t2)}${t2 >= ct.tc - 0.3 ? ' – reached, thermals reach condensation' : `, ${fdT(ct.tc - t2)} short`}) · ${isImp() ? '32 °F' : '0 °C'} at ${f0(ix.frz)} · precipitable water ${fm(ix.pw, 'mm')}` : '',
     ].filter(Boolean).join('<br>');
   }
 
@@ -4248,7 +4632,7 @@ async function init() {
       push(0, pp.ps, pp.T2, pp.q2, v('UA'), v('VA'));
       for (const L of pp.lev) if (L.za > 5) push(L.za, L.p, L.T, L.q, L.u, L.v);
       pr.zg = pp.zg; pr.lat = la; pr.lon = num('lon') + (i - MG - NXD / 2 + 0.5) * CFG.DX / (111320 * Math.cos(la * Math.PI / 180));
-      pr.label = `${((i - MG + 0.5) * CFG.DX / 1000).toFixed(1)}, ${((j - MG + 0.5) * CFG.DY / 1000).toFixed(1)} km`;
+      pr.label = `${nD((i - MG + 0.5) * CFG.DX / 1000, 'km', 1)}, ${nD((j - MG + 0.5) * CFG.DY / 1000, 'km', 1)} ${unitD('km')}`;
       return pr;
     }
     if (!sim.means || !sim.meanUV) return null;
@@ -4338,8 +4722,10 @@ async function init() {
     for (let t = 0; t < nx * ny; t++) { cuc.U[2 * t] = su[t] / sn[t]; cuc.U[2 * t + 1] = sv[t] / sn[t]; cuc.U2[2 * t] = su2[t] / sn[t]; cuc.U2[2 * t + 1] = sv2[t] / sn[t]; }
     for (let tj = 0; tj < ny; tj++) for (let ti = 0; ti < nx; ti++) {
       const t = tj * nx + ti;
-      if (ti + 1 < nx) g = Math.max(g, Math.hypot(cuc.U[2 * t + 2] - cuc.U[2 * t], cuc.U[2 * t + 3] - cuc.U[2 * t + 1]) / (LXd / nx));
-      if (tj + 1 < ny) g = Math.max(g, Math.hypot(cuc.U[2 * (t + nx)] - cuc.U[2 * t], cuc.U[2 * (t + nx) + 1] - cuc.U[2 * t + 1]) / (LYd / ny));
+      for (const U of [cuc.U, cuc.U2]) {   // oba wzory (niskie i piętro średnie)
+        if (ti + 1 < nx) g = Math.max(g, Math.hypot(U[2 * t + 2] - U[2 * t], U[2 * t + 3] - U[2 * t + 1]) / (LXd / nx));
+        if (tj + 1 < ny) g = Math.max(g, Math.hypot(U[2 * (t + nx)] - U[2 * t], U[2 * (t + nx) + 1] - U[2 * t + 1]) / (LYd / ny));
+      }
     }
     cuc.gmax = g;
   }
@@ -4386,7 +4772,7 @@ async function init() {
       $('shape').value = 'painted';
       applyTerrain();
       $('hills').value = String(Math.round(sim.hmax / 50) * 50);
-      $('hillsV').textContent = `${Math.round(sim.hmax)} m`;
+      $('hillsV').textContent = fmH(sim.hmax);
     }
 
     let n = 0;
@@ -4404,7 +4790,7 @@ async function init() {
       n = Math.max(0, Math.min(MAX_STEPS, n));
     }
 
-    if (sim.busy) n = 0;
+    if (sim.busy || sim.saving) n = 0;
     if (n > 0) {
       runSteps(n, true);
       speedHist.push({ t: now, sim: n * DT });
@@ -4437,7 +4823,8 @@ async function init() {
   $('landuse').value = 'mosaic';
   setShape('flat');
   const urlScen = new URLSearchParams(location.search).get('scen'), urlStart = new URLSearchParams(location.search).get('start');
-  if (urlStart !== null) startFromTitle(urlStart);
+  if (new URLSearchParams(location.search).has('resume')) resumeRun();
+  else if (urlStart !== null) startFromTitle(urlStart);
   else {
     $('loadScr').classList.remove('on');
     if (urlScen && SCENARIOS[urlScen]) applyScenario(urlScen);
@@ -4455,12 +4842,17 @@ async function init() {
 
   requestAnimationFrame(frame);
 
+  // przybliżanie meteogramu sondy (najkrótsze okno 1 h, zapis co 10 min)
+  const cmetView = newView(3600);
+  attachView($('cmet'), () => cmetView, () => drawMeteogram($('cmet'), meteo.hist, cmetView), MET_L, MET_R);
+
   // zegar, wskaźniki, legendy, profil i diagnostyka (co ~0.25 s; w testach z draw())
   function updateUi(now) {
       updateLegends();
       drawProf();
       drawSnd();
-      drawMeteogram($('cmet'), meteo.hist);
+      drawMeteogram($('cmet'), meteo.hist, cmetView);
+      manipUi();
       stations.tick(curAna() === 'st' && !document.body.classList.contains('noana'));
       const pm = $('probe');
       if (sim.probe && !v3.on) {
@@ -4482,9 +4874,9 @@ async function init() {
       $('clockTime').textContent = `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`;
       $('clockDate').textContent = `${dateFromDoy(sim.year, ck.doy)} · day ${Math.floor((sim.startHour + sim.time / 3600) / 24) + 1}`;
       $('clockSun').textContent = sun.elev > 0 ? `☀ ${sun.elev.toFixed(0)}°` : '☾ night';
-      $('chipT2').textContent = t2 ? `${t2.min.toFixed(1)}…${t2.max.toFixed(1)} °C` : '–';
+      $('chipT2').textContent = t2 ? `${nD(t2.min, '°C', 1)}…${fT(t2.max)}` : '–';
       $('chipCloud').textContent = st ? `${(100 * st[14] / (NXD * NYD)).toFixed(0)} %` : '–';
-      $('chipRain').textContent = st ? `${st[15].toFixed(1)} mm/h` : '–';
+      $('chipRain').textContent = st ? fm(st[15], 'mm/h', 1) : '–';
       $('chipSpeed').textContent = sim.paused ? 'paused' : `${simPerReal.toFixed(0)}×`;
       $('chipGpu').textContent = sim.msPerStep ? `${sim.msPerStep.toFixed(1)} ms/step` : '–';
       $('perf').textContent = [

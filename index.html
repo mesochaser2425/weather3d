@@ -53,7 +53,8 @@
     .chip { background: var(--panel2); padding: 2px 9px; color: var(--muted); white-space: nowrap; font-size: 12px; }
     .chip b { color: var(--text); }
     @media (max-width: 1500px) { #chipScaleBox, #chipGpuBox { display: none; } }
-    @media (max-width: 1250px) { #chipAirBox, #chipRainBox { display: none; } }
+    @media (max-width: 1500px) { #chipAirBox { display: none; } }
+    @media (max-width: 1250px) { #chipRainBox { display: none; } }
     #helpBtn { width: 30px; height: 30px; padding: 0; font-weight: 700; }
 
     /* ---------- układ: pasek zakładek | mapa | panel analiz ---------- */
@@ -91,6 +92,13 @@
     .vsw::after { content: ''; position: absolute; left: 3px; right: 3px; top: 3px; height: 11px; background: var(--tile-ink); transition: top .12s ease; }
     .vsw.off::after { top: 17px; }
     .box { background: var(--panel2); padding: 9px 10px; display: flex; flex-direction: column; gap: 8px; flex: none; }
+    details.manip { flex: none; display: flex; flex-direction: column; gap: 2px; }
+    details.manip summary { background: var(--panel2); padding: 6px 10px; cursor: pointer; letter-spacing: .05em; text-transform: uppercase; font-size: 12px; }
+    details.manip .strip { margin-top: 2px; }
+    details.manip .slbl { width: 104px; flex: none; }
+    details.manip select { flex: 1; min-width: 0; }
+    details.manip .btn { flex: none; padding: 3px 8px; }
+    details.manip .hint:empty { display: none; }
     .strip { background: var(--panel2); padding: 6px 10px; display: flex; align-items: center; gap: 10px; min-height: 29px; flex: none; }
     .strip .slbl { letter-spacing: .05em; text-transform: uppercase; font-size: 12px; white-space: nowrap; }
     .strip input[type=range] { flex: 1; min-width: 0; }
@@ -150,7 +158,11 @@
     .zbtns { position: absolute; right: 5px; top: 5px; display: flex; flex-direction: column; gap: 3px; }
     .zbtns button { width: 22px; height: 22px; padding: 0; border: 0; background: rgba(217,217,217,.9); color: var(--tile-ink); font-weight: 700; cursor: pointer; line-height: 1; }
     .zbtns button:hover { background: #fff; }
-    #cfc { width: 100%; aspect-ratio: 1.73; background: var(--panel2); display: block; }
+    #fcHead { display: flex; align-items: center; gap: 8px; }
+    #fcHead h4 { flex: 1; }
+    #fcHead .zbtns, .apanel .zbtns { position: static; flex-direction: row; }
+    #cfc { width: 100%; aspect-ratio: 1.73; background: var(--panel2); display: block; cursor: grab; touch-action: none; }
+    #cfc.drag { cursor: grabbing; }
     #wxNow { font-size: 12px; line-height: 1.5; min-height: 120px; padding: 10px 11px; display: block; }
     #wxNow .amn { font-size: 13.5px; font-weight: 700; letter-spacing: .03em; }
     #wxNow .k { color: var(--muted); }
@@ -206,13 +218,19 @@
     .tt-side { width: 384px; flex: none; background: var(--panel); border-radius: var(--radius); padding: 7px; display: flex; flex-direction: column; gap: 10px; overflow-y: auto; }
     #ttRes { display: flex; }
     #ttRes button { flex: 1; padding: 5px 2px; }
+    .ttman { display: flex; align-items: center; gap: 8px; font-size: 12px; margin-top: 4px; }
+    .ttman span { width: 84px; flex: none; }
+    .ttman input { flex: 1; min-width: 0; }
+    .ttman b { width: 46px; flex: none; text-align: right; }
     #ttMonths { display: grid; grid-template-columns: repeat(6, 1fr); gap: 6px; }
     #ttMonths button { border: 0; background: var(--tile); color: var(--tile-ink); padding: 9px 0; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .03em; cursor: pointer; }
     #ttMonths button:hover { background: var(--tile-hi); }
     #ttMonths button.on { background: var(--tile-ink); color: #fff; }
-    #ttPlace { font-size: 14px; font-weight: 700; }
+    #ttPlace { float: right; font-weight: 700; text-transform: none; letter-spacing: 0; }
+    .ttbtns { display: flex; gap: 6px; flex: none; }
+    .ttbtns .btn { flex: 1; min-width: 0; }
     #ttStart { flex: none; padding: 13px 8px; font-size: 16px; letter-spacing: .08em; text-transform: uppercase; }
-    #ttFlat { flex: none; }
+    #ttFlat, #ttResume { flex: none; }
     /* sondaż */
     #csnd { width: 100%; display: block; background: #fff; flex: none; }
     #sndFull { position: fixed; inset: 0; z-index: 70; background: #fff; display: none; }
@@ -306,6 +324,7 @@
     #stTable td { padding: 5px 4px; border-bottom: 1px solid var(--line); vertical-align: top; }
     #stTable td b { display: block; white-space: nowrap; }
     #stTable td small { display: block; color: var(--dim); font-size: 10.5px; white-space: nowrap; }
+    #stTable td:first-child small { white-space: normal; }
     #stTable tr[data-n] { cursor: pointer; }
     #stTable tr[data-n]:hover td { background: var(--panel3); }
     #stTable tr.sel td { background: rgba(99, 102, 241, .22); }
@@ -367,6 +386,7 @@
       <span class="chip">speed <b id="chipSpeed">–</b></span>
       <span class="chip" id="chipGpuBox">GPU <b id="chipGpu">–</b></span>
     </div>
+    <button id="unitBtn" class="iconbtn" title="Units on the screen: metric or imperial (°F, mph, in, ft, mi, inHg). Click to switch">°C</button>
     <button id="anaBtn" class="iconbtn on" title="Analysis panel: cross-section, probe, stations (A)">◨ Analysis</button>
     <button id="helpBtn" class="iconbtn" title="Help and keyboard shortcuts (H)">?</button>
   </div>
@@ -431,10 +451,11 @@
       </div>
       <div class="tt-side">
         <div class="box">
-          <h4>Map size</h4>
+          <h4>Map size <span id="ttPlace"></span></h4>
+          <div class="seg" id="ttUnits" title="Units on the screen"><button data-u="metric">Metric</button><button data-u="imperial">Imperial</button></div>
           <div style="display:flex; gap:8px">
-            <label style="flex:1"><span class="lbl">Width (W–E) [km]</span><input id="ttLx" type="number" min="5" max="5000" step="any" /></label>
-            <label style="flex:1"><span class="lbl">Height (S–N) [km]</span><input id="ttLy" type="number" min="5" max="5000" step="any" /></label>
+            <label style="flex:1"><span class="lbl" id="ttLxL">Width (W–E) [km]</span><input id="ttLx" type="number" min="5" max="5000" step="any" /></label>
+            <label style="flex:1"><span class="lbl" id="ttLyL">Height (S–N) [km]</span><input id="ttLy" type="number" min="5" max="5000" step="any" /></label>
           </div>
           <div class="synopts" id="ttSizes"></div>
           <label><span class="lbl">Detail (cells on the longer side; more = slower)</span><div class="seg" id="ttRes"></div></label>
@@ -446,11 +467,18 @@
           <div id="ttMonths"></div>
         </div>
         <div class="box">
-          <h4>Area centre</h4>
-          <div id="ttPlace"></div>
+          <h4>Atmosphere manipulation</h4>
+          <div class="ttman" title="Temperature anomaly of the whole troposphere, relative humidity unchanged"><span>Temperature</span><input id="ttTan" type="range" min="-10" max="10" step="0.5" value="0" /><b id="ttTanV"></b></div>
+          <div class="ttman" title="More or less precipitation; soil moisture follows"><span>Precipitation</span><input id="ttRain" type="range" min="0" max="9" step="1" value="4" /><b id="ttRainV"></b></div>
+          <div class="ttman" title="How active the weather is: above ×1 stronger lows and fronts, below ×1 quieter"><span>Variability</span><input id="ttVar" type="range" min="0" max="6" step="1" value="2" /><b id="ttVarV"></b></div>
         </div>
         <button id="ttStart" class="btn primary">Start</button>
-        <button id="ttFlat" class="btn" title="No download: flat terrain, climate of Kraków">Start on flat terrain</button>
+        <div class="ttbtns">
+          <button id="ttFlat" class="btn" title="No download: flat terrain, climate of Kraków">Start on flat terrain</button>
+          <button id="ttResume" class="btn" title="Continue a run saved with “Save run” in Settings">Load a saved run…</button>
+        </div>
+        <input id="ttRunFile" type="file" accept=".w3drun" hidden />
+        <div class="hint" id="ttRunInfo"></div>
       </div>
     </div>
   </div>
@@ -489,9 +517,23 @@
           <option value="const">Fixed air mass</option>
         </select>
         <div class="box" id="wxNow">–</div>
-        <div class="strip" id="tanomStrip" title="Temperature anomaly of the whole troposphere, relative humidity unchanged">
-          <span class="slbl">Anomaly</span><input id="tanom" type="range" min="-6" max="6" step="0.5" value="0" /><b id="tanomV"></b>
-        </div>
+        <details class="manip" id="manipBox" open>
+          <summary>Atmosphere manipulation</summary>
+          <div class="strip" title="Temperature anomaly of the whole troposphere, relative humidity unchanged">
+            <span class="slbl">Temperature</span><input id="tanom" type="range" min="-10" max="10" step="0.5" value="0" /><b id="tanomV"></b>
+          </div>
+          <div class="strip" title="More or less precipitation: humidity of the large-scale air, lifting of moisture on fronts and rain coming in through the edges. Soil moisture follows">
+            <span class="slbl">Precipitation</span><input id="manipR" type="range" min="0" max="9" step="1" value="4" /><b id="manipRV"></b>
+          </div>
+          <div class="strip" title="How active the weather is: the north–south temperature contrast and the jet stream of the synoptic model. Above ×1 stronger lows and fronts and bigger swings, below ×1 quieter weather. Builds up over days">
+            <span class="slbl">Variability</span><input id="manipV" type="range" min="0" max="6" step="1" value="2" /><b id="manipVV"></b>
+          </div>
+          <div class="strip" title="How long a change made during the run takes to take full effect">
+            <span class="slbl">Kick-in time</span><select id="manipRamp"><option value="0.25">6 hours</option><option value="1">1 day</option><option value="3" selected>3 days</option><option value="7">7 days</option><option value="14">14 days</option></select>
+            <button id="manipZero" class="btn" title="Back to normal, through the kick-in time">Neutral</button>
+          </div>
+          <div class="hint" id="manipNow"></div>
+        </details>
         <div class="col" id="wxSyn">
           <div class="synw">
             <div class="synbar"><select id="synLevel" title="What the synoptic map shows"></select></div>
@@ -504,8 +546,11 @@
             <div id="synLeg"></div>
           </div>
           <div class="synw">
-            <h4>7-day forecast – domain centre</h4>
-            <canvas id="cfc"></canvas>
+            <div id="fcHead">
+              <h4>7-day forecast – domain centre</h4>
+              <div class="zbtns"><button id="fcZp" title="Zoom in">+</button><button id="fcZm" title="Zoom out">−</button></div>
+            </div>
+            <canvas id="cfc" title="Mouse wheel – zoom, drag – move along time, double-click – whole week"></canvas>
             <div class="synleg" id="fcLeg"></div>
           </div>
         </div>
@@ -630,13 +675,17 @@
           <h4>Visible domain</h4>
           <table id="monTab"><thead><tr><th>Period</th><th title="Mean temperature">T</th><th title="Mean daily maximum">Tx</th><th title="Mean daily minimum">Tn</th><th title="Precipitation">P</th><th title="Snow (water equivalent)">S</th><th title="Absolute T max: the highest temperature anywhere in the visible domain">TXx</th><th title="Absolute T min: the lowest temperature anywhere in the visible domain">TNn</th><th title="Highest daily precipitation anywhere in the visible domain">Rx1d</th></tr></thead>
             <tbody></tbody><tfoot></tfoot></table>
-          <div class="hint">Domain means: T, mean daily max Tx and min Tn [°C], precipitation P and snow S (water) [mm]. Extremes anywhere in the domain: absolute TXx and TNn [°C], highest daily precipitation Rx1d [mm].
+          <div class="hint">Domain means: T, mean daily max Tx and min Tn [<span class="uT">°C</span>], precipitation P and snow S (water) [<span class="uP">mm</span>]. Extremes anywhere in the domain: absolute TXx and TNn [<span class="uT">°C</span>], highest daily precipitation Rx1d [<span class="uP">mm</span>].
             * – period in progress. Click a row – map of that period. “Total” – the whole run. A restart clears the saved months.</div>
         </div>
       </div>
 
       <div class="tab" data-panel="set">
         <div class="thead"><i class="tmark"></i><span class="ttl">Settings</span><button class="tclose" title="Close the menu (Esc)">×</button></div>
+        <div class="box">
+          <h4>Units</h4>
+          <div class="seg" id="unitSeg" title="Units on the screen. The model and the CSV files stay metric"><button data-u="metric">Metric</button><button data-u="imperial">Imperial (°F, mph, in, ft, mi, inHg)</button></div>
+        </div>
         <div class="box">
           <h4>Place and climate (a change restarts)</h4>
           <select id="location"></select>
@@ -661,8 +710,8 @@
         <div class="box">
           <h4>Grid and resolution</h4>
           <div style="display:flex; gap:8px">
-            <label style="flex:1"><span class="lbl">Width (W–E) [km]</span><input id="gridLx" type="number" min="5" max="5000" step="any" /></label>
-            <label style="flex:1"><span class="lbl">Height (S–N) [km]</span><input id="gridLy" type="number" min="5" max="5000" step="any" /></label>
+            <label style="flex:1"><span class="lbl" id="gridLxL">Width (W–E) [km]</span><input id="gridLx" type="number" min="5" max="5000" step="any" /></label>
+            <label style="flex:1"><span class="lbl" id="gridLyL">Height (S–N) [km]</span><input id="gridLy" type="number" min="5" max="5000" step="any" /></label>
           </div>
           <label><span class="lbl">Detail (cells on the longer side; more = slower)</span><select id="gridRes"></select></label>
           <label><span class="lbl">Grid spacing</span><select id="gridDx"></select></label>
@@ -676,7 +725,7 @@
           <h4>Map overlays</h4>
           <label class="row"><input id="tipOn" type="checkbox" checked /> Tooltip with values under the cursor</label>
           <label class="row"><input id="reliefShade" type="checkbox" checked /> Terrain shading</label>
-          <label class="row"><input id="reliefIso" type="checkbox" checked /> Contour lines (every 50–500 m)</label>
+          <label class="row"><input id="reliefIso" type="checkbox" checked /> Contour lines</label>
           <label class="row"><input id="windArrows" type="checkbox" /> Wind arrows (W)</label>
           <label class="row" title="Places above 1000 inhabitants (GeoNames, CC BY 4.0) – only on real terrain from the world map. Dot size and labels depend on the map zoom; other names on hover. Clicking a dot adds a weather station."><input id="cityOn" type="checkbox" checked /> Cities and villages (click – station)</label>
           <label class="row"><input id="gridLines" type="checkbox" checked /> Helper grid (not on satellite images)</label>
@@ -699,6 +748,13 @@
           <div class="btns"><button id="stSave" class="btn">Save file</button><button id="stLoad" class="btn">Load file…</button><button id="stLink" class="btn primary">Copy link</button></div>
           <input id="stFile" type="file" accept=".json,application/json" hidden />
           <div class="hint" id="stInfo"></div>
+        </div>
+        <div class="box">
+          <h4>Whole run</h4>
+          <div class="hint">Saves the run itself to one file: atmosphere, ground and snow, the synoptic model, station history and climate analysis maps. After loading, the run continues from the same moment, without spin-up.</div>
+          <div class="btns"><button id="runSave" class="btn primary">Save run</button><button id="runLoad" class="btn">Load run…</button></div>
+          <input id="runFile" type="file" accept=".w3drun" hidden />
+          <div class="hint" id="runInfo"></div>
         </div>
         <div class="box">
           <h4>Diagnostics</h4>
@@ -747,7 +803,7 @@
           <label>top <input id="zt" type="range" min="1" max="20" step="0.5" value="6" /><b id="ztV"></b></label>
         </div>
         <canvas id="cxz" class="gpu"></canvas>
-        <div class="ax"><span>x = 0 km</span><span id="xzTop"></span><span class="xmax"></span></div>
+        <div class="ax"><span class="xmin"></span><span id="xzTop"></span><span class="xmax"></span></div>
         <div class="leg" id="legXZ"><span class="lo"></span><div class="bar"></div><span class="hi"></span><div class="ticks"></div><div class="note"></div></div>
         <div class="hint">The section line is marked on the map.</div>
       </div>
@@ -771,7 +827,8 @@
         <div class="btns"><button id="stAdd" class="btn primary">+ Add station (click the map)</button><button id="stAddProbe" class="btn">At the probe</button><button id="stPeak" class="btn" title="Station on a summit: click the map near a mountain – the station goes to the highest point of the real terrain within ~1 grid cell (min. 2 km). Station height from the detailed terrain; a station above the model ground measures the model air at its own height">⛰ Summit</button></div>
         <table id="stTable"></table>
         <div style="display:flex; gap:8px; align-items:center"><h3 class="mh" id="stMetTitle" style="flex:1">Meteogram</h3>
-          <select id="stRange" style="width:auto"><option value="d3">3 days (every 10 min)</option><option value="d120">up to 120 days (hourly)</option><option value="all">whole period (daily)</option></select></div>
+          <select id="stRange" style="width:auto"><option value="d3">3 days (every 10 min)</option><option value="d120">up to 120 days (hourly)</option><option value="all">whole period (daily)</option></select>
+          <div class="zbtns"><button id="stZp" title="Zoom in">+</button><button id="stZm" title="Zoom out">−</button></div></div>
         <canvas id="cmetSt"></canvas>
         <h3 class="mh">Spreadsheet export</h3>
         <div class="hint">The further back, the coarser: every 10 min – the last 3 days, hourly means – 120 days, daily summaries (Tmin, Tmax,

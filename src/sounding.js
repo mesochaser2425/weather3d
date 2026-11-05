@@ -1,6 +1,7 @@
 // Sondaż: analiza profilu (cząstki SB / MU / ML, CAPE, CIN, ścinanie, SRH, wskaźniki burzowe) i wykres w układzie jak sondaże thundeR
 // (R-pakiet Czernecki, Taszarek, Szuster – licencja GPL ≥ 2): własny kod na podstawie standardowych wzorów, z pakietu wzięty tylko układ
 // i konwencje wykresu (skew-T, hodograf, tabele). Skew-T: oś T jak na obrazku wzorcowym, izotermy pochylone o 75.5 K między 1050 a 100 hPa.
+import { nD, unitD, fmH, isImp } from './units.js';
 
 const G = 9.81, RD = 287.04, CP = 1005.7, EPS = 0.622, LV = 2.501e6, KAP = RD / CP;
 const es = (T) => 611.2 * Math.exp(17.67 * (T - 273.15) / (T - 29.65));
@@ -143,6 +144,9 @@ export function analyzeSounding(P) {
 // ---------- wykres ----------
 const FONT = 'Arial, Helvetica, sans-serif';
 const fmt = (v, d = 0) => (Number.isFinite(v) ? v.toFixed(d) : 'NA');
+// tabele w jednostkach z przełącznika; wykres skew-T zostaje w °C i hPa, a indeksy w J/kg i K/km – tak czyta się sondaże także w USA
+const fmtU = (v, u, d = 0) => (Number.isFinite(v) ? nD(v, u, d) : 'NA');
+const kmLab = (km) => (isImp() ? `${+(km * 3.28084).toFixed(1)} kft` : `${km} km`);
 const PMIN = 100, PMAX = 1050, SKEW = 75.5;
 const C = { iso: '#d4b48c', dry: '#efd2c8', moist: '#6fee6f', mix: '#b9b2f2', plev: '#9a9a9a', hgl: '#0a0a8c', T: '#ee1c1c', Td: '#35963c', par: '#ffa500', parF: 'rgba(255,165,0,0.16)', cin: 'rgba(255,60,60,0.22)',
   rh: '#1414ee', the: '#ff14ff', txt: '#111', grey: '#bdbdbd', srh: '#ffc2c2' };
@@ -282,9 +286,9 @@ function skewData(g, R, A, key, s, opt) {
     const p = hp(A.PR[i]);
     if (p < PMIN) break;
     if (R.h / 16 < 18 * s + 6 && km % 2) continue;
-    g.fillText(`--- ${km} km`, R.x + 2 * s, Y(p));
+    g.fillText(`--- ${kmLab(km)}`, R.x + 2 * s, Y(p));
   }
-  g.fillText(`--- Sfc (${Math.round(opt.zg ?? 0)} m) ---`, R.x + 2 * s, Y(hp(A.PR[0])));
+  g.fillText(`--- Sfc (${fmH(opt.zg ?? 0)}) ---`, R.x + 2 * s, Y(hp(A.PR[0])));
   // LCL i EL wybranej cząstki
   g.textAlign = 'left';
   const tag = PAR_TAG[key];
@@ -331,7 +335,7 @@ function zPanel(g, R, A, arr, lo, hi, ticks, title, col, s) {
   for (let km = 0; km <= 7; km++) {
     if (R.h < 120 && km % 2 && km !== 7) continue;       // mały panel: co 2 km
     const y = Y(km * 1000);
-    g.fillText(km ? `${km} km` : 'sfc', R.x + R.w - 3 * s, y);
+    g.fillText(km ? kmLab(km) : 'sfc', R.x + R.w - 3 * s, y);
     g.lineWidth = Math.max(0.7, 1 * s);
     g.beginPath(); g.moveTo(R.x + R.w - 26 * s, y + 1); g.lineTo(R.x + R.w, y + 1); g.stroke();
   }
@@ -407,9 +411,9 @@ function hodograph(g, R, A, s) {
   g.restore();
   g.strokeStyle = '#000'; g.lineWidth = Math.max(1, 1.4 * s); g.strokeRect(R.x, R.y, R.w, R.h);
   g.fillStyle = '#666'; g.font = `${Math.round(24 * s)}px ${FONT}`; g.textAlign = 'right'; g.textBaseline = 'top';
-  g.fillText('[m/s]', R.x + R.w - 12 * s, R.y + 14 * s);
+  g.fillText(`[${unitD('m/s')}]`, R.x + R.w - 12 * s, R.y + 14 * s);
   g.fillStyle = C.txt; g.font = `${Math.round(21 * s)}px ${FONT}`; g.textAlign = 'left'; g.textBaseline = 'alphabetic';
-  const ln = (w) => `${fmt(dirOf(w[0], w[1]))} / ${fmt(Math.hypot(w[0], w[1]), 1)} m/s`;
+  const ln = (w) => `${fmt(dirOf(w[0], w[1]))} / ${fmtU(Math.hypot(w[0], w[1]), 'm/s', 1)} ${unitD('m/s')}`;
   g.fillText(`Left-moving: ${ln(A.lm)}`, R.x + 12 * s, R.y + R.h - 76 * s);
   g.fillText(`Storm-motion: ${ln(A.mean6)}`, R.x + 12 * s, R.y + R.h - 44 * s);
   g.fillText(`Right-moving: ${ln(A.rm)}`, R.x + 12 * s, R.y + R.h - 12 * s);
@@ -427,32 +431,33 @@ function tables(g, R, A, s) {
   g.textBaseline = 'middle'; g.fillStyle = C.txt;
   const f1 = `${Math.round(23 * s)}px ${FONT}`, f2 = `${Math.round(18 * s)}px ${FONT}`, f3 = `${Math.round(22 * s)}px ${FONT}`;
   const put = (t, xx, yy, al = 'left', fn = f3) => { g.font = fn; g.textAlign = al; g.fillText(t, x(xx), y(yy)); };
-  const cols = [['MIXR', '[g/kg]', 67], ['CAPE', '[J/kg]', 137], ['CAPE03', '[J/kg]', 208], ['CAPEHGL', '[J/kg]', 304], ['CIN', '[J/kg]', 417], ['LI', '[K]', 483], ['LCL', '[m]', 533], ['LFC', '[m]', 600], ['EL', '[m]', 668], ['WMAXSHEAR', '[m2/s2]', 746]];
+  const cols = [['MIXR', '[g/kg]', 67], ['CAPE', '[J/kg]', 137], ['CAPE03', '[J/kg]', 208], ['CAPEHGL', '[J/kg]', 304], ['CIN', '[J/kg]', 417], ['LI', '[K]', 483], ['LCL', `[${unitD('m')}]`, 533], ['LFC', `[${unitD('m')}]`, 600], ['EL', `[${unitD('m')}]`, 668], ['WMAXSHEAR', '[m2/s2]', 746]];
   for (const [a, b, xx] of cols) { put(a, xx, 22, 'left', f1); put(b, xx, 44, 'left', f2); }
   [['SB', 'sb', 76], ['MU', 'mu', 109], ['ML', 'ml', 142]].forEach(([n, k, yy]) => {
-    const c = A.parcels[k], lcl = (v) => fmt(v);
+    const c = A.parcels[k], lcl = (v) => fmtU(v, 'm');
     put(n, 20, yy);
     put(fmt(c.mixr, 1), 67, yy); put(fmt(c.cape), 137, yy); put(fmt(c.cape03), 208, yy); put(fmt(c.hgl), 304, yy); put(fmt(c.cin), 417, yy); put(fmt(c.li), 483, yy);
     put(lcl(c.lcl), 533, yy); put(lcl(c.lfc), 600, yy); put(lcl(c.el), 668, yy);
     put(`${fmt(A.wmax(c))}  (E ${fmt(A.wmaxE(c))})`, 746, yy);
   });
   // ścinanie
-  put('Bulk wind shear', 176, 183, 'right', f3); put('[m/s]', 176, 204, 'right', f2);
+  put('Bulk wind shear', 176, 183, 'right', f3); put(`[${unitD('m/s')}]`, 176, 204, 'right', f2);
   const ebs = [['Effec. (SB)', 'sb'], ['Effec. (MU)', 'mu'], ['Effec. (ML)', 'ml']];
   [['Sfc - 1 km', A.bs.s1], ['Sfc - 3 km', A.bs.s3], ['Sfc - 6 km', A.bs.s6], ['Sfc - 8 km', A.bs.s8], ['Sfc - HGL', A.bs.hgl], ...ebs.map(([n, k]) => [n, A.ebwd(A.parcels[k])])].forEach(([n, v], r) => {
-    put(`${n}: ${fmt(v, 1)}`, 174, 233 + 35 * r, 'right');
+    put(`${n}: ${fmtU(v, 'm/s', 1)}`, 174, 233 + 35 * r, 'right');
   });
   // SRH
   put('SRH RM', 398, 183, 'right'); put('SRH LM', 492, 183, 'right'); put('[m2/s2]', 398, 204, 'right', f2); put('[m2/s2]', 492, 204, 'right', f2);
   ['Sfc - 100 m', 'Sfc - 500 m', 'Sfc - 1 km', 'Sfc - 3 km'].forEach((n, r) => {
     put(`${n}:`, 325, 234 + 35 * r, 'right'); put(fmt(A.srh.rm[r]), 333, 234 + 35 * r); put(fmt(A.srh.lm[r]), 427, 234 + 35 * r);
   });
-  put('Mean wind', 675, 183, 'right'); put('[m/s]', 675, 204, 'right', f2);
-  [['Sfc - 1 km', A.mw.s1], ['Sfc - 2 km', A.mw.s2], ['1 - 3 km', A.mw.m13], ['Sfc - 6 km', A.mw.s6]].forEach(([n, v], r) => put(`${n}: ${fmt(v, 1)}`, 675, 234 + 35 * r, 'right'));
+  put('Mean wind', 675, 183, 'right'); put(`[${unitD('m/s')}]`, 675, 204, 'right', f2);
+  [['Sfc - 1 km', A.mw.s1], ['Sfc - 2 km', A.mw.s2], ['1 - 3 km', A.mw.m13], ['Sfc - 6 km', A.mw.s6]].forEach(([n, v], r) => put(`${n}: ${fmtU(v, 'm/s', 1)}`, 675, 234 + 35 * r, 'right'));
   put('Lapse rate', 888, 183, 'right'); put('[K/km]', 888, 204, 'right', f2);
   [['Sfc - 1 km', A.lr.s1], ['Sfc - 3 km', A.lr.s3], ['3 - 6 km', A.lr.m36], ['500700 hPa', A.lr.lr75]].forEach(([n, v], r) => put(`${n}: ${fmt(v, 1)}`, 862, 234 + 35 * r, 'right'));
   // dolne pola
-  [['Precip. water [mm]', A.pw, 0], ['2 - 5 km RH [%]', A.rh25, 0], ['Sfc - 2 km RH [%]', A.rh02, 0]].forEach(([n, v, d], r) => { put(`${n}:`, 392, 399 + 37 * r, 'right'); put(fmt(v, d), 400, 399 + 37 * r); });
+  put(`Precip. water [${unitD('mm')}]:`, 392, 399, 'right'); put(fmtU(A.pw, 'mm'), 400, 399);
+  [['2 - 5 km RH [%]', A.rh25, 0], ['Sfc - 2 km RH [%]', A.rh02, 0]].forEach(([n, v, d], r) => { put(`${n}:`, 392, 399 + 37 * (r + 1), 'right'); put(fmt(v, d), 400, 399 + 37 * (r + 1)); });
   [['Moisture flux [g/s/m2]', A.flux, 0], ['4 km DCAPE [J/kg]', A.dcape, 0], ['4 km delta theta-e [K]', A.dthe, 0]].forEach(([n, v, d], r) => { put(`${n}:`, 684, 399 + 37 * r, 'right'); put(fmt(v, d), 692, 399 + 37 * r); });
   [['SHIP', A.ship, 1], ['SCP', A.scp, 1], ['STP', A.stp, 1]].forEach(([n, v, d], r) => { put(`${n}:`, 828, 399 + 37 * r, 'right'); put(fmt(v, d), 838, 399 + 37 * r); });
 }
@@ -467,16 +472,16 @@ function miniTables(g, R, A) {
   [['SB', 'sb'], ['MU', 'mu'], ['ML', 'ml']].forEach(([n, k], r) => {
     const c = A.parcels[k], yy = 26 + 16 * r;
     put(n, 8, yy, 'left', true);
-    [[fmt(c.cape), 58], [fmt(c.cin), 104], [fmt(c.li), 136], [fmt(c.lcl), 180], [fmt(c.lfc), 228], [fmt(c.el), 278], [fmt(A.wmax(c)), W - 6]].forEach(([t, xx]) => put(t, xx, yy, 'right'));
+    [[fmt(c.cape), 58], [fmt(c.cin), 104], [fmt(c.li), 136], [fmtU(c.lcl, 'm'), 180], [fmtU(c.lfc, 'm'), 228], [fmtU(c.el, 'm'), 278], [fmt(A.wmax(c)), W - 6]].forEach(([t, xx]) => put(t, xx, yy, 'right'));
   });
   g.strokeStyle = '#000'; g.lineWidth = 1;
   g.beginPath(); g.moveTo(x0, y0 + 70); g.lineTo(x0 + W, y0 + 70); g.stroke();
   const L = [
-    ['Shear 0–1 / 0–3 / 0–6 km', `${fmt(A.bs.s1, 0)} / ${fmt(A.bs.s3, 0)} / ${fmt(A.bs.s6, 0)} m/s`],
+    ['Shear 0–1 / 0–3 / 0–6 km', `${fmtU(A.bs.s1, 'm/s')} / ${fmtU(A.bs.s3, 'm/s')} / ${fmtU(A.bs.s6, 'm/s')} ${unitD('m/s')}`],
     ['SRH RM 0–1 / 0–3 km', `${fmt(A.srh.rm[2])} / ${fmt(A.srh.rm[3])} m²/s²`],
-    ['Mean wind 0–1 / 0–6 km', `${fmt(A.mw.s1, 0)} / ${fmt(A.mw.s6, 0)} m/s`],
+    ['Mean wind 0–1 / 0–6 km', `${fmtU(A.mw.s1, 'm/s')} / ${fmtU(A.mw.s6, 'm/s')} ${unitD('m/s')}`],
     ['Lapse 0–3 / 3–6 km, 700–500 hPa', `${fmt(A.lr.s3, 1)} / ${fmt(A.lr.m36, 1)}, ${fmt(A.lr.lr75, 1)} K/km`],
-    ['Precip. water · RH 0–2 / 2–5 km', `${fmt(A.pw)} mm · ${fmt(A.rh02)} / ${fmt(A.rh25)} %`],
+    ['Precip. water · RH 0–2 / 2–5 km', `${fmtU(A.pw, 'mm')} ${unitD('mm')} · ${fmt(A.rh02)} / ${fmt(A.rh25)} %`],
     ['DCAPE · Δθe (4 km)', `${fmt(A.dcape)} J/kg · ${fmt(A.dthe)} K`],
     ['SHIP · SCP · STP', `${fmt(A.ship, 1)} · ${fmt(A.scp, 1)} · ${fmt(A.stp, 1)}`],
   ];

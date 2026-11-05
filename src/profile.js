@@ -1,5 +1,6 @@
 // Wykres profilu pionowego (średnia z domeny albo sonda w punkcie): T i Td, sondaż startowy (przerywane),
 // cząstka, wiatr (chorągiewki), zachmurzenie; meteogram sondy.
+import { toD, fromD, unitD, nD, isImp } from './units.js';
 
 export function drawProfile(canvas, d) {
   // d: { z: [], T: [], Td: [], T0: [], Td0: [], cloud: [] (0..1), top: m }
@@ -31,20 +32,23 @@ export function drawProfile(canvas, d) {
   g.strokeStyle = '#2c313b';
   g.lineWidth = 1;
   // siatka: temperatura
-  for (let v = lo; v <= hi + 1e-6; v += step) {
+  const dlo = toD(lo, '°C'), dhi = toD(hi, '°C'), dst = isImp() ? (dhi - dlo > 72 ? 20 : 10) : step;
+  for (let f = Math.ceil(dlo / dst - 1e-9) * dst; f <= dhi + 1e-6; f += dst) {
+    const v = fromD(f, '°C');
     g.beginPath(); g.moveTo(X(v), T); g.lineTo(X(v), T + ph); g.stroke();
-    g.textAlign = 'center'; g.fillText(`${v}`, X(v), h - 8);
+    g.textAlign = 'center'; g.fillText(`${f}`, X(v), h - 8);
   }
   // siatka: wysokość
-  const zs = d.top > 8000 ? 2000 : 1000;
-  for (let z = 0; z <= d.top + 1; z += zs) {
+  const zs = isImp() ? (d.top > 8000 ? 5000 : 2000) : (d.top > 8000 ? 2000 : 1000), zf = isImp() ? 3.28084 : 1;   // krok w stopach albo metrach
+  for (let q = 0; q / zf <= d.top + 1; q += zs) {
+    const z = q / zf;
     g.beginPath(); g.moveTo(L, Y(z)); g.lineTo(L + pw, Y(z)); g.stroke();
-    g.textAlign = 'right'; g.fillText(`${z / 1000}`, L - 4, Y(z) + 3);
+    g.textAlign = 'right'; g.fillText(`${q / 1000}`, L - 4, Y(z) + 3);
   }
   g.textAlign = 'left';
-  g.fillText('km', 4, T + 8);
+  g.fillText(isImp() ? 'kft' : 'km', 4, T + 8);
   g.textAlign = 'center';
-  g.fillText('°C', L + pw / 2, h - 0);
+  g.fillText(unitD('°C'), L + pw / 2, h - 0);
 
   // zachmurzenie (pasek po prawej)
   const cx0 = L + pw + 8, cw = R - 12;
@@ -139,7 +143,7 @@ function hodograph(g, x0, y0, size, h) {
   }
   g.restore();
   g.font = '9px system-ui, sans-serif'; g.fillStyle = '#8b94a3'; g.textAlign = 'left';
-  g.fillText(`hodograph · ${vmax} m/s`, x0 + 4, y0 + size + 10);
+  g.fillText(`hodograph · ${Math.round(toD(vmax, 'm/s'))} ${unitD('m/s')}`, x0 + 4, y0 + size + 10);
 }
 
 // chorągiewka wiatru w (x, y): trzon w stronę, skąd wieje (u, v w m/s → węzły)
@@ -169,8 +173,69 @@ function barb(g, x, y, u, v) {
   }
 }
 
+export const MET_L = 34, MET_R = 40;   // marginesy meteogramów po bokach [px CSS]
+// Przybliżanie wykresu w czasie (meteogramy sondy i stacji). Widok: span – długość okna (null – cały zakres), end – prawy koniec okna
+// (null – przy najnowszych danych, okno idzie za nimi; liczba – stoi w miejscu, gdy dochodzą nowe). Jednostka – ta, w której rysuje wykres.
+export const newView = (min) => ({ span: null, end: null, min, last: null });
+export function viewRange(v, dmin, dmax) {
+  let a = dmin, b = dmax;
+  if (v.span != null && v.span < dmax - dmin) {
+    b = v.end == null ? dmax : Math.min(dmax, Math.max(dmin + v.span, v.end));
+    a = b - v.span;
+  }
+  v.last = { a, b, dmin, dmax };
+  return [a, b];
+}
+// zmiana długości okna wokół punktu fr wykresu (0…1)
+function viewZoom(v, s1, fr) {
+  if (!v.last) return;
+  const { a, b, dmin, dmax } = v.last, full = dmax - dmin, s = Math.min(full, Math.max(v.min, s1));
+  if (s >= full) { v.span = null; v.end = null; v.last = { a: dmin, b: dmax, dmin, dmax }; return; }
+  const b1 = Math.min(dmax, Math.max(dmin + s, a + fr * (b - a) + (1 - fr) * s));
+  v.span = s; v.end = b1 >= dmax - 1e-6 * full ? null : b1;
+  v.last = { a: b1 - s, b: b1, dmin, dmax };
+}
+// przyciski: wokół najnowszych danych, gdy okno przy nich stoi, inaczej wokół środka
+export function viewStep(v, f) { if (v.last) viewZoom(v, (v.last.b - v.last.a) * f, v.end == null ? 1 : 0.5); }
+// mysz: kółko, przeciąganie, dwuklik; cur() – bieżący widok (stacje mają osobny na każdy zakres), L, R – marginesy wykresu [px CSS]
+export function attachView(canvas, cur, redraw, L, R) {
+  const plotW = () => Math.max(1, canvas.clientWidth - L - R);
+  let drag = null, raf = 0;
+  const later = () => { if (!raf) raf = requestAnimationFrame(() => { raf = 0; redraw(); }); };
+  canvas.title = 'Mouse wheel – zoom, drag – move along time, double-click – whole range';
+  canvas.style.touchAction = 'none';
+  canvas.addEventListener('wheel', (e) => {
+    const v = cur(), q = v.last;
+    if (!q || (e.deltaY > 0 && q.b - q.a >= q.dmax - q.dmin)) return;   // cały zakres: kółko dalej przewija panel
+    e.preventDefault();
+    const r = canvas.getBoundingClientRect();
+    viewZoom(v, (q.b - q.a) * Math.exp(e.deltaY * 0.0015), Math.min(1, Math.max(0, (e.clientX - r.left - L) / plotW())));
+    later();
+  }, { passive: false });
+  canvas.addEventListener('pointerdown', (e) => {
+    const v = cur();
+    if (!v.last || v.span == null) return;
+    drag = { x: e.clientX, b: v.last.b, v };
+    canvas.setPointerCapture(e.pointerId); canvas.style.cursor = 'grabbing';
+  });
+  canvas.addEventListener('pointermove', (e) => {
+    if (!drag) return;
+    const v = drag.v, { dmin, dmax } = v.last, s = v.span;
+    if (s == null) return;
+    const b1 = Math.min(dmax, Math.max(dmin + s, drag.b - (e.clientX - drag.x) / plotW() * s));
+    v.end = b1 >= dmax - 1e-6 * (dmax - dmin) ? null : b1;
+    v.last = { a: b1 - s, b: b1, dmin, dmax };
+    later();
+  });
+  const up = () => { drag = null; canvas.style.cursor = ''; later(); };
+  canvas.addEventListener('pointerup', up);
+  canvas.addEventListener('pointercancel', up);
+  canvas.addEventListener('dblclick', () => { const v = cur(); v.span = null; v.end = null; later(); });
+}
+
 // Meteogram: pasek zachmurzenia, T 2 m i Td (°C), opad (słupki, mm/h) i ciśnienie (hPa), wiatr (m/s)
-export function drawMeteogram(canvas, hist) {
+// view – widok przybliżenia (newView, jednostka: sekundy), dateOf(t) – podpis daty dla osi przy długim oknie (bez niego godziny)
+export function drawMeteogram(canvas, histAll, view = null, dateOf = null) {
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
   const W = Math.round(canvas.clientWidth * dpr), H = Math.round(canvas.clientHeight * dpr);
   if (!W || !H) return;
@@ -180,24 +245,30 @@ export function drawMeteogram(canvas, hist) {
   const w = W / dpr, h = H / dpr;
   g.clearRect(0, 0, w, h);
   g.font = '10px system-ui, sans-serif';
-  if (hist.length < 2) { g.fillStyle = '#8b94a3'; g.textAlign = 'center'; g.fillText('the meteogram records every 10 min of simulation time…', w / 2, h / 2); return; }
-  const L = 34, R = 40, T = 6, B = 16;
+  if (histAll.length < 2) { g.fillStyle = '#8b94a3'; g.textAlign = 'center'; g.fillText('the meteogram records every 10 min of simulation time…', w / 2, h / 2); return; }
+  const L = MET_L, R = MET_R, T = 6, B = 16;
   const pw = w - L - R;
   const hc = 10, h1 = (h - T - B - hc - 8) * 0.6, h2 = (h - T - B - hc - 8) * 0.4;
   const yc = T, y1 = T + hc + 4, y2 = y1 + h1 + 4;
-  const t0 = hist[0].t, t1 = Math.max(hist[hist.length - 1].t, t0 + 3 * 3600);
+  const dmin = histAll[0].t, dmax = Math.max(histAll[histAll.length - 1].t, dmin + 3 * 3600);
+  const [t0, t1] = view ? viewRange(view, dmin, dmax) : [dmin, dmax];
+  // to, co widać, plus po jednym punkcie za brzegiem okna; skale pionowe z tego wycinka
+  let i0 = 0, i1 = histAll.length - 1;
+  while (i0 < i1 - 1 && histAll[i0 + 1].t <= t0) i0++;
+  while (i1 > i0 + 1 && histAll[i1 - 1].t >= t1) i1--;
+  const hist = view ? histAll.slice(i0, i1 + 1) : histAll;
   const X = (t) => L + (t - t0) / (t1 - t0) * pw;
-  // osie czasu: północ (pełna linia) i co 6 h
-  g.strokeStyle = '#2c313b'; g.lineWidth = 1; g.fillStyle = '#8b94a3'; g.textAlign = 'center';
-  const hr0 = hist[0].hour, tStart = t0 - hr0 * 3600;
-  for (let t = tStart; t <= t1; t += 6 * 3600) {
-    if (t < t0) continue;
-    const mid = Math.abs(((t - tStart) / 3600) % 24) < 0.01;
+  // osie czasu: północ (mocniejsza linia), krok tak, by podpisy się nie nakładały
+  g.lineWidth = 1; g.fillStyle = '#8b94a3'; g.textAlign = 'center';
+  const tStart = histAll[0].t - histAll[0].hour * 3600, spanH = (t1 - t0) / 3600;
+  const stH = [1, 2, 3, 6, 12, 24, 48, 96, 168, 336, 720, 1440, 2880].find((q) => spanH / q <= (q >= 24 ? 5 : 8)) || 5760;
+  for (let t = tStart + Math.ceil((t0 - tStart) / (stH * 3600) - 1e-9) * stH * 3600; t <= t1 + 1; t += stH * 3600) {
+    const hh = Math.round(((t - tStart) / 3600) % 24), mid = hh === 0 || hh === 24;
     g.strokeStyle = mid ? '#4a5262' : '#262b35';
     g.beginPath(); g.moveTo(X(t), y1); g.lineTo(X(t), y2 + h2); g.stroke();
-    const hh = Math.round(((t - tStart) / 3600) % 24);
-    g.fillText(mid ? '0:00' : `${hh}`, X(t), h - 4);
+    g.fillText(mid ? (dateOf ? dateOf(t + 60) : '0:00') : `${hh}`, Math.min(w - 16, Math.max(16, X(t))), h - 4);
   }
+  g.save(); g.beginPath(); g.rect(L, 0, pw, h - B); g.clip();   // krzywe i słupki kończą się na brzegu okna
   // zachmurzenie
   for (let n = 1; n < hist.length; n++) {
     const c = hist[n].cov, gr = Math.round(40 + 190 * c);
@@ -206,15 +277,15 @@ export function drawMeteogram(canvas, hist) {
   }
   // T i Td
   let lo = Infinity, hi = -Infinity;
-  for (const p of hist) { lo = Math.min(lo, p.Td2, p.T2); hi = Math.max(hi, p.T2); }
+  for (const p of hist) { lo = Math.min(lo, toD(p.Td2, '°C'), toD(p.T2, '°C')); hi = Math.max(hi, toD(p.T2, '°C')); }
   lo = Math.floor(lo / 2) * 2 - 1; hi = Math.ceil(hi / 2) * 2 + 1;
-  const Y1 = (v) => y1 + h1 * (1 - (v - lo) / (hi - lo));
-  const st = hi - lo > 24 ? 10 : 5;
+  const YD = (v) => y1 + h1 * (1 - (v - lo) / (hi - lo));   // oś w jednostkach na ekranie
+  const Y1 = (c) => YD(toD(c, '°C'));
+  const st = isImp() ? (hi - lo > 44 ? 20 : 10) : (hi - lo > 24 ? 10 : 5);
   g.textAlign = 'right'; g.fillStyle = '#8b94a3';
   for (let v = Math.ceil(lo / st) * st; v <= hi; v += st) {
-    g.strokeStyle = v === 0 ? '#5b8bd6' : '#232833';
-    g.beginPath(); g.moveTo(L, Y1(v)); g.lineTo(L + pw, Y1(v)); g.stroke();
-    g.fillText(`${v}°`, L - 4, Y1(v) + 3);
+    g.strokeStyle = v === (isImp() ? 32 : 0) ? '#5b8bd6' : '#232833';
+    g.beginPath(); g.moveTo(L, YD(v)); g.lineTo(L + pw, YD(v)); g.stroke();
   }
   const line = (key, Y, color, width) => {
     g.strokeStyle = color; g.lineWidth = width; g.beginPath();
@@ -224,7 +295,8 @@ export function drawMeteogram(canvas, hist) {
   line('Td2', Y1, '#5fd17a', 1.6);
   line('T2', Y1, '#ff6b5e', 2);
   // opad (słupki) i ciśnienie
-  const pmax = Math.max(2, ...hist.map((p) => p.PR));
+  let pmax = 2, wmax = 5;   // pętla, nie Math.max(...): historia godzinowa to tysiące punktów
+  for (const p of hist) { pmax = Math.max(pmax, p.PR); wmax = Math.max(wmax, p.gust || p.ws); }
   const Y2 = (v) => y2 + h2 * (1 - v / pmax);
   for (let n = 1; n < hist.length; n++) {
     const p = hist[n];
@@ -232,24 +304,26 @@ export function drawMeteogram(canvas, hist) {
     g.fillStyle = p.sn > 0.5 * p.PR ? '#d9e6ff' : '#3d8bff';
     g.fillRect(X(hist[n - 1].t), Y2(p.PR), Math.max(1, X(p.t) - X(hist[n - 1].t) - 0.5), y2 + h2 - Y2(p.PR));
   }
-  g.strokeStyle = '#2c313b'; g.strokeRect(L, y2, pw, h2);
-  g.fillStyle = '#6fa8ff'; g.textAlign = 'right'; g.fillText(`${pmax.toFixed(pmax < 10 ? 1 : 0)}`, L - 4, y2 + 8); g.fillText('mm/h', L - 4, y2 + 18);
   let plo = Infinity, phi = -Infinity;
   for (const p of hist) { plo = Math.min(plo, p.PSL); phi = Math.max(phi, p.PSL); }
   if (phi - plo < 4) { const m = (phi + plo) / 2; plo = m - 2; phi = m + 2; }
   const Yp = (v) => y2 + 2 + (h2 - 4) * (1 - (v - plo) / (phi - plo));
   line('PSL', Yp, '#c58cff', 1.4);
-  g.fillStyle = '#c58cff'; g.textAlign = 'left';
-  g.fillText(`${phi.toFixed(0)}`, L + pw + 4, y2 + 8); g.fillText(`${plo.toFixed(0)} hPa`, L + pw + 4, y2 + h2);
   // wiatr (m/s) w prawej osi górnego panelu
-  const wmax = Math.max(5, ...hist.map((p) => p.gust || p.ws));
   const Yw = (v) => y1 + h1 * (1 - v / wmax);
   g.setLineDash([3, 3]); line('ws', Yw, '#d8c26a', 1.2); g.setLineDash([]);
   if (hist[0].gust !== undefined) {
     g.fillStyle = 'rgba(216,194,106,0.7)';
     for (const p of hist) g.fillRect(X(p.t) - 1, Yw(p.gust) - 1, 2, 2);
   }
-  g.fillStyle = '#d8c26a'; g.fillText(`${wmax.toFixed(0)} m/s`, L + pw + 4, y1 + 8);
+  g.restore();
+  g.textAlign = 'right'; g.fillStyle = '#8b94a3';
+  for (let v = Math.ceil(lo / st) * st; v <= hi; v += st) g.fillText(`${v}°`, L - 4, YD(v) + 3);
+  g.lineWidth = 1; g.strokeStyle = '#2c313b'; g.strokeRect(L, y2, pw, h2);
+  g.fillStyle = '#6fa8ff'; g.textAlign = 'right'; g.fillText(nD(pmax, 'mm/h', pmax < 10 ? 1 : 0), L - 4, y2 + 8); g.fillText(unitD('mm/h'), L - 4, y2 + 18);
+  g.fillStyle = '#c58cff'; g.textAlign = 'left';
+  g.fillText(nD(phi, 'hPa'), L + pw + 4, y2 + 8); g.fillText(unitD('hPa'), L + pw + 4, y2 + h2 - 12); g.fillText(nD(plo, 'hPa'), L + pw + 4, y2 + h2);
+  g.fillStyle = '#d8c26a'; g.fillText(`${nD(wmax, 'm/s')} ${unitD('m/s')}`, L + pw + 4, y1 + 8);
   // legenda
   g.textAlign = 'left';
   const lg = [['T 2 m', '#ff6b5e'], ['Td', '#5fd17a'], ['wind 10 m (· gusts)', '#d8c26a'], ['p', '#c58cff'], ['precip.', '#3d8bff']];

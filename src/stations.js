@@ -10,7 +10,8 @@
 // Stacja wyżej niż grunt modelu (szczyt) mierzy powietrze modelu na swojej wysokości, niżej (dno doliny) – temperaturę
 // i punkt rosy przeliczone gradientem 6.5 K/km; przycisk „Szczyt” stawia stację w najwyższym punkcie w pobliżu kliknięcia.
 
-import { drawMeteogram } from './profile.js';
+import { toD, unitD, nD, fm, fT, fmH, fmVis, isImp, onUnits } from './units.js';
+import { drawMeteogram, newView, viewRange, viewStep, attachView, MET_L, MET_R } from './profile.js';
 
 const DIRS = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE', 'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW'];
 const dirName = (u, v) => DIRS[Math.round(((Math.atan2(-u, -v) * 180 / Math.PI + 360) % 360) / 22.5) % 16];
@@ -71,7 +72,7 @@ export function createStations(ctx) {
     $('stName').value = '';
     save(); markers(); table(true); drawSel();
     const zm = ctx.modelH(colOf(list[sel]));
-    ctx.toast(`Station “${nm}” added (${xkm.toFixed(1)}, ${ykm.toFixed(1)} km, ${Math.round(z)} m a.s.l.; model ground ${Math.round(zm)} m) – measures every 10 min of simulation time`);
+    ctx.toast(`Station “${nm}” added (${nD(xkm, 'km', 1)}, ${nD(ykm, 'km', 1)} ${unitD('km')}, ${fmH(z)} a.s.l.; model ground ${fmH(zm)}) – measures every 10 min of simulation time`);
   }
   const setMode = (m) => {
     addMode = m;
@@ -88,7 +89,7 @@ export function createStations(ctx) {
     if (m === 'peak') {
       const nm = ($('stName').value || '').trim();
       const p = await ctx.peak(xkm, ykm, Math.max(0.4 * DX, 1500) / 1000);
-      add(p.xkm, p.ykm, nm || `Summit ${Math.round(p.z)} m`, p.z);
+      add(p.xkm, p.ykm, nm || `Summit ${fmH(p.z)}`, p.z);
     } else add(xkm, ykm);
   }
   function remove(n) {
@@ -249,21 +250,21 @@ export function createStations(ctx) {
       const r = reading(s, 0), t2 = r.T2, td = r.Td2, ws = r.ws;
       const day = s.ad ? s.ad.pr : 0;
       const pr = v('PR'), sn = (r.corr ? t2 < 0 : v('PSN') > 0.5 * pr) && pr > 0.05;
-      const zm = ctx.modelH(c), zt = s.zs == null ? '' : ` · ${Math.round(s.zs)} m${Math.abs(s.zs - zm) > 25 ? ` (model ${Math.round(zm)})` : ''}`;
+      const zm = ctx.modelH(c), zt = s.zs == null ? '' : ` · ${fmH(s.zs)}${Math.abs(s.zs - zm) > 25 ? ` (model ${fmH(zm)})` : ''}`;
       return `<tr data-n="${n}" class="${n === sel ? 'sel' : ''}">
-        <td><b>${s.name.replace(/</g, '&lt;')}</b><small>${s.xkm.toFixed(1)}, ${s.ykm.toFixed(1)} km${zt}</small></td>
-        <td><b>${t2.toFixed(1)}</b><small>Td ${td.toFixed(1)} · ${rhOf(t2, td).toFixed(0)}%</small></td>
-        <td><b>${ws < 0.5 ? 'calm' : `${dirName(r.ua, r.va)} ${ws.toFixed(0)}`}</b><small>gusts ${r.gust.toFixed(0)} m/s</small></td>
-        <td><b>${pr < 0.05 ? '–' : `${pr.toFixed(1)}${sn ? ' ❄' : ''}`}</b><small>today ${day.toFixed(1)} mm</small></td>
-        <td><b>${v('PSL').toFixed(0)}</b><small>hPa</small></td>
-        <td><b>${Math.round(100 * v('COVER'))}%</b><small>${v('VIS') < 1 ? 'fog' : v('VIS') >= 49 ? '> 50 km' : `${v('VIS').toFixed(0)} km`}</small></td>
+        <td><b>${s.name.replace(/</g, '&lt;')}</b><small>${nD(s.xkm, 'km', 1)}, ${nD(s.ykm, 'km', 1)} ${unitD('km')}${zt}</small></td>
+        <td><b>${nD(t2, '°C', 1)}</b><small>Td ${nD(td, '°C', 1)} · ${rhOf(t2, td).toFixed(0)}%</small></td>
+        <td><b>${ws < 0.5 ? 'calm' : `${dirName(r.ua, r.va)} ${nD(ws, 'm/s')}`}</b><small>gusts ${fm(r.gust, 'm/s')}</small></td>
+        <td><b>${pr < 0.05 ? '–' : `${nD(pr, 'mm/h', 1)}${sn ? ' ❄' : ''}`}</b><small>today ${fm(day, 'mm', 1)}</small></td>
+        <td><b>${nD(v('PSL'), 'hPa')}</b><small>${unitD('hPa')}</small></td>
+        <td><b>${Math.round(100 * v('COVER'))}%</b><small>${v('VIS') < 1 ? 'fog' : fmVis(v('VIS'))}</small></td>
         <td><button class="stdel" data-del="${n}" title="Remove the station">×</button></td></tr>`;
     });
-    tb.innerHTML = '<tr class="hd"><th>station</th><th>T °C</th><th>wind m/s</th><th>rain mm/h</th><th>press.</th><th>clouds</th><th></th></tr>' + rows.join('');
+    tb.innerHTML = `<tr class="hd"><th>station</th><th>T ${unitD('°C')}</th><th>wind ${unitD('m/s')}</th><th>rain ${unitD('mm/h')}</th><th>press.</th><th>clouds</th><th></th></tr>` + rows.join('');
   }
 
   // wykres dobowy (cały okres): słupki Tmin–Tmax z linią Tśr, opad dobowy, śnieg
-  function drawDaily(canvas, d) {
+  function drawDaily(canvas, dAll, view) {
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
     const W = Math.round(canvas.clientWidth * dpr), H = Math.round(canvas.clientHeight * dpr);
     if (!W || !H) return;
@@ -273,35 +274,47 @@ export function createStations(ctx) {
     const w = W / dpr, h = H / dpr;
     g.clearRect(0, 0, w, h);
     g.font = '10px system-ui, sans-serif';
-    if (d.length < 1) { g.fillStyle = '#8b94a3'; g.textAlign = 'center'; g.fillText('the daily history starts after the first full day…', w / 2, h / 2); return; }
-    const L = 34, R = 40, T = 8, B = 16, h1 = (h - T - B - 6) * 0.62, h2 = (h - T - B - 6) * 0.38, y1 = T, y2 = T + h1 + 6;
-    const pw = w - L - R, bw = pw / d.length;
+    if (dAll.length < 1) { g.fillStyle = '#8b94a3'; g.textAlign = 'center'; g.fillText('the daily history starts after the first full day…', w / 2, h / 2); return; }
+    const L = MET_L, R = MET_R, T = 8, B = 16, h1 = (h - T - B - 6) * 0.62, h2 = (h - T - B - 6) * 0.38, y1 = T, y2 = T + h1 + 6;
+    // okno w dobach: słupek doby `day` zajmuje [day, day + 1]; skale i podsumowanie z tego, co widać
+    const [a, b] = viewRange(view, dAll[0].day, dAll[dAll.length - 1].day + 1);
+    const d = dAll.filter((r) => r.day + 1 > a + 1e-6 && r.day < b - 1e-6);
+    if (!d.length) return;
+    const pw = w - L - R, bw = pw / (b - a), XD = (day) => L + (day - a) * bw;
     let lo = Infinity, hi = -Infinity, pmax = 1;
-    for (const r of d) { lo = Math.min(lo, r.Tmin); hi = Math.max(hi, r.Tmax); pmax = Math.max(pmax, r.pr); }
+    for (const r of d) { lo = Math.min(lo, toD(r.Tmin, '°C')); hi = Math.max(hi, toD(r.Tmax, '°C')); pmax = Math.max(pmax, r.pr); }
     lo = Math.floor(lo / 5) * 5; hi = Math.ceil(hi / 5) * 5 + (hi - lo < 5 ? 5 : 0);
     const Y = (v) => y1 + h1 * (1 - (v - lo) / (hi - lo));
     g.strokeStyle = '#262b35'; g.fillStyle = '#8b94a3'; g.textAlign = 'right';
-    for (let v = lo; v <= hi; v += (hi - lo > 30 ? 10 : 5)) { g.beginPath(); g.moveTo(L, Y(v)); g.lineTo(L + pw, Y(v)); g.stroke(); g.fillText(`${v}°`, L - 4, Y(v) + 3); }
-    if (lo < 0 && hi > 0) { g.strokeStyle = '#7da7ff55'; g.beginPath(); g.moveTo(L, Y(0)); g.lineTo(L + pw, Y(0)); g.stroke(); }
-    d.forEach((r, n) => {
-      const x = L + n * bw;
+    for (let v = lo; v <= hi; v += (hi - lo > (isImp() ? 54 : 30) ? (isImp() ? 20 : 10) : (isImp() ? 10 : 5))) { g.beginPath(); g.moveTo(L, Y(v)); g.lineTo(L + pw, Y(v)); g.stroke(); g.fillText(`${v}°`, L - 4, Y(v) + 3); }
+    const y0d = toD(0, '°C');   // linia zera °C (32 °F)
+    if (lo < y0d && hi > y0d) { g.strokeStyle = '#7da7ff55'; g.beginPath(); g.moveTo(L, Y(y0d)); g.lineTo(L + pw, Y(y0d)); g.stroke(); }
+    g.save(); g.beginPath(); g.rect(L, 0, pw, h - B); g.clip();   // słupki kończą się na brzegu okna
+    for (const r of d) {
+      const x = XD(r.day);
       g.fillStyle = r.full ? '#e06a4c' : '#e06a4c77';
-      g.fillRect(x + bw * 0.15, Y(r.Tmax), Math.max(1, bw * 0.7), Math.max(1, Y(r.Tmin) - Y(r.Tmax)));
+      g.fillRect(x + bw * 0.15, Y(toD(r.Tmax, '°C')), Math.max(1, bw * 0.7), Math.max(1, Y(toD(r.Tmin, '°C')) - Y(toD(r.Tmax, '°C'))));
       const ph = h2 * Math.min(1, r.pr / pmax);
       g.fillStyle = r.sn > 0.5 * r.pr && r.pr > 0 ? '#c9b6ff' : '#4d9bff';
       g.fillRect(x + bw * 0.15, y2 + h2 - ph, Math.max(1, bw * 0.7), ph);
-    });
+    }
     g.strokeStyle = '#ffd34d'; g.lineWidth = 1.2; g.beginPath();
-    d.forEach((r, n) => { const x = L + (n + 0.5) * bw; if (n) g.lineTo(x, Y(r.Tmean)); else g.moveTo(x, Y(r.Tmean)); });
+    d.forEach((r, n) => { const x = XD(r.day + 0.5), y = Y(toD(r.Tmean, '°C')); if (n) g.lineTo(x, y); else g.moveTo(x, y); });
     g.stroke(); g.lineWidth = 1;
-    g.fillStyle = '#6fa8ff'; g.textAlign = 'right'; g.fillText(`${pmax.toFixed(pmax < 10 ? 1 : 0)}`, L - 4, y2 + 8); g.fillText('mm/d', L - 4, y2 + 18);
-    // podpisy dób (co ~8 etykiet)
+    g.restore();
+    g.fillStyle = '#6fa8ff'; g.textAlign = 'right'; g.fillText(nD(pmax, 'mm/d', pmax < 10 ? 1 : 0), L - 4, y2 + 8); g.fillText(unitD('mm/d'), L - 4, y2 + 18);
+    // podpisy dób: najwyżej ~5, przypięte do numeru doby – nie skaczą przy przesuwaniu; przy długim oknie miesiąc i rok przebiegu
     g.fillStyle = '#8b94a3'; g.textAlign = 'center';
-    const step = Math.max(1, Math.ceil(d.length / 8));
-    for (let n = 0; n < d.length; n += step) g.fillText(d[n].date.split(' ').slice(0, 2).join(' '), L + (n + 0.5) * bw, h - 4);
+    const step = Math.max(1, Math.ceil((b - a) / 5));
+    for (const r of d) {
+      if (r.day % step) continue;
+      const w3 = r.date.split(' '), x = XD(r.day + 0.5);
+      if (x < L || x > L + pw) continue;
+      g.fillText(b - a > 300 ? `${w3[1].slice(0, 3)} y${Math.floor(r.day / 365.25) + 1}` : `${w3[0]} ${w3[1].slice(0, 3)}`, x, h - 4);   // data w historii jest bez roku: y – rok przebiegu
+    }
     g.textAlign = 'left'; g.fillStyle = '#c9d1dc';
     const tot = d.reduce((a, r) => a + r.pr, 0), tm = d.reduce((a, r) => a + r.Tmean, 0) / d.length;
-    g.fillText(`${d.length} days · Tmean ${tm.toFixed(1)} °C · precip. ${tot.toFixed(0)} mm`, L + 4, y1 + 10);
+    g.fillText(`${d.length} days · Tmean ${fT(tm)} · precip. ${fm(tot, 'mm')}`, L + 4, y1 + 10);
   }
 
   function drawSel() {
@@ -309,9 +322,15 @@ export function createStations(ctx) {
     const rng = $('stRange').value;
     const lab = { d3: '3 days every 10 min', d120: 'up to 120 days – hourly means', all: 'whole period – daily' }[rng];
     $('stMetTitle').innerHTML = `${s ? `Meteogram: ${s.name.replace(/</g, '&lt;')}` : 'Meteogram'} <span class="sub">${lab}</span>`;
-    if (rng === 'all') drawDaily($('cmetSt'), s ? s.d : []);
-    else drawMeteogram($('cmetSt'), s ? (rng === 'd3' ? s.h10 : s.h1) : []);
+    if (rng === 'all') drawDaily($('cmetSt'), s ? s.d : [], views.all);
+    else drawMeteogram($('cmetSt'), s ? (rng === 'd3' ? s.h10 : s.h1) : [], views[rng], ctx.dateStr ? (t) => { const w3 = ctx.dateStr(t).split(' '); return `${w3[0]} ${w3[1].slice(0, 3)}`; } : null);
   }
+  // przybliżanie: osobny widok na każdy zakres (najkrótsze okno: 1 h przy zapisie co 10 min, 6 h przy godzinowym, 3 doby przy dobowym)
+  onUnits(() => { table(true); drawSel(); });
+  const views = { d3: newView(3600), d120: newView(6 * 3600), all: newView(3) };
+  attachView($('cmetSt'), () => views[$('stRange').value], drawSel, MET_L, MET_R);
+  $('stZp').onclick = () => { viewStep(views[$('stRange').value], 1 / 1.5); drawSel(); };
+  $('stZm').onclick = () => { viewStep(views[$('stRange').value], 1.5); drawSel(); };
 
   // eksport CSV (separator „;”, przecinek dziesiętny – otwiera się wprost w polskim Excelu)
   function csv() {
@@ -382,6 +401,16 @@ export function createStations(ctx) {
     setCities: (arr) => { cities = arr || []; markers(); },
     exportList,
     importList: (arr) => { importList(arr); save(); },
+    viewOf: (rng) => ({ ...views[rng] }),   // widok przybliżenia meteogramu (testy)
+    // pełny zapis przebiegu: historia (hist) i liczniki w toku (live) – osobno, bo historię można zaokrąglić
+    exportFull: () => ({ sel,
+      hist: list.map((s) => ({ h10: s.h10, h1: s.h1, d: s.d })),
+      live: list.map((s) => ({ name: s.name, xkm: s.xkm, ykm: s.ykm, zs: s.zs, ah: s.ah, ad: s.ad, lastPacc: s.lastPacc, lastT: s.lastT })) }),
+    importFull({ sel: n, hist, live }) {
+      list = live.map((s, i) => ({ ...s, ...hist[i] }));
+      sel = list.length ? Math.max(0, Math.min(n ?? 0, list.length - 1)) : -1;
+      save(); markers(); table(true); drawSel();
+    },
     // co ~0.25 s (pętla interfejsu): zapis pomiarów; gdy panel stacji widoczny – tabela i meteogram
     tick(visible) {
       record();

@@ -173,12 +173,22 @@ fn blobMask(p: vec3f, fc: f32) -> f32 {
   // (frzT.y) płyną z wiatrem średnim 0–6 km, wieże ciągłe od podstawy – z wiatrem podstawy
   let fz = textureSampleLevel(frzT, sClamp, p.xy / vec2f(LX(), LY()), 0.0);
   let zag = p.z - groundH(p.x, p.y);
-  let wm = select(0.0, max(smoothstep(2500.0, 4000.0, fz.w), smoothstep(300.0, 800.0, zag - fz.y)), fz.w > 0.0);
-  let d = mix(cuDisp(p.xy), cuDisp2(p.xy), wm);
+  let dl = cuDisp(p.xy);
+  let dh = cuDisp2(p.xy);
+  let wm0 = select(0.0, max(smoothstep(2500.0, 4000.0, fz.w), smoothstep(300.0, 800.0, zag - fz.y)), fz.w > 0.0);
+  // dwa osobne wzory o częściach powierzchni fc·(1 − wm) i fc·wm (przesunięcie mieszane wg wm ściskało wzór w cienkie smugi – cuBlob w render.wgsl);
+  // jedna pętla po obu wzorach i pokoleniach, granice zależne od wm: drugi wzór pominięty poza przejściem (dwa wywołania w if albo continue w pętli 0..4
+  // kosztowały obraz +30% także przy jednym wzorze – kompilator shaderów prawdopodobnie liczy wtedy obie strony)
+  let wm = smoothstep(0.25, 0.75, wm0);
   var m = 0.0;
-  for (var g = 0u; g < 2u; g++) {
-    let gq = cuGen(p.xy, select(d.xy, d.zw, g == 1u), C.cuPh, S, g);
-    let sh = cuShape(gq.xy, fc, gq.z);
+  let t1 = select(4u, 2u, wm <= 0.01);
+  for (var t = select(0u, 2u, wm >= 0.99); t < t1; t++) {
+    let mid = t >= 2u;
+    let w = select(1.0 - wm, wm, mid);
+    let g = t & 1u;
+    let dd4 = select(dl, dh, mid);
+    let gq = cuGen(p.xy, select(dd4.xy, dd4.zw, g == 1u), C.cuPh, S, g);
+    let sh = cuShape(gq.xy + select(vec2f(0.0), CU_MID, mid), fc * w, gq.z);
     if (sh.x > 2.0 * sh.y) { continue; }
     let n = textureSampleLevel(noiseT, sRep, vec3f(gq.xy, p.z / S), 0.0);
     let dd = sh.x - 0.5 * sh.y * (n.g - 0.55);

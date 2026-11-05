@@ -49,7 +49,7 @@ struct Params {
   hang: f32,         // kąt godzinny słońca w środku mapy [rad]
   tanom: f32,        // anomalia temperatury masy powietrza dużej skali [K] (suwak w zakładce Pogoda)
   ddecl: f32,        // zmiana deklinacji słońca [rad/dobę] (> 0: na półkuli N dzień się wydłuża) – fenologia
-  _r0: f32,
+  rainF: f32,        // manipulacja atmosfery: mnożnik opadu (1 – bez zmian)
   _r1: f32,
   _r2: f32,
 }
@@ -1101,6 +1101,9 @@ fn tgt_build(@builtin(global_invocation_id) gid: vec3u) {
   let au = airAt(X - 0.5, Y);
   let av = airAt(X, Y - 0.5);
   let base = P.bslot * TG_SLOT;
+  // manipulacja atmosfery „opad”: wilgotność dużej skali. Przy gruncie wykładnik RH → RH^e (RH 0 i 1 zostają na miejscu), wyżej mnożnik, nie ponad nasycenie
+  let eRain = pow(max(P.rainF, 0.05), -0.4);
+  let hRain = pow(max(P.rainF, 0.05), 0.15);
   for (var k = 0u; k < NZ; k++) {
     let z = vg[VG_ZC + k];
     // anomalia z suwaka: cała troposfera cieplejsza / chłodniejsza o tyle samo, wilgotność względna bez zmian
@@ -1124,7 +1127,7 @@ fn tgt_build(@builtin(global_invocation_id) gid: vec3u) {
     if (a.r15 > 0.0) {
       let zb = mix(1500.0, a.zi, select(0.0, clamp(a.di, 0.0, 1.0), a.zi > 0.0));
       let rm = airRHm(a, z);
-      wsat = smoothstep(zb - 300.0, zb + 300.0, z) * smoothstep(0.85, 0.97, rm) * (1.0 - smoothstep(287.0, 294.0, a.ts));
+      wsat = smoothstep(zb - 300.0, zb + 300.0, z) * smoothstep(0.85, 0.97, rm) * (1.0 - smoothstep(287.0, 294.0, a.ts)) * min(P.rainF, 1.0);
       qtw = mix(qtw, max(qtw, rm * qsatMix(t, vg[VG_PRS + k])), wsat);
       rhU = mix(rhU, max(rhU, rm), wsat);
     }
@@ -1161,8 +1164,8 @@ fn tgt_build(@builtin(global_invocation_id) gid: vec3u) {
     // i nie ponad nasycenie
     let qb = mix(qtw, min(qtw, lim), wlim);
     let qsm = qsatMix(t, vg[VG_PRS + k]);
-    let qeN = select(qb, qsm * pow(max(qb / qsm, 1e-4), mix(fqn, 1.0, wsat)), qb < qsm);
-    let qeA = min(mix(fqa, 1.0, wsat) * qb, max(qb, qsm));
+    let qeN = select(qb, qsm * pow(max(qb / qsm, 1e-4), mix(fqn * eRain, 1.0, wsat)), qb < qsm);
+    let qeA = min(mix(fqa * hRain, 1.0, wsat) * qb, max(qb, qsm));
     tgt[base + N + l] = mix(qeN, qeA, smoothstep(0.0, 1500.0, zagl));
     // hodograf: liniowy (u0 + ścinanie) + skręt w dolnych 1.5 km (wiatr geostroficzny przy gruncie) + krzywizna 1.5–6 km
     let f0 = max(1.0 - z / 1500.0, 0.0);
@@ -1505,7 +1508,7 @@ fn lbc_apply(@builtin(global_invocation_id) gid: vec3u) {
     let wsm = clamp((150000.0 - lDom) / 100000.0, 0.0, 1.0);
     let wst = (1.0 - clamp(parAt(14u, X, Y), 0.0, 1.0)) * (1.0 - smoothstep(287.0, 294.0, parAt(0u, X, Y)));
     let fpc = ccBil(X, Y, 7u);
-    fpr = max(parAt(13u, X, Y), 0.0) / 3600.0 * mix(wst, 1.0, wsm) * select(1.0, fpc, fpc > 0.0);
+    fpr = max(parAt(13u, X, Y), 0.0) / 3600.0 * mix(wst, 1.0, wsm) * select(1.0, fpc, fpc > 0.0) * P.rainF;
     if (fpr > 3e-6) {
       for (var k = kb; k < NZ; k++) {
         let z = vg[VG_ZC + k];
@@ -1779,7 +1782,7 @@ fn lsTend(off: u32, l: u32, k: u32, theta: bool) -> f32 {
   // korekta opadu z klimatu (main.js ccUpdate: norma / średni opad modelu synoptycznego, 0.3–1) – model pada 2–3× za dużo
   // (Poznań: listopad 0.30, grudzień 0.48; Kraków, lipiec 0.41)
   let fpc = ccBil(f32(cidx2 % NX) + 0.5, f32(cidx2 / NX) + 0.5, 7u);
-  fm *= select(1.0, fpc, fpc > 0.0);
+  fm *= select(1.0, fpc, fpc > 0.0) * P.rainF;   // × mnożnik z manipulacji atmosfery (powyżej 1: więcej pary i ochłodzenia niż ze wznoszenia dużej skali)
   // w strefie wyostrzonego frontu wznoszenie robi sama domena (skok wiatru Φ skupia zbieżność całego pasa modelu synoptycznego na wąskiej linii), więc pełne unoszenie liczyłoby je
   // podwójnie: największe opady przy przejściu frontów w ciepłej porze roku. Tylko w cieple (przy gruncie ≥ ~14–21 °C, jak warstwy nasycone w celu): zimą opad frontów pada głównie z tego unoszenia
   if (fm > 1e-3) {
@@ -2934,6 +2937,32 @@ fn stormParams(i: i32, j: i32, col: u32, kb: u32) {
 // (jak IFS); domknięcie – usuwanie CAPE w ~1 h, × (1 − σ)² (σ – udział burzy o promieniu 1.2 km w oczku: na siatkach ≤ 2 km
 // konwekcję liczy siatka). Zima, Polska, 4 km: MUCAPE ≥ 20 J/kg w 8% oczko·terminów, CAPE cząstki z dolnych 500 m w 0% z nich –
 // schemat głęboki ani razu.
+// Parowanie opadu schematu pod podstawą chmury (Kessler 1969, postać jak w IFS – Tiedtke 1993; opad na części σ = 5% oczka):
+// E = σ·α₁·(RHc − RH)·q_s·(√(p/p_s)·F/(σ·α₃))^α₄; zwraca opad dochodzący do gruntu [kg/m²], para i ochłodzenie zostają w warstwach.
+// Bez tego słaby opad konwekcji płytkiej i podniesionej spadał na grunt w całości, także spod podstawy na 2–2.5 km przez suchą warstwę
+// graniczną (w rzeczywistości virga: przy 0.3 mm/h, RH 60%, 2 km paruje ~75%) – duże gładkie pola opadu 0.1–0.6 mm/h pod rzadkimi cumulusami
+fn cuVirga(col: u32, kb: u32, kl: u32, pr0: f32) -> f32 {
+  var fl = pr0 / P.dt;                                // strumień opadu [kg/m²/s]
+  if (fl <= 0.0) { return 0.0; }
+  let ps = vg[VG_PRS + kb];
+  for (var kk = kl; kk > kb; kk--) {
+    let k = kk - 1u;
+    let c = k * NXY + col;
+    let pk = vg[VG_PRS + k];
+    let te = (vg[VG_TC + k] + state[T_OFF + c]) * vg[VG_EXC + k];
+    let qs = qsat(te, pk);
+    let def = max(0.9 * qs - max(state[QV_OFF + c], 0.0), 0.0);
+    if (def <= 0.0) { continue; }
+    let m = vg[VG_RC + k] * vg[VG_DZC + k];
+    let e = 0.05 * 5.44e-4 * def * pow(sqrt(pk / ps) * fl / (0.05 * 5.09e-3), 0.5777);
+    let df = min(min(e * m, fl), 0.5 * def * m / P.dt);
+    state[QV_OFF + c] += df * P.dt / m;
+    state[T_OFF + c] -= LV * df * P.dt / (CP * m * vg[VG_EXC + k]);
+    fl -= df;
+    if (fl <= 0.0) { return 0.0; }
+  }
+  return fl * P.dt;
+}
 const TAU_MID: f32 = 3600.0;
 fn cuMid(col: u32, kb: u32, zg: f32, ks: u32, capes: f32) -> bool {
   var hmx = -1.0;
@@ -3049,7 +3078,7 @@ fn cuMid(col: u32, kb: u32, zg: f32, ks: u32, capes: f32) -> bool {
     let te = (vg[VG_TC + k] + state[T_OFF + c]) * vg[VG_EXC + k];
     if (te < 253.15) { state[QI_OFF + c] += 0.4 * det / ma; } else { state[QC_OFF + c] += 0.4 * det / ma; }
   }
-  sfc[sf(S_PRCU, col)] = prc / P.dt * 3600.0;
+  sfc[sf(S_PRCU, col)] = cuVirga(col, kb, kl, prc) / P.dt * 3600.0;
   // widoczne chmury (wieże w części oczka – 3D, satelita, zachmurzenie)
   sfc[sf(S_CUTOP, col)] = zb + depth;
   sfc[sf(S_CUBASE, col)] = zb;
@@ -3481,8 +3510,11 @@ fn cumulus(@builtin(global_invocation_id) gid: vec3u) {
         // znad Bałtyku) padają na każdej siatce od ~1 km: kłęby mają 2–5 km średnicy i wierzchołki 2–3 km – siatka 1–4 km ich nie
         // rozwiązuje (zima, Polska: schemat ani razu, MUCAPE ~0, opad konwekcyjny 0% przy ERA5 ~10–20%)
         let tbase = (vg[VG_TC + klcl] + state[T_OFF + klcl * NXY + col]) * vg[VG_EXC + klcl];
-        let wCold = select(0.0, 1.0 - smoothstep(271.15, 279.15, tbase), ttop < 263.15) * smoothstep(700.0, 1200.0, DX);
-        let prs = max(smoothstep(3000.0, 8000.0, DX), wCold) * pcell * 0.6 * tr * select(0.5 * smoothstep(2500.0, 3500.0, dsh), smoothstep(1200.0, 2500.0, dsh), ttop < 263.15);
+        // (płynnie z temperaturą wierzchołka i grubością chmury: próg −10 °C i koniec schematu na 3.5 km dawały na mapie opadu ostre granice,
+        // a w poziomie pasma i pierścienie wzdłuż izolinii grubości chmury)
+        let fIce = 1.0 - smoothstep(258.15, 268.15, ttop);
+        let wCold = fIce * (1.0 - smoothstep(271.15, 279.15, tbase)) * smoothstep(700.0, 1200.0, DX);
+        let prs = max(smoothstep(3000.0, 8000.0, DX), wCold) * pcell * 0.6 * tr * mix(0.5 * smoothstep(2500.0, 3500.0, dsh), smoothstep(1200.0, 2500.0, dsh), fIce) * (1.0 - smoothstep(3000.0, 3500.0, dsh));
         for (var k = kb; k < klcl; k++) {
           let c = k * NXY + col;
           state[QV_OFF + c] = max(state[QV_OFF + c] - (added + prs) / ms, 0.0);
@@ -3491,7 +3523,7 @@ fn cumulus(@builtin(global_invocation_id) gid: vec3u) {
           for (var k = klcl; k <= kt; k++) {
             state[T_OFF + k * NXY + col] += LV * prs / (CP * mc * vg[VG_EXC + k]);
           }
-          sfc[sf(S_PRCU, col)] = prs / P.dt * 3600.0;
+          sfc[sf(S_PRCU, col)] = cuVirga(col, kb, klcl, prs) / P.dt * 3600.0;
           // padający cumulus congestus – widoczny (3D, satelita) jak gęsta chmura, nie rzadka mgiełka
           sfc[sf(S_CUL, col)] = max(sfc[sf(S_CUL, col)], 120.0 * smoothstep(0.0, 0.5, prs / P.dt * 3600.0));
           sfc[sf(S_CUTOP, col)] = vg[VG_ZC + kt];
