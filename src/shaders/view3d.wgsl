@@ -110,10 +110,11 @@ fn ambientSky() -> vec3f {
 }
 
 // kolor podłoża: typ roślinności i jej zieleń (jak vegColor w render.wgsl)
-fn vegCol(v: u32, g: f32) -> vec3f {
+fn vegCol(v: u32, g0: f32) -> vec3f {
+  let g = abs(g0);
   switch v {
     case 0u: { return mix(vec3f(0.55, 0.50, 0.36), vec3f(0.36, 0.48, 0.22), g); }
-    case 1u: { return mix(vec3f(0.27, 0.24, 0.21), vec3f(0.15, 0.32, 0.13), g); }
+    case 1u: { return mix(leafCol(g0), vec3f(0.09, 0.20, 0.12), 0.3 * (1.0 - g)); }
     case 2u: { return vec3f(0.09, 0.20, 0.12); }
     case 3u: { return mix(vec3f(0.50, 0.46, 0.38), vec3f(0.42, 0.45, 0.30), g); }
     case 4u: { return vec3f(0.90, 0.92, 0.95); }

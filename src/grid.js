@@ -334,6 +334,8 @@ export function wgslHeader(c, grid) {
     `const W_EBM: u32 = W_EA + 2u * NZ;`,
     // średni wiatr na poziomach (u, v – sondaż średniej domeny, level_means)
     `const W_MUV: u32 = W_EBM + 2u * MEB;`,
+    // średni po domenie strumień ciepła z gruntu, średnia wykładnicza z doby [W/m²]
+    `const W_HM: u32 = W_MUV + 2u * NZ;`,
   ];
   SFC.forEach((name, i) => lines.push(`const S_${name}: u32 = ${i}u;`));
   for (const [k, v] of Object.entries(grid.off)) lines.push(`const VG_${k}: u32 = ${v}u;`);
@@ -349,7 +351,20 @@ export function wgslHeader(c, grid) {
   // zaburzenia napływu na siatkach LES (?cpm=0 – wyłączone, do porównań A/B)
   lines.push(`const CPM: f32 = ${typeof location !== 'undefined' && new URLSearchParams(location.search).get('cpm') === '0' ? '0.0' : '1.0'};`);
   // stochastyczne zaburzenia warstwy granicznej w szarej strefie (?psp=0 – wyłączone, do porównań A/B)
+  lines.push(`const PHS: f32 = ${typeof location !== 'undefined' && new URLSearchParams(location.search).get('phs') === '0' ? '0.0' : '1.0'};`);
   lines.push(`const PSP: f32 = ${typeof location !== 'undefined' && new URLSearchParams(location.search).get('psp') === '0' ? '0.0' : '1.0'};`);
+  // napływ z wariancją wilgotności i wilgocią wznoszenia (?bcq=0 – wyłączone): duże domeny, płynnie 150–400 km krótszego boku
+  const bcqT = Math.min(1, Math.max(0, (Math.min(c.NXD, c.NYD) * c.DX - 150e3) / 250e3));
+  lines.push(`const BCQ: f32 = ${typeof location !== 'undefined' && new URLSearchParams(location.search).get('bcq') === '0' ? '0.0' : f(bcqT * bcqT * (3 - 2 * bcqT))};`);
+  // drenaż na spodzie gleby jako część swobodnego (?drn=1 – dawny swobodny) i część średniego strumienia ciepła z gruntu zdejmowana z warstwy granicznej (?hff=0 – bez)
+  const qnum = (k, d) => { const v = typeof location !== 'undefined' ? new URLSearchParams(location.search).get(k) : null; const n = v === null ? NaN : Number(v); return Number.isFinite(n) && n >= 0 ? n : d; };
+  lines.push(`const SM_DRN: f32 = ${f(qnum('drn', 0.15))};`, `const HFF: f32 = ${f(qnum('hff', 0.8))};`);
+  // cienka komórka przy gruncie łączona mieszaniem z warstwą wyżej (?tlk=1 – włączone; domyślnie wyłączone: odwracała artefakt – cienkie oczka nocą cieplejsze od sąsiadów), wychładzanie mgły na ~300 m (?fsp=0), mgła na stacji i mapie z wody na 2 m (?fgd=0), ograniczenie bardzo dużego CAPE (?cul= próg [J/kg], 0 – bez)
+  // próg lodowego wierzchołka cumulusa płytkiego nad lądem przy ciepłej podstawie o GLI [K] chłodniej (?gli=0 – dawniej wszędzie −5…−15 °C)
+  lines.push(`const GLI: f32 = ${f(qnum('gli', 10))};`);
+  lines.push(`const TLK: f32 = ${f(qnum('tlk', 0))};`, `const FSP: f32 = ${f(qnum('fsp', 1))};`, `const FGD: f32 = ${f(qnum('fgd', 1))};`, `const CUL: f32 = ${f(qnum('cul', 2000))};`, `const CUQ: f32 = ${f(qnum('cuq', 1))};`, `const SHL: f32 = ${f(qnum('shl', 0.1))};`);
+  // narodziny chmur schematu w płynących skupiskach zamiast kropek po całej mapie (?clu=0 – wyłączone)
+  lines.push(`const CLU: f32 = ${typeof location !== 'undefined' && new URLSearchParams(location.search).get('clu') === '0' ? '0.0' : '1.0'};`);
   return lines.join('\n') + '\n';
 }
 

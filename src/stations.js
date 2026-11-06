@@ -332,26 +332,36 @@ export function createStations(ctx) {
   $('stZp').onclick = () => { viewStep(views[$('stRange').value], 1 / 1.5); drawSel(); };
   $('stZm').onclick = () => { viewStep(views[$('stRange').value], 1.5); drawSel(); };
 
-  // eksport CSV (separator „;”, przecinek dziesiętny – otwiera się wprost w polskim Excelu)
+  // eksport CSV: metryczny – separator „;”, przecinek dziesiętny (otwiera się wprost w polskim Excelu); imperialny – °F, in, mph, inHg, mi, ft,
+  // separator „,” i kropka dziesiętna (amerykański Excel). Model i historia stacji zostają metryczne – przeliczane tylko przy zapisie
   function csv() {
     if (!list.length) { ctx.toast('No stations to save'); return; }
     const kind = $('stCsvKind').value;
-    const f = (x, dd = 1) => (Number.isFinite(x) ? x.toFixed(dd).replace('.', ',') : '');
-    const nm = (s) => s.name.replace(/;/g, ',');
+    const I = $('stCsvUnits') && $('stCsvUnits').value === 'imperial', SEP = I ? ',' : ';';
+    const fx = (x, dd = 1) => (Number.isFinite(x) ? (I ? x.toFixed(dd) : x.toFixed(dd).replace('.', ',')) : '');
+    // przeliczenia (bez I – bez zmian) i miejsca po przecinku w jednostkach imperialnych
+    const C = { T: (x) => (I ? x * 1.8 + 32 : x), mm: (x) => (I ? x / 25.4 : x), ms: (x) => (I ? x * 2.23694 : x), hPa: (x) => (I ? x * 0.02953 : x),
+      km: (x) => (I ? x * 0.621371 : x), cm: (x) => (I ? x / 2.54 : x), m: (x) => (I ? x * 3.28084 : x) };
+    const f = fx;
+    const fT1 = (x) => fx(C.T(x), 1), fP = (x, d = 1) => fx(C.mm(x), I ? d + 1 : d), fW = (x) => fx(C.ms(x), 1), fH = (x) => fx(C.hPa(x), I ? 2 : 1), fK = (x) => fx(C.km(x), I ? 2 : 1);
+    const u = I ? { T: 'F', mm: 'in', ms: 'mph', hPa: 'inHg', km: 'mi', cm: 'in', m: 'ft' } : { T: 'C', mm: 'mm', ms: 'm_s', hPa: 'hPa', km: 'km', cm: 'cm', m: 'm' };
+    const nm = (s) => s.name.replace(/[;,]/g, ' ');
     const lines = [];
-    const zf = (s) => (s.zs == null ? '' : Math.round(s.zs));
+    const zf = (s) => (s.zs == null ? '' : Math.round(C.m(s.zs)));
     if (kind === 'day') {
-      lines.push('station;x_km;y_km;height_m;sim_day;date;full_day;Tmin_C;Tmax_C;Tmean_C;Td_mean_C;RH_mean_%;precip_mm;snow_mm;wind_mean_m_s;prevailing_dir;gust_max_m_s;pressure_mean_hPa;cloud_cover_mean_%;sunshine_h;snow_depth_cm;visibility_min_km;fog_h;evapotranspiration_mm;soil_0_10cm_%vol;soil_10_40cm_%vol;soil_40_100cm_%vol');
+      lines.push(['station', `x_${u.km}`, `y_${u.km}`, `height_${u.m}`, 'sim_day', 'date', 'full_day', `Tmin_${u.T}`, `Tmax_${u.T}`, `Tmean_${u.T}`, `Td_mean_${u.T}`, 'RH_mean_%', `precip_${u.mm}`, `snow_${u.mm}`, `wind_mean_${u.ms}`, 'prevailing_dir', `gust_max_${u.ms}`,
+        `pressure_mean_${u.hPa}`, 'cloud_cover_mean_%', 'sunshine_h', `snow_depth_${u.cm}`, `visibility_min_${u.km}`, 'fog_h', `evapotranspiration_${u.mm}`, 'soil_0_10cm_%vol', 'soil_10_40cm_%vol', 'soil_40_100cm_%vol'].join(SEP));
       for (const s of list) for (const r of s.d) {
-        lines.push([nm(s), f(s.xkm), f(s.ykm), zf(s), r.day + 1, r.date, r.full ? 1 : 0, f(r.Tmin), f(r.Tmax), f(r.Tmean), f(r.Td), f(r.RH, 0), f(r.pr), f(r.sn), f(r.ws),
-          r.dir, f(r.gust), f(r.PSL), f(100 * r.cov, 0), f(r.sunh), f(r.snow, 0), f(r.vis), f(r.fog), f(r.et, 2), f(r.sm1), f(r.sm2), f(r.sm3)].join(';'));
+        lines.push([nm(s), fK(s.xkm), fK(s.ykm), zf(s), r.day + 1, r.date, r.full ? 1 : 0, fT1(r.Tmin), fT1(r.Tmax), fT1(r.Tmean), fT1(r.Td), f(r.RH, 0), fP(r.pr), fP(r.sn), fW(r.ws),
+          r.dir, fW(r.gust), fH(r.PSL), f(100 * r.cov, 0), f(r.sunh), f(C.cm(r.snow), 0), fK(r.vis), f(r.fog), fP(r.et, 2), f(r.sm1), f(r.sm2), f(r.sm3)].join(SEP));
       }
     } else {
       const hourly = kind === 'hour';
-      lines.push(`station;x_km;y_km;height_m;sim_time_h;hour;T2_C;Td_C;RH_%;wind_m_s;dir;gust_m_s;${hourly ? 'precip_mm_per_hour;snow_mm_per_hour;Tmin_C;Tmax_C' : 'precip_mm_h;snow_mm_h;total_since_start_mm'};pressure_hPa;cloud_cover_%;visibility_km`);
+      lines.push(['station', `x_${u.km}`, `y_${u.km}`, `height_${u.m}`, 'sim_time_h', 'hour', `T2_${u.T}`, `Td_${u.T}`, 'RH_%', `wind_${u.ms}`, 'dir', `gust_${u.ms}`,
+        ...(hourly ? [`precip_${u.mm}_per_hour`, `snow_${u.mm}_per_hour`, `Tmin_${u.T}`, `Tmax_${u.T}`] : [`precip_${u.mm}_h`, `snow_${u.mm}_h`, `total_since_start_${u.mm}`]), `pressure_${u.hPa}`, 'cloud_cover_%', `visibility_${u.km}`].join(SEP));
       for (const s of list) for (const h of (hourly ? s.h1 : s.h10)) {
-        lines.push([nm(s), f(s.xkm), f(s.ykm), zf(s), f(h.t / 3600, 2), f(h.hour, 2), f(h.T2), f(h.Td2), f(rhOf(h.T2, h.Td2), 0), f(h.ws), dirName(h.ua, h.va), f(h.gust),
-          ...(hourly ? [f(h.PR, 2), f(h.sn, 2), f(h.tmin), f(h.tmax)] : [f(h.PR, 2), f(h.sn, 2), f(h.pacc, 1)]), f(h.PSL), f(100 * h.cov, 0), f(h.vis)].join(';'));
+        lines.push([nm(s), fK(s.xkm), fK(s.ykm), zf(s), f(h.t / 3600, 2), f(h.hour, 2), fT1(h.T2), fT1(h.Td2), f(rhOf(h.T2, h.Td2), 0), fW(h.ws), dirName(h.ua, h.va), fW(h.gust),
+          ...(hourly ? [fP(h.PR, 2), fP(h.sn, 2), fT1(h.tmin), fT1(h.tmax)] : [fP(h.PR, 2), fP(h.sn, 2), fP(h.pacc, 1)]), fH(h.PSL), f(100 * h.cov, 0), fK(h.vis)].join(SEP));
       }
     }
     if (lines.length < 2) { ctx.toast('No data at this resolution yet'); return; }
@@ -360,7 +370,7 @@ export function createStations(ctx) {
     const blob = new Blob(['﻿' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = `weather3d_stations_${{ day: 'daily', hour: 'hourly', min10: '10min' }[kind]}.csv`;
+    a.download = `weather3d_stations_${{ day: 'daily', hour: 'hourly', min10: '10min' }[kind]}${I ? '_imperial' : ''}.csv`;
     a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 5000);
     ctx.toast(`Saved ${lines.length - 1 - (ctx.csvMeta ? 1 : 0)} rows (CSV)`);
@@ -381,6 +391,8 @@ export function createStations(ctx) {
     add((p.i - MG + 0.5) * DX / 1000, (p.j - MG + 0.5) * DY / 1000);
   };
   $('stCsv').onclick = csv;
+  // jednostki pliku domyślnie jak na ekranie, z możliwością zmiany przed zapisem
+  if ($('stCsvUnits')) { $('stCsvUnits').value = isImp() ? 'imperial' : 'metric'; onUnits(() => { $('stCsvUnits').value = isImp() ? 'imperial' : 'metric'; }); }
   $('stRange').onchange = drawSel;
   $('stClear').onclick = () => { if (list.length && confirm('Remove all stations?')) { list = []; sel = -1; save(); markers(); table(true); drawSel(); } };
   $('stTable').addEventListener('click', (e) => {

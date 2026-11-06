@@ -13,7 +13,7 @@ struct VolP {
   zTop: f32,        // górna granica tekstury [m]
   cloudScale: f32,  // przelicznik chmur podsiatkowych (0 na siatkach LES)
   blend: f32,      // wygładzenie w czasie tekstury chmur (część nowego stanu, ~Δt_sym / 10 min)
-  _b: f32,
+  leafAut: f32,    // 1 – jesień (kolory drzew: main.js leafAut)
 }
 
 @group(0) @binding(0) var<uniform> VP: VolP;
@@ -106,7 +106,7 @@ fn ground_build(@builtin(global_invocation_id) g: vec3u) {
   let iced = isW && sfc[S_ICE * NXY + col] > 0.0;
   // śnieg (0..1); zamarznięta woda jako „śnieg” ≥ 0.6, otwarta woda bez śniegu
   let snow = select(select(clamp(sfc[S_SWE * NXY + col] / 10.0, 0.0, 1.0), 0.0, isW), max(0.6, clamp(sfc[S_SWE * NXY + col] / 10.0, 0.0, 1.0)), iced);
-  textureStore(groundOut, vec2u(g.x, g.y), vec4f(vg[VG_HGT + col], sfc[S_GRN * NXY + col], snow, veg));
+  textureStore(groundOut, vec2u(g.x, g.y), vec4f(vg[VG_HGT + col], select(1.0, -1.0, VP.leafAut > 0.5) * sfc[S_GRN * NXY + col], snow, veg));   // zieleń ze znakiem: ujemna – jesień (leafCol)
   // wysokość izotermy 0 °C [m n.p.m.] (najwyższe przejście przez 0 °C w kolumnie; −1 – całość < 0 °C)
   let kb = u32(vg[VG_KB + col]);
   var zf = -1.0;

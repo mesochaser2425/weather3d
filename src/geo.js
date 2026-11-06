@@ -372,22 +372,31 @@ function lcTiff(name, tok) {
 
 // Udziały pokrycia w oczkach siatki nx × ny (oczko dx [m], środek lat0, lon0 – jak fetchTerrain):
 // { tree, built, water, wet, valid } – Float32Array (0…1); valid = udział próbek z danymi.
-export async function fetchLandCover(lat0, lon0, nx, ny, dx, onProgress) {
+// hiF ≥ 2 – dodatkowo gęsta mapa klas do obrazu (out.hi: hiF × hiF punktów na oczko, wiersze S→N): 0 otwarte (pola, łąki, krzewy, mokradła),
+// 1 drzewa, 2 zabudowa, 3 woda, 5 goły grunt i skały, 6 śnieg i lód, 255 – brak danych. Model liczy dalej na udziałach w oczku
+export async function fetchLandCover(lat0, lon0, nx, ny, dx, onProgress, hiF = 0) {
   const kx = 111320 * Math.cos(lat0 * Math.PI / 180);
   const ll = (x, y) => [lat0 + y / 111320, lon0 + x / kx];
   const [laS] = ll(0, -ny * dx / 2), [laN] = ll(0, ny * dx / 2);
   const loW = ll(-nx * dx / 2, 0)[1], loE = ll(nx * dx / 2, 0)[1];
-  const tiles = [];
-  for (let la = Math.floor(laS / 3) * 3; la < laN; la += 3) {
-    for (let lo = Math.floor(loW / 3) * 3; lo < loE; lo += 3) tiles.push([la, lo]);
+  const tiles = [], la0 = Math.floor(laS / 3) * 3, lo0 = Math.floor(loW / 3) * 3;
+  let nRow = 0, nCol = 0;
+  for (let la = la0; la < laN; la += 3, nRow++) {
+    nCol = 0;
+    for (let lo = lo0; lo < loE; lo += 3, nCol++) tiles.push([la, lo]);
   }
-  if (tiles.length > 40) throw new Error(`domain too large for the land-cover map (${tiles.length} files 3° × 3°)`);
+  // (do 240 plików – domena ~3000 × 3000 km; wcześniej 40, więc domeny > ~1300 km zostawały z mozaiką i bez gęstej mapy do obrazu)
+  if (tiles.length > 240) throw new Error(`domain too large for the land-cover map (${tiles.length} files 3° × 3°)`);
   if (onProgress) onProgress(`downloading land cover (ESA WorldCover, ${tiles.length} files)…`);
-  const needW = 3 * 111320 * 5 / dx;                       // szerokość poziomu, przy której piksel ≈ dx/5
+  // szerokość poziomu, przy której piksel ≈ dx/5 (z mapą gęstą ≈ 1/3 punktu – 3 × 3 próbki w punkcie); przy dużej domenie (> 40 plików) poziom ~1.7× grubszy –
+  // piksel ≈ próbka, inaczej setki MB w pamięci (3000 km: ~144 → ~36 MB)
+  const needW = 3 * 111320 * Math.max(5, 3 * hiF) / dx * (tiles.length > 40 ? 0.6 : 1);
   const tok = await lcToken();
   const got = [];
   let nOk = 0;
-  await Promise.all(tiles.map(async ([la, lo]) => {
+  // po 8 plików naraz (przy ~60–240 plikach wszystkie naraz zatykały połączenie)
+  let next = 0;
+  const one = async ([la, lo]) => {
     const tiff = await lcTiff(lcName(la, lo), tok);
     if (!tiff) return;
     try {
@@ -407,16 +416,20 @@ export async function fetchLandCover(lat0, lon0, nx, ny, dx, onProgress) {
       if (typeof window !== 'undefined' && window.__lcDebug) { const hs = {}; for (const v of r) hs[v] = (hs[v] || 0) + 1; window.__lcDebug.push({ name: lcName(la, lo), W, n, hs }); }
       nOk++;
     } catch (e) { /* uszkodzony / nieosiągalny plik – oczka bez danych */ }
-  }));
+  };
+  await Promise.all(Array.from({ length: Math.min(8, tiles.length) }, async () => { while (next < tiles.length) await one(tiles[next++]); }));
   if (!nOk) throw new Error('could not download the land-cover map (no internet, or open ocean only)');
+  // plik próbki z indeksu w siatce 3° (przeglądanie listy plików dla każdej z milionów próbek gęstej mapy było przy dużej domenie za wolne)
+  const byTile = new Array(nRow * nCol).fill(null);
+  for (const t of got) byTile[((t.la - la0) / 3) * nCol + (t.lo - lo0) / 3] = t;
   const cls = (la, lo) => {
-    for (const t of got) {
-      if (la < t.la || la >= t.la + 3 || lo < t.lo || lo >= t.lo + 3) continue;
-      const X = Math.floor((lo - t.lo) / 3 * t.W) - t.x0, Y = Math.floor((t.la + 3 - la) / 3 * t.H) - t.y0;
-      if (X < 0 || Y < 0 || X >= t.w || Y >= t.h) return 0;
-      return t.d[Y * t.w + X];
-    }
-    return 0;
+    const r = Math.floor((la - la0) / 3), q = Math.floor((lo - lo0) / 3);
+    if (r < 0 || q < 0 || r >= nRow || q >= nCol) return 0;
+    const t = byTile[r * nCol + q];
+    if (!t) return 0;
+    const X = Math.floor((lo - t.lo) / 3 * t.W) - t.x0, Y = Math.floor((t.la + 3 - la) / 3 * t.H) - t.y0;
+    if (X < 0 || Y < 0 || X >= t.w || Y >= t.h) return 0;
+    return t.d[Y * t.w + X];
   };
   const N = nx * ny, out = { tree: new Float32Array(N), built: new Float32Array(N), water: new Float32Array(N),
     wet: new Float32Array(N), valid: new Float32Array(N) };
@@ -434,6 +447,29 @@ export async function fetchLandCover(lat0, lon0, nx, ny, dx, onProgress) {
       const c = j * nx + i, q = Math.max(v, 1);
       out.tree[c] = t / q; out.built[c] = b / q; out.water[c] = w / q; out.wet[c] = m / q; out.valid[c] = v / 25;
     }
+  }
+  if (hiF >= 2) {
+    // klasa większości z 3 × 3 próbek w punkcie (jedna próbka z poziomu przeglądowego dawała szum „sól i pieprz” – ziarnisty obraz na całej mapie);
+    // remis: woda, zabudowa, drzewa, otwarte
+    const W = nx * hiF, H = ny * hiF, hi = new Uint8Array(W * H), code = (k) => (!k ? 255 : (k === 10 || k === 95) ? 1 : k === 50 ? 2 : k === 80 ? 3 : k === 60 ? 5 : k === 70 ? 6 : 0);
+    const PRI = [3, 2, 1, 6, 5, 0], cnt = new Uint8Array(256), SO = [-1 / 3, 0, 1 / 3];
+    // szerokość próbki zależy tylko od wiersza, długość tylko od kolumny (ten sam rzut co ll)
+    const laA = new Float64Array(H * 3), loA = new Float64Array(W * 3);
+    for (let j = 0; j < H; j++) for (let s = 0; s < 3; s++) laA[j * 3 + s] = ll(0, ((j + 0.5 + SO[s]) / hiF - ny / 2) * dx)[0];
+    for (let i = 0; i < W; i++) for (let s = 0; s < 3; s++) loA[i * 3 + s] = ll(((i + 0.5 + SO[s]) / hiF - nx / 2) * dx, 0)[1];
+    for (let j = 0; j < H; j++) {
+      for (let i = 0; i < W; i++) {
+        cnt.fill(0, 0, 8); let any = 0;
+        for (let sy = 0; sy < 3; sy++) for (let sx = 0; sx < 3; sx++) {
+          const c = code(cls(laA[j * 3 + sy], loA[i * 3 + sx]));
+          if (c !== 255) { cnt[c]++; any++; }
+        }
+        let best = 255, bn = 0;
+        for (const c of PRI) if (cnt[c] > bn) { bn = cnt[c]; best = c; }
+        hi[j * W + i] = any ? best : 255;
+      }
+    }
+    out.hi = hi;
   }
   return out;
 }

@@ -80,6 +80,22 @@ fn cloudAt(rho: f32, qc: f32, qi: f32, qr: f32, rhw: f32, rhi: f32, t: f32, z: f
 // nad gruntem, pblh – wysokość warstwy granicznej) albo chwiejna kolumna (mu – MUCAPE [J/kg], muel – wierzchołek dodatniej
 // wyporności tej cząstki nad gruntem): także nocą – konwekcja podniesiona, nad ciepłą wodą, w chłodnym napływie za frontem
 // (wcześniej tylko ciepło z gruntu – po zachodzie wszystkie chmury siatki stawały się warstwowe)
+// Kolor drzew liściastych z zieleni g (fenologia). Ujemna wartość – jesień (main.js leafAut, tekstura gruntu w widoku 3D). Jesienią zieleń → złoto → rdza → gołe gałęzie,
+// wiosną gołe gałęzie → jasna, świeża zieleń → pełna zieleń lata; wcześniej jedna prosta między brązem a zielenią dawała przez cały październik burą oliwkę.
+fn leafCol(g0: f32) -> vec3f {
+  let g = clamp(abs(g0), 0.0, 1.0);
+  let bare = vec3f(0.27, 0.24, 0.21);
+  let lato = vec3f(0.15, 0.32, 0.13);
+  if (g0 >= 0.0) {
+    let fresh = vec3f(0.30, 0.47, 0.17);
+    return select(mix(fresh, lato, (g - 0.6) / 0.4), mix(bare, fresh, g / 0.6), g < 0.6);
+  }
+  let gold = vec3f(0.74, 0.53, 0.10);
+  let rust = vec3f(0.63, 0.27, 0.07);
+  if (g > 0.55) { return mix(gold, lato, (g - 0.55) / 0.45); }
+  if (g > 0.25) { return mix(rust, gold, (g - 0.25) / 0.3); }
+  return mix(bare, rust, g / 0.25);
+}
 fn convFlag(w: f32, hs: f32, zagl: f32, pblh: f32, mu: f32, muel: f32) -> f32 {
   // (bez lokalnego w: prąd pionowy oscyluje między wierszami siatki i rodzaj chmury zmieniał się co wiersz – paski)
   let heat = select(0.0, smoothstep(30.0, 80.0, hs), zagl < pblh + 1500.0);

@@ -35,8 +35,8 @@ struct View {
   monS: f32,       // widok „Miesiące”, bieżący miesiąc: sekundy od jego początku i pełne doby (main.js monMidnight)
   monD: f32,
   monCur: f32,     // 1 – bieżący miesiąc (z liczników MTS…MSN), 0 – zapisany (pole MV)
-  _p3: f32,
-  _p4: f32,
+  leafAut: f32,    // 1 – jesień (kolory drzew: main.js leafAut)
+  vhF: f32,        // gęstsze pokrycie terenu do obrazu: punktów na oczko (0 – z oczek; main.js buildVegHi)
   cuD: array<vec4f, 36>,   // przesunięcie pokoleń 0 (xy) i 1 (zw) [m] w kaflach (wiersze po cuNx)
   cuD2: array<vec4f, 36>,  // to samo z wiatrem średnim 0–6 km – chmury kłębiaste piętra średniego (altocumulus)
 }
@@ -47,6 +47,7 @@ struct View {
 @group(0) @binding(3) var<storage, read> work: array<f32>;   // φ na początku bufora
 @group(0) @binding(4) var<storage, read> sfc: array<f32>;
 @group(0) @binding(5) var<storage, read> demHi: array<f32>;   // gęstszy teren (V.hiF × V.hiF punktów na oczko widocznej domeny)
+@group(0) @binding(6) var<storage, read> vegHi: array<u32>;   // gęstsze pokrycie terenu (V.vhF × V.vhF punktów na oczko, 1 bajt na punkt, 12 – skały)
 
 fn ldb(b: u32, i: u32) -> f32 {
   if (b == 0u) { return state[i]; }
@@ -500,12 +501,37 @@ fn hillshade(X: f32, Y: f32, light: vec3f) -> f32 {
   return max(dot(n, normalize(light)), 0.0);
 }
 
+// Lód na punkcie wody: oczko wody – lód oczka; punkt wody gęstszej mapy w oczku lądu (brzeg morza, zatoka, jezioro mniejsze od oczka) – lód większości
+// sąsiednich oczek wody (3 × 3), a bez nich (małe jezioro) – średnia T 2 m z ~15 dób (TPH) < −1 °C. Wcześniej grunt oczka lądu < −1 °C: każdej mroźnej
+// nocy lód wzdłuż wszystkich brzegów, za dnia znikał (użytkownik)
+fn waterIce(col: u32) -> bool {
+  if (u32(vg[VG_VEG + col] + 0.5) == 10u) { return sfcAt(S_ICE, col) > 0.0; }
+  let ci = i32(col % NX);
+  let cj = i32(col / NX);
+  var nw = 0u;
+  var ni = 0u;
+  for (var dj = -1; dj <= 1; dj++) {
+    for (var di = -1; di <= 1; di++) {
+      let c = u32(clamp(cj + dj, 0, i32(NY) - 1)) * NX + u32(clamp(ci + di, 0, i32(NX) - 1));
+      if (u32(vg[VG_VEG + c] + 0.5) == 10u) { nw++; if (sfcAt(S_ICE, c) > 0.0) { ni++; } }
+    }
+  }
+  if (nw > 0u) { return 2u * ni >= nw; }
+  return sfcAt(S_TPH, col) < -1.0;
+}
+
 // Kolor podłoża: typ roślinności (biom) i jej zieleń (fenologia), jak w climate.js
-fn vegColor(col: u32) -> vec3f {
+fn vegColor(col: u32) -> vec3f { return vegColorT(u32(vg[VG_VEG + col] + 0.5), col, vec2i(i32(col % NX), i32(col / NX))); }
+// vt – typ, col – oczko (zieleń, lód), p – punkt do plam drzew (oczko albo punkt gęstszej mapy)
+fn vegColorT(vt: u32, col: u32, p: vec2i) -> vec3f {
   let g = sfcAt(S_GRN, col);
-  switch u32(vg[VG_VEG + col] + 0.5) {
+  // las liściasty: plamy drzew żółknących wcześniej i później, bez liści widać domieszkę drzew iglastych (zimą las ciemniejszy niż pola)
+  if (vt == 1u) {
+    let gp = clamp(g + 0.22 * (hash2(p) - 0.5) * 4.0 * g * (1.0 - g), 0.0, 1.0);
+    return mix(leafCol(select(gp, -gp, V.leafAut > 0.5)), vec3f(0.09, 0.20, 0.12), (0.18 + 0.30 * hash2(p + vec2i(17, 41))) * (1.0 - g));
+  }
+  switch vt {
     case 0u: { return mix(vec3f(0.55, 0.50, 0.36), vec3f(0.36, 0.48, 0.22), g); }
-    case 1u: { return mix(vec3f(0.27, 0.24, 0.21), vec3f(0.15, 0.32, 0.13), g); }
     case 2u: { return vec3f(0.09, 0.20, 0.12); }
     case 3u: { return mix(vec3f(0.50, 0.46, 0.38), vec3f(0.42, 0.45, 0.30), g); }
     case 4u: { return vec3f(0.90, 0.92, 0.95); }
@@ -514,9 +540,53 @@ fn vegColor(col: u32) -> vec3f {
     case 7u: { return vec3f(0.84, 0.72, 0.52); }
     case 8u: { return mix(vec3f(0.70, 0.64, 0.45), vec3f(0.55, 0.58, 0.32), g); }
     case 9u: { return vec3f(0.50, 0.48, 0.46); }
-    case 10u: { return select(vec3f(0.06, 0.16, 0.32), vec3f(0.72, 0.78, 0.84), sfcAt(S_ICE, col) > 0.0); }
+    // woda: lód wg waterIce
+    case 10u: { return select(vec3f(0.06, 0.16, 0.32), vec3f(0.72, 0.78, 0.84), waterIce(col)); }
+    case 12u: { return vec3f(0.47, 0.45, 0.42); }        // skały, goły grunt w górach (tylko gęstsza mapa)
     default: { return mix(vec3f(0.35, 0.38, 0.24), vec3f(0.27, 0.36, 0.20), g); }
   }
+}
+
+// gęstsza mapa pokrycia: typ w punkcie (i, j) widocznej domeny i kolor podłoża w (X, Y) – mieszanka czterech najbliższych punktów (płynne przejście
+// na ~1 punkt, jak rozmyta granica na zdjęciu); nearest – typ najbliższego punktu (śnieg na lesie, kolory mapy typów)
+fn vegHiCode(i: i32, j: i32) -> u32 {
+  let F = i32(V.vhF);
+  let W = i32(NXD) * F;
+  let H = i32(NYD) * F;
+  let idx = u32(clamp(j, 0, H - 1) * W + clamp(i, 0, W - 1));
+  return (vegHi[idx >> 2u] >> ((idx & 3u) * 8u)) & 255u;
+}
+fn vegHiCell(i: i32, j: i32) -> u32 {
+  let F = i32(V.vhF);
+  return u32(clamp(j / F, 0, i32(NYD) - 1) + i32(MG)) * NX + u32(clamp(i / F, 0, i32(NXD) - 1) + i32(MG));
+}
+struct GroundHi { c: vec3f, vt: u32, col: u32 }
+// przy oddaleniu (piksel ekranu obejmuje kilka punktów: fp – punktów na piksel) kolor uśredniony po pikselu (2 × 2 próbki w odstępie fp/2) – bez migotania
+// i ziarna z przypadkowego punktu
+fn groundHiA(X: f32, Y: f32, fp: f32) -> GroundHi {
+  let g0 = groundHi(X, Y);
+  if (fp < 1.2) { return g0; }
+  let e = 0.35 * min(fp, 6.0) / V.vhF;
+  let c = 0.25 * (groundHi(X - e, Y - e).c + groundHi(X + e, Y - e).c + groundHi(X - e, Y + e).c + groundHi(X + e, Y + e).c);
+  return GroundHi(mix(g0.c, c, smoothstep(1.2, 2.0, fp)), g0.vt, g0.col);
+}
+fn groundHi(X: f32, Y: f32) -> GroundHi {
+  let u = (X - f32(MG)) * V.vhF - 0.5;
+  let v = (Y - f32(MG)) * V.vhF - 0.5;
+  let i0 = i32(floor(u));
+  let j0 = i32(floor(v));
+  let fx = u - floor(u);
+  let fy = v - floor(v);
+  var c = vec3f(0.0);
+  for (var q = 0; q < 4; q++) {
+    let i = i0 + (q & 1);
+    let j = j0 + (q >> 1);
+    let w = select(1.0 - fx, fx, (q & 1) == 1) * select(1.0 - fy, fy, (q >> 1) == 1);
+    c += w * vegColorT(vegHiCode(i, j), vegHiCell(i, j), vec2i(i, j));
+  }
+  let ni = i0 + select(0, 1, fx > 0.5);
+  let nj = j0 + select(0, 1, fy > 0.5);
+  return GroundHi(c, vegHiCode(ni, nj), vegHiCell(ni, nj));
 }
 
 // gładka wysokość terenu (dwuliniowo, bez zawijania przy brzegach otwartych)
@@ -636,7 +706,14 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
     }
   } else if (cm == 31u) {
     // typ powierzchni: kolor podłoża w oczku (jak na satelicie) z cieniowaniem terenu
-    col = vegColor(wrapi(i32(floor(Y)), NY) * NX + wrapi(i32(floor(X)), NX)) * (0.55 + 0.45 * hillshade(X, Y, nw));
+    // (gęstsza mapa: punkt przesunięty drobnym szumem jak na satelicie – nieregularne granice zamiast kwadratów punktów przy przybliżeniu)
+    let fpT = max(fwidth(X), fwidth(Y)) * max(V.vhF, 1.0);                  // punktów gęstszej mapy na piksel ekranu
+    let jT = (1.0 - smoothstep(1.0, 2.0, fpT)) / max(V.vhF, 1.0);           // szum brzegów słabnie przy oddaleniu
+    let qt = vec2f(X, Y) * max(V.vhF, 1.0) / 2.5;
+    let Xt = X + (0.9 * (vnoise(qt + vec2f(4.3, 17.9)) - 0.5) + 0.45 * (vnoise(qt * 2.7 + vec2f(13.1, 2.2)) - 0.5)) * jT;
+    let Yt = Y + (0.9 * (vnoise(qt + vec2f(21.7, 3.4)) - 0.5) + 0.45 * (vnoise(qt * 2.7 + vec2f(6.6, 19.5)) - 0.5)) * jT;
+    let gt = select(vegColor(wrapi(i32(floor(Y)), NY) * NX + wrapi(i32(floor(X)), NX)), groundHiA(Xt, Yt, fpT).c, V.vhF > 1.5);
+    col = gt * (0.55 + 0.45 * hillshade(X, Y, nw));
   } else if (cm == 19u) {
     // grad: małe (< 2 cm) żółte, duże (2–5 cm) pomarańczowe, bardzo duże (> 5 cm) fioletowe
     col = vec3f(0.70) * (0.55 + 0.45 * hillshade(X, Y, nw));
@@ -700,11 +777,24 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
     let qg = vec2f(X, Y) / 2.5;
     let Xg = X + 0.9 * (vnoise(qg + vec2f(23.1, 5.7)) - 0.5) + 0.45 * (vnoise(qg * 2.7 + vec2f(3.1, 8.2)) - 0.5);
     let Yg = Y + 0.9 * (vnoise(qg + vec2f(7.9, 31.4)) - 0.5) + 0.45 * (vnoise(qg * 2.7 + vec2f(9.4, 1.3)) - 0.5);
-    let gcol0 = wrapi(i32(floor(Yg)), NY) * NX + wrapi(i32(floor(Xg)), NX);
-    let ground = vegColor(gcol0);
+    var gcol0 = wrapi(i32(floor(Yg)), NY) * NX + wrapi(i32(floor(Xg)), NX);
+    var ground = vegColor(gcol0);
+    var vt = u32(vg[VG_VEG + gcol0] + 0.5);
+    // gęstsza mapa pokrycia (ESA WorldCover, ~0.5–1 km): kolory czterech najbliższych punktów zmieszane, punkt przesunięty drobnym szumem (±~0.6 punktu) –
+    // rozmyte, nieregularne granice pól, lasów, hal i skał; śnieg i lód jezior z oczka
+    var wice = vt == 10u && sfcAt(S_ICE, gcol0) <= 0.0;
+    if (V.vhF > 1.5) {
+      let fpH = max(fwidth(X), fwidth(Y)) * V.vhF;
+      let jH = (1.0 - smoothstep(1.0, 2.0, fpH)) / V.vhF;
+      let qh = vec2f(X, Y) * V.vhF / 2.5;
+      let Xh = X + (0.9 * (vnoise(qh + vec2f(4.3, 17.9)) - 0.5) + 0.45 * (vnoise(qh * 2.7 + vec2f(13.1, 2.2)) - 0.5)) * jH;
+      let Yh = Y + (0.9 * (vnoise(qh + vec2f(21.7, 3.4)) - 0.5) + 0.45 * (vnoise(qh * 2.7 + vec2f(6.6, 19.5)) - 0.5)) * jH;
+      let gh = groundHiA(Xh, Yh, fpH);
+      ground = gh.c; vt = gh.vt; gcol0 = gh.col;
+      wice = vt == 10u && !waterIce(gcol0);
+    }
     let lit = select(0.0, hillshade(X, Y, sun), V.sunZ > 0.0);
-    let vt = u32(vg[VG_VEG + gcol0] + 0.5);
-    let fsn = select(clamp(sfcBil(S_SWE, Xg, Yg) / 10.0, 0.0, 1.0) * select(1.0, 0.5, vt == 1u || vt == 2u || vt == 5u || vt == 11u), 0.0, vt == 10u && sfcAt(S_ICE, gcol0) <= 0.0);
+    let fsn = select(clamp(sfcBil(S_SWE, Xg, Yg) / 10.0, 0.0, 1.0) * select(1.0, 0.5, vt == 1u || vt == 2u || vt == 5u || vt == 11u), 0.0, wice);
     let gcol = mix(ground, vec3f(0.92, 0.94, 0.97), fsn) * (0.25 + 0.75 * lit);
     // zachmurzenie ogólne z tego samego opisu chmur co widok 3D i promieniowanie (cloudAt): w przerwach
     // widać grunt – chmury porwane wg szumu o skali kilku km, płynącego z wiatrem
@@ -786,8 +876,10 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
       let major = abs(fract(ht / (5.0 * iv) + 0.5) - 0.5) * 5.0 * iv / fh;
       // brązowe, kropkowane – żeby odróżniały się od izolinii pola (ciągłych, ciemnych)
       let dot = fract((pos.x + pos.y) / 5.0) < 0.6;
-      if (ht > 0.5 * iv && d < 0.6 && dot) { col = mix(col, vec3f(0.42, 0.25, 0.08), 0.5); }
-      if (ht > 0.5 * iv && major < 0.9) { col = mix(col, vec3f(0.36, 0.20, 0.05), 0.7); }
+      // (przy izoliniach pola poziomice o połowę słabsze – w górach razem dawały gąszcz linii)
+      let ra = select(1.0, 0.5, V.iso > 0.0);
+      if (ht > 0.5 * iv && d < 0.6 && dot) { col = mix(col, vec3f(0.42, 0.25, 0.08), 0.5 * ra); }
+      if (ht > 0.5 * iv && major < 0.9) { col = mix(col, vec3f(0.36, 0.20, 0.05), 0.7 * ra); }
     }
   }
 
@@ -803,9 +895,11 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
       let d5 = abs(fract(val * 0.2 + 0.5) - 0.5) * 5.0 / fw;
       let dash = select(0.0, 1.0, fract((pos.x + pos.y) / 7.0) < 0.55);
       let a5 = 1.0 - smoothstep(0.9, 1.6, d5);
-      let a2 = (1.0 - smoothstep(0.3, 0.9, d2)) * (1.0 - smoothstep(0.35, 0.6, fw));
-      let a1 = (1.0 - smoothstep(0.2, 0.7, d1)) * dash * (1.0 - smoothstep(0.2, 0.3, fw));
-      col = mix(col, vec3f(0.0), max(0.9 * a5, max(0.75 * a2, 0.6 * a1)));   // czarne
+      // (spokojniej niż dawniej – razem z kropkami miejscowości i poziomicami pole ginęło pod liniami: co 2 °C 0.75 → 0.5, co 1 °C 0.6 → 0.35,
+      // linie co 1 °C znikają, gdy leżą bliżej niż ~7 px, co 2 °C – bliżej niż ~5 px)
+      let a2 = (1.0 - smoothstep(0.3, 0.9, d2)) * (1.0 - smoothstep(0.25, 0.45, fw));
+      let a1 = (1.0 - smoothstep(0.2, 0.7, d1)) * dash * (1.0 - smoothstep(0.1, 0.15, fw));
+      col = mix(col, vec3f(0.0), max(0.85 * a5, max(0.5 * a2, 0.35 * a1)));   // czarne
     } else {
       let d = abs(fract(val / V.iso + 0.5) - 0.5) * V.iso / fw;
       col = mix(col, vec3f(0.0), 0.8 * (1.0 - smoothstep(0.4, 0.9, d)));

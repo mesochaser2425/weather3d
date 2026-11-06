@@ -127,7 +127,7 @@ async function init() {
   const tmpBuf = buf(STATE_LEN * 4, U.STORAGE | U.COPY_DST | U.COPY_SRC, 'tmp');
   const W_MSC = W_MEAN + 4 * NZ + 8 * NPART;
   const W_MUV = W_MSC + 4 + 6 * CFG.MEB + 2 * NZ;      // średni wiatr na poziomach (2 · NZ), sondaż średniej domeny
-  const workBuf = buf((W_MUV + 2 * NZ) * 4, U.STORAGE | U.COPY_DST | U.COPY_SRC, 'work');
+  const workBuf = buf((W_MUV + 2 * NZ + 1) * 4, U.STORAGE | U.COPY_DST | U.COPY_SRC, 'work');   // + W_HM (średni strumień ciepła z gruntu)
   const cxBuf = buf(2 * N * 8, U.STORAGE, 'complex');
   const vgBuf = buf(grid.data.byteLength, U.STORAGE | U.COPY_DST | U.COPY_SRC, 'vgrid');
   const statsBuf = buf(STATS_BYTES, U.STORAGE | U.COPY_SRC | U.COPY_DST, 'stats');
@@ -209,10 +209,12 @@ async function init() {
   // widocznej domeny, punkt ~0.5–0.6 km, najwyżej 2048 na bok; przy oczkach < ~0.9 km niepotrzebny (siatka modelu)
   const DEMF = Math.min(8, Math.max(1, Math.round(CFG.DX / 600)), Math.floor(2048 / Math.max(NXD, NYD)));
   const demHiBuf = buf(Math.max(16, DEMF >= 2 ? NXD * NYD * DEMF * DEMF * 4 : 16), U.STORAGE | U.COPY_DST, 'demHi');
+  // gęstsze pokrycie terenu tylko do obrazu (satelita, „Surface type”): typ powierzchni w tych samych punktach co gęstszy teren, 1 bajt na punkt
+  const vegHiBuf = buf(Math.max(16, DEMF >= 2 ? Math.ceil(NXD * NYD * DEMF * DEMF / 4) * 4 : 16), U.STORAGE | U.COPY_DST, 'vegHi');
   const renderLayout = device.createBindGroupLayout({
     entries: [
       { binding: 0, visibility: F, buffer: { type: 'uniform' } },
-      ...[1, 2, 3, 4, 5].map((b) => ({ binding: b, visibility: F, buffer: { type: 'read-only-storage' } })),
+      ...[1, 2, 3, 4, 5, 6].map((b) => ({ binding: b, visibility: F, buffer: { type: 'read-only-storage' } })),
     ],
   });
   const renderPipe = device.createRenderPipeline({
@@ -230,7 +232,7 @@ async function init() {
     const ubuf = buf(VIEW_BYTES, U.UNIFORM | U.COPY_DST, 'view');
     const bg = device.createBindGroup({
       layout: renderLayout,
-      entries: [ubuf, vgBuf, stateBuf, workBuf, sfcBuf, demHiBuf].map((b, i) => ({ binding: i, resource: { buffer: b } })),
+      entries: [ubuf, vgBuf, stateBuf, workBuf, sfcBuf, demHiBuf, vegHiBuf].map((b, i) => ({ binding: i, resource: { buffer: b } })),
     });
     return { ...v, ctx, ubuf, bg };
   });
@@ -264,7 +266,7 @@ async function init() {
   const pNoise = cpipe('noise_gen'), pGround = cpipe('ground_build'), pVol = cpipe('vol_build'), pLight = cpipe('vol_light');
   const bgOf = (p, entries) => device.createBindGroup({ layout: p.getBindGroupLayout(0), entries: entries.map(([b, r]) => ({ binding: b, resource: r })) });
   const bNoise = bgOf(pNoise, [[4, noiseTex.createView()]]);
-  const bGround = bgOf(pGround, [[1, { buffer: vgBuf }], [2, { buffer: stateBuf }], [3, { buffer: sfcBuf }], [5, groundTex.createView()], [11, frzTex.createView()]]);
+  const bGround = bgOf(pGround, [[0, { buffer: volP }], [1, { buffer: vgBuf }], [2, { buffer: stateBuf }], [3, { buffer: sfcBuf }], [5, groundTex.createView()], [11, frzTex.createView()]]);
   const bVol = bgOf(pVol, [[0, { buffer: volP }], [1, { buffer: vgBuf }], [2, { buffer: stateBuf }], [3, { buffer: sfcBuf }], [6, densTex.createView()], [7, densPrev.createView()]]);
   const bLight = bgOf(pLight, [[0, { buffer: volP }], [1, { buffer: vgBuf }], [2, { buffer: stateBuf }], [7, densTex.createView()], [8, groundTex.createView()], [9, sClamp], [10, lightTex.createView()]]);
   const p3 = device.createRenderPipeline({
@@ -471,7 +473,7 @@ async function init() {
     // roślinność z klimatu (szerokość, kontynentalizm, wilgotność klimatu) i wysokości terenu
     const veg = new Float32Array(NXY);
     for (let c = 0; c < NXY; c++) {
-      veg[c] = biome(sim.land.cls[c], latRow(c), num('cont'), num('hum'), sim.h[c]);
+      veg[c] = biome(sim.land.cls[c], latRow(c), num('cont'), num('hum'), sim.h[c], cellRnd(c));
       if (sim.vmask && sim.land.cls[c] !== 3 && c % NX < NXV && c < NYV * NX) {
         const pv = sim.vmask[Math.floor(c / NX) * NXV + c % NX];
         if (pv >= 0) veg[c] = pv;
@@ -480,6 +482,7 @@ async function init() {
       if (veg[c] === VEG.STEPPE) sim.land.w[c] = Math.min(sim.land.w[c], 0.3);
     }
     sim.veg = veg;
+    if (sim.lcHi) { clearTimeout(sim.vegHiT); sim.vegHiT = setTimeout(buildVegHi, 300); }
     device.queue.writeBuffer(vgBuf, grid.off.LAND * 4, sim.land.cls);
     device.queue.writeBuffer(vgBuf, grid.off.VEG * 4, veg);
     device.queue.writeBuffer(vgBuf, grid.off.RCV * 4, flowNet());     // ujścia do jezior i morza
@@ -511,6 +514,7 @@ async function init() {
   const tgW = (a) => { const u = Math.min(1, Math.max(0, a)); return [0.5 * (1 - u) * (1 - u), 0.5 + u - u * u, 0.5 * u * u]; };
   const drv = { mode: 'syn', seed: 1 + Math.floor(Math.random() * 1e6), key: '', start: null, model: null,
     tA: 0, slot: 0, pg0: null, cls: null, fc: [], fcModel: null, synDirty: false, lastDraw: 0 };
+  const cellRnd = (c) => (Math.imul(c + 1, 2654435761) >>> 0) / 4294967296;   // stała liczba losowa oczka 0…1 (pas lasu mieszanego)
   const climKey = () => [num('lat'), num('cont'), num('hum'), dayOfYear($('date').value), drv.seed, $('location').value === 'custom' ? num('lon') : 'x', num('tbias'), num('hour'), MANIP_VAR[num('manipV')]].join('|');
   // Manipulacja atmosfery (zakładka Weather, strona tytułowa): T – anomalia temperatury [K], R – mnożnik opadu, V – zmienność pogody. Przy starcie działa od razu
   // (stan początkowy, rozbieg modelu synoptycznego), a zmiana w trakcie przebiegu wchodzi liniowo przez wybrany czas (odcinek from → to w t0…t1). Ten sam odcinek
@@ -1252,6 +1256,7 @@ async function init() {
     device.queue.submit([enc.finish()]);
     device.queue.writeBuffer(workBuf, 0, new Float32Array(5 * N));
     device.queue.writeBuffer(workBuf, (W_MSC + 4 + 4 * CFG.MEB + 2 * NZ) * 4, new Float32Array(2 * CFG.MEB));   // średnia dobowa odchyłki θ i q_v
+    device.queue.writeBuffer(workBuf, (W_MUV + 2 * NZ) * 4, new Float32Array(1));                              // średni strumień ciepła z gruntu
     // powierzchnia: temperatura gruntu = lokalna temperatura powietrza przy gruncie
     const sf = new Float32Array(NSF * NXY);
     const water = num('water') + 273.15;
@@ -1503,6 +1508,10 @@ async function init() {
     return { id, ...rangeFor(id, lo, hi, { contrast: Math.pow(2, -num('range')), hmax: sim.hmax, nIso: v.mode === 1 ? 20 : 8, vertical: v.mode === 1 }) };
   }
 
+  // Jesień do kolorów drzew: od ~18 VIII (58 dób po przesileniu letnim) do końca grudnia, na półkuli S pół roku później. Na przełomie zieleń jest pełna albo prawie zerowa
+  // (poza zimnymi miejscami w sierpniu), więc przejście nie jest widoczne. Żółkną wtedy tylko drzewa, które naprawdę tracą zieleń (fenologia w jądrze surface)
+  const leafAut = (doy) => { const d = (((doy - 172 - (num('lat') < 0 ? 182.5 : 0)) % 365) + 365) % 365; return d >= 58 && d < 190 ? 1 : 0; };
+
   function encodeRender(enc) {
     const ck = clock(sim.time);
     const sun = sunVector(num('lat'), ck.doy, ck.hour);
@@ -1527,8 +1536,10 @@ async function init() {
         | ($('windArrows').checked ? 32 : 0) | ($('gridLines').checked ? 64 : 0);
       f[18] = (performance.now() / 1000) % 1000;            // czas do migania błyskawic
       f[19] = cuc.ph; f[27] = cuc.nx; f[28] = cuc.ny; f[29] = cuc.N[0]; f[30] = cuc.N[1]; f.set(cuc.D, 36); f.set(cuc.D2, 36 + 144);   // zegar i przesunięcie wzoru cumulusów (cuGen)
+      f[34] = leafAut(ck.doy);
       f[31] = sim.time - mon.t0; f[32] = mon.days; f[33] = monLive() ? 1 : 0;   // analizy klimatyczne: sam bieżący miesiąc – z liczników
       if (demHiOk()) { f[20] = DEMF; f[21] = sim.demHi.hmax; }        // gęstszy teren do obrazu (loadDemHi)
+      f[35] = vegHiOk() ? DEMF : 0;                                    // gęstsze pokrycie terenu do obrazu (buildVegHi)
       if (v.mode === 0) { f[22] = mz.x; f[23] = mz.y; f[24] = mz.s; } else { f[24] = 1; }   // zoom (tylko mapa)
       f[25] = psumF(r.id);                                    // skala sumy opadu wg okresu (albo miesiąca)
       f[26] = Math.min(10000, Math.max(3000, 2 * CFG.DX)) * (v3.newView ? 1 : Math.max(1, 0.5 * exagAuto * v3.exagMul));   // bok siatki cumulusów jak w 3D
@@ -1567,6 +1578,7 @@ async function init() {
       const wall = performance.now(), gap = wall - (v3.lastWall ?? -1e9);   // widok 3D był wyłączony – tekstura nieaktualna
       // (przy dużym tempie także ≥ 1.5 s rzeczywistego – w trybie MAX 10 min symulacji to ~0.2 s i chmury „wyskakiwały”)
       f[6] = dts < 0 || dts > 6 * 3600 || gap > 1500 ? 1 : Math.min(1, dts / Math.max(600, 1.5 * cuc.rate));
+      f[7] = leafAut(clock(sim.time).doy);
       v3.lastT = sim.time; v3.lastWall = wall;
       device.queue.writeBuffer(volP, 0, ab);
     }
@@ -1817,14 +1829,14 @@ async function init() {
   function selectTab(name, open) {
     document.querySelectorAll('#tabs button').forEach((x) => x.classList.toggle('on', x.dataset.tab === name));
     document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('on', t.dataset.panel === name));
-    if (open !== undefined) document.body.classList.toggle('drawer', open);
+    if (open !== undefined) { document.body.classList.toggle('drawer', open); requestAnimationFrame(() => sim.fitMap && sim.fitMap()); }
     if (name === 'atm') requestAnimationFrame(() => drawSnd(true));
     if (name === 'wx') requestAnimationFrame(() => { wxModeUi(); drawSyn(); drawForecast(); drawPreview(); });
     if (name === 'mon') monTable(true);
     if (name === 'view') { if (layTabCur === 'most') layMostBuild(); layMark(true); }
     savePrefs();
   }
-  const setDrawer = (open) => { document.body.classList.toggle('drawer', open); if (open) selectTab(curTab()); };
+  const setDrawer = (open) => { document.body.classList.toggle('drawer', open); if (open) selectTab(curTab()); requestAnimationFrame(() => sim.fitMap && sim.fitMap()); };
   document.querySelectorAll('#tabs button').forEach((b) => b.addEventListener('click', () => {
     const open = document.body.classList.contains('drawer');
     if (open && b.dataset.tab === curTab()) setDrawer(false);
@@ -1839,12 +1851,16 @@ async function init() {
     savePrefs();
   }
   document.querySelectorAll('#anaSeg button').forEach((b) => b.addEventListener('click', () => selectAna(b.dataset.a)));
-  function setAna(on) {
+  // anaUser – użytkownik sam włączył albo schował panel analiz (przycisk, klawisz A); bez tego na ekranach węższych niż 1500 px panel startuje schowany
+  // (1366 × 768: mapa miała ~650 px szerokości przy 440 px panelu analiz, z otwartą zakładką ~400 px)
+  var anaUser = false;   // (var: savePrefs może ruszyć wcześniej niż ta linia)
+  function setAna(on, user = false) {
+    if (user) anaUser = true;
     document.body.classList.toggle('noana', !on);
     $('anaBtn').classList.toggle('on', on);
     savePrefs();
   }
-  $('anaBtn').onclick = () => setAna(document.body.classList.contains('noana'));
+  $('anaBtn').onclick = () => setAna(document.body.classList.contains('noana'), true);
 
   // --- udogodnienia: komunikaty, pomoc, pełny ekran, zwijane panele, zapamiętane ustawienia widoku ---
   let toastT = 0;
@@ -1867,7 +1883,7 @@ async function init() {
   const PREF_CHECKS = ['tipOn', 'overlay', 'reliefShade', 'reliefIso', 'windArrows', 'cityOn', 'gridLines', 'clLow', 'clMid', 'clHigh', 'v3frz', 'v3cut', 'v3new'];
   function savePrefs() {
     try {
-      const p = { tab: curTab(), layT: layTabCur, layOpen: [...document.querySelectorAll('#layGroups .lygrp.open')].map((g) => g.dataset.g), synView: $('synLevel').value, synO: syn.o, manipOpen: $('manipBox').open, ana: curAna(), anaOn: !document.body.classList.contains('noana'), profMode: sim.profModePref || 'point',
+      const p = { tab: curTab(), layT: layTabCur, layOpen: [...document.querySelectorAll('#layGroups .lygrp.open')].map((g) => g.dataset.g), synView: $('synLevel').value, synO: syn.o, manipOpen: $('manipBox').open, ana: curAna(), anaUser, anaOn: !document.body.classList.contains('noana'), profMode: sim.profModePref || 'point',
         checks: Object.fromEntries(PREF_CHECKS.map((id) => [id, $(id).checked])), cloudAlpha: $('cloudAlpha').value,
         collapsed: [...document.querySelectorAll('.view')].map((v) => v.classList.contains('collapsed')) };
       localStorage.setItem('w3d-ui', JSON.stringify(p));
@@ -1876,7 +1892,9 @@ async function init() {
   function loadPrefs() {
     let p = null;
     try { p = JSON.parse(localStorage.getItem('w3d-ui') || 'null'); } catch (e) { p = null; }
-    if (!p) return;
+    const narrow = window.innerWidth < 1500;
+    if (!p) { if (narrow) setAna(false); return; }
+    anaUser = !!p.anaUser;
     for (const [id, v] of Object.entries(p.checks || {})) if ($(id)) $(id).checked = !!v;
     if (p.cloudAlpha !== undefined) $('cloudAlpha').value = p.cloudAlpha;
     // (anomalia temperatury nie jest zapamiętywana – zawsze start od 0: ustawione kiedyś +6 K zostawało w kolejnych sesjach, cała
@@ -1889,7 +1907,7 @@ async function init() {
     if (p.synO) Object.assign(syn.o, p.synO);
     if (p.manipOpen === false) $('manipBox').open = false;
     synUi();
-    if (p.anaOn === false) setAna(false);
+    if (anaUser ? p.anaOn === false : narrow) setAna(false);
     (p.collapsed || []).forEach((c, n) => { const v = document.querySelectorAll('.view')[n]; if (v) v.classList.toggle('collapsed', !!c); });
     if (p.profMode) sim.profModePref = p.profMode;
   }
@@ -2187,7 +2205,7 @@ async function init() {
     if (st.stations) stations.importList(st.stations);
     applyTerrain();
     applyLand();
-    if ($('shape').value === 'dem' && st.ui.location === 'custom') loadDemHi(...(st.demLL || [num('lat'), num('lon')]));
+    if ($('shape').value === 'dem' && st.ui.location === 'custom') { const ll = st.demLL || [num('lat'), num('lon')]; loadDemHi(...ll).then(() => loadVegHi(...ll)); }
     reset();
     labels();
     drawPreview();
@@ -2343,7 +2361,7 @@ async function init() {
       $('wxMode').value = drv.mode;
       sim.waterUser = js.sim.waterUser;
       rebuildBase();
-      if ($('shape').value === 'dem' && js.st.ui.location === 'custom') loadDemHi(...(js.st.demLL || [num('lat'), num('lon')]));
+      if ($('shape').value === 'dem' && js.st.ui.location === 'custom') { const ll = js.st.demLL || [num('lat'), num('lon')]; loadDemHi(...ll).then(() => loadVegHi(...ll)); }
       // korekta klimatu: normy, próbki i poprawki w węzłach
       ccGen++;
       cc.off = js.cc.off; cc.busy = false;
@@ -2378,7 +2396,8 @@ async function init() {
       const q = device.queue, ok = (a, b) => a && a.byteLength === b.size;
       for (const [n, b] of [['state', stateBuf], ['tmp', tmpBuf]]) q.writeBuffer(b, 0, await read(n));
       const wk = await read('work');
-      if (ok(wk, workBuf)) q.writeBuffer(workBuf, 0, wk);
+      // (plik sprzed W_HM ma bufor krótszy o jedną liczbę na końcu – reszta zostaje, strumień liczy się od zera)
+      if (ok(wk, workBuf) || (wk && wk.byteLength + 4 === workBuf.size)) q.writeBuffer(workBuf, 0, wk);
       const sf0 = await read('sfc'), sf = new Float32Array(NSF * NXY);
       js.sfcNames.forEach((n, i) => { if (n in S) sf.set(sf0.subarray(i * NXY, (i + 1) * NXY), S[n] * NXY); });
       q.writeBuffer(sfcBuf, 0, sf);
@@ -2611,6 +2630,7 @@ async function init() {
       if (!sim.demLL || sim.demLL[0] !== lat || sim.demLL[1] !== lon) return;     // w międzyczasie inne miejsce
       device.queue.writeBuffer(demHiBuf, 0, d.h);
       sim.demHi = { lat, lon, hmax: d.hmax, h: d.h };
+      if (sim.lcHi) buildVegHi();
     } catch (e) { console.warn(`detailed terrain for the image: ${e.message}`); }
   }
   // wysokość prawdziwego terenu w punkcie (x, y – oczka siatki obliczeniowej, ułamkowo): gęstszy DEM dwuliniowo, bez niego grunt
@@ -2651,6 +2671,52 @@ async function init() {
     }
     return { xkm: (best.x - MG) * CFG.DX / 1000, ykm: (best.y - MG) * CFG.DY / 1000, z: best.z };
   }
+  // Gęstsze pokrycie terenu tylko do obrazu: typ powierzchni w każdym punkcie gęstszego terenu (DEMF × DEMF na oczko) z klasy ESA WorldCover w tym punkcie
+  // i tą samą regułą biomów co model (climate.js biome), z wysokości gęstszego terenu – granica lasu, hale i las iglasty idą po stokach, nie po kwadratach
+  // oczek. Goły grunt i skały (WorldCover 60) poza pustynią i stepem – skały (12), śnieg i lód – lodowiec. Oczka pomalowane pędzlem typu – typ oczka.
+  // Model liczy dalej na oczku (parametry podłoża i tak uśrednione z 5 × 5 oczek); bez mapy pokrycia (bez sieci, teren losowy) – obraz z oczek
+  function buildVegHi() {
+    sim.vegHi = null;
+    const L = sim.lcHi;
+    if (!L || DEMF < 2 || !sim.veg) return;
+    const W = NXD * DEMF, H = NYD * DEMF, WV = NXV * DEMF, out = new Uint8Array(Math.ceil(W * H / 4) * 4);
+    const dh = sim.demHi && sim.demHi.lat === L.lat && sim.demHi.lon === L.lon ? sim.demHi.h : null;
+    const cont = num('cont'), hum = num('hum');
+    const hash = (i, j) => { let h = (i * 73856093) ^ (j * 19349663) ^ 0x5bd1e995; h = Math.imul(h ^ (h >>> 15), 2246822519); h ^= h >>> 13; return ((h >>> 0) % 10007) / 10007; };
+    for (let j = 0; j < H; j++) {
+      const lat = L.lat + ((j + 0.5) / DEMF - NYD / 2) * CFG.DY / 111320, cj = Math.floor(j / DEMF);
+      for (let i = 0; i < W; i++) {
+        // (mapa pokrycia pobrana dla domeny liczonej NXV × NYV – widoczna przesunięta o margines MG; maska pędzla też w NXV)
+        const ci = Math.floor(i / DEMF), c = (cj + MG) * NX + ci + MG, k = L.d[(j + MG * DEMF) * WV + i + MG * DEMF];
+        const painted = sim.vmask && sim.vmask[(cj + MG) * NXV + ci + MG] >= 0;
+        let v;
+        if (k === 255 || painted) v = sim.veg[c];
+        else {
+          const h = dh ? Math.max(0, dh[j * W + i]) : sim.h[c];
+          if (k === 3) v = VEG.WATER;
+          else if (k === 6) v = VEG.GLACIER;
+          else {
+            v = biome(k === 1 ? 1 : k === 2 ? 2 : 0, lat, cont, hum, h, hash(i, j));
+            if (k === 5 && v !== VEG.DESERT && v !== VEG.STEPPE) v = 12;
+          }
+        }
+        out[j * W + i] = v;
+      }
+    }
+    device.queue.writeBuffer(vegHiBuf, 0, out);
+    sim.vegHi = { lat: L.lat, lon: L.lon };
+  }
+  // (przy zapisanym stanie i wczytanym przebiegu: sama gęsta mapa do obrazu w tle – maska pokrycia modelu jest w stanie)
+  async function loadVegHi(lat, lon) {
+    if (DEMF < 2) return;
+    try {
+      const lc = await fetchLandCover(lat, lon, NXV, NYV, CFG.DX, null, DEMF);
+      if (!sim.demLL || sim.demLL[0] !== lat || sim.demLL[1] !== lon || !lc.hi) return;
+      sim.lcHi = { lat, lon, d: lc.hi };
+      buildVegHi();
+    } catch (e) { console.warn(`detailed land cover for the image: ${e.message}`); }
+  }
+  function vegHiOk() { return !!sim.vegHi && $('shape').value === 'dem' && !!sim.demLL && sim.vegHi.lat === sim.demLL[0] && sim.vegHi.lon === sim.demLL[1]; }
   function demHiOk() { return !!sim.demHi && $('shape').value === 'dem' && !!sim.demLL && sim.demHi.lat === sim.demLL[0] && sim.demHi.lon === sim.demLL[1]; }
   function applyDem(t, lat, lon, c) {
     $('lat').value = lat.toFixed(2); $('lon').value = lon.toFixed(3);
@@ -2680,8 +2746,9 @@ async function init() {
   // biom (tajga, las liściasty, step, pustynia…) dalej z klimatu i wysokości. Bez sieci zostaje mozaika.
   // maxMs > 0 – najwyżej tyle czekania (dane, które przyjdą później, nie są już używane)
   async function applyLandCover(lat, lon, onProgress = status, maxMs = 0) {
+    let load = null;
     try {
-      const load = fetchLandCover(lat, lon, NXV, NYV, CFG.DX, onProgress);
+      load = fetchLandCover(lat, lon, NXV, NYV, CFG.DX, onProgress, DEMF);
       const lc = await (maxMs ? Promise.race([load, new Promise((_, no) => setTimeout(() => no(new Error('no answer')), maxMs))]) : load);
       const n = NXV * NYV;
       sim.lmask = new Int8Array(n).fill(-1);
@@ -2702,13 +2769,24 @@ async function init() {
         sim.lmask[c] = k; if (k === 1) nf++; if (k === 2) nu++;
         sim.lwet[c] = lc.wet[c];
       }
+      sim.lcHi = lc.hi ? { lat, lon, d: lc.hi } : null;
       applyTerrain(); applyLand();
+      buildVegHi();
       const pc = (x) => Math.round(100 * x / Math.max(nv, 1));
       window.__lcStats = { las: pc(nf), zabudowa: pc(nu), wody: pc(nl), oczek: nv, depresje: nd };
       toast(`Land cover (ESA WorldCover): forest ${pc(nf)}%, urban ${pc(nu)}%, inland water ${pc(nl)}%`);
       return true;
     } catch (e) {
       toast(`Land cover: ${e.message} – keeping the mosaic`);
+      // za długo przy starcie (duża domena, wolna sieć): model zostaje z mozaiką, a mapa, która przyjdzie później, idzie tylko do obrazu (jak przy wczytanym stanie)
+      if (load && e.message === 'no answer') {
+        load.then((lc) => {
+          if (!lc.hi || !sim.demLL || sim.demLL[0] !== lat || sim.demLL[1] !== lon) return;
+          sim.lcHi = { lat, lon, d: lc.hi };
+          buildVegHi();
+          toast('Detailed land cover arrived – shown on the maps (the model keeps the mosaic)');
+        }).catch(() => {});
+      }
       return false;
     }
   }
@@ -2851,7 +2929,7 @@ async function init() {
         sim.vmask[c] = veg;
         sim.lmask[c] = cls;
         sim.land.cls[cc] = cls;
-        sim.veg[cc] = veg >= 0 ? veg : biome(cls, latRow(cc), num('cont'), num('hum'), sim.h[cc]);
+        sim.veg[cc] = veg >= 0 ? veg : biome(cls, latRow(cc), num('cont'), num('hum'), sim.h[cc], cellRnd(cc));
         any = true;
       }
     }
@@ -3086,15 +3164,40 @@ async function init() {
   sim.fitScale = fitScale;
   // mapa wpisana w dostępne miejsce z zachowaniem proporcji domeny (widok 3D – całe pole); warstwy nad mapą
   // (sonda, stacje, dymek, skala) leżą w #mapInner o rozmiarze płótna
+  // Wskaźniki na górnym pasku: te, które się nie mieszczą, chowane po kolei od najmniej ważnych (wcześniej pole ucinało pierwszy z lewej –
+  // przy 1366 px „0.5 °C” zamiast zakresu T 2 m). Tempo symulacji zostaje zawsze (licznik wydajności)
+  const CHIP_ORDER = ['chipGpuBox', 'chipScaleBox', 'chipAirBox', 'chipRainBox', 'chipCloudBox', 'chipT2Box'];
+  function fitChips() {
+    const box = $('chips');
+    for (const id of CHIP_ORDER) $(id).style.display = '';
+    // (szerokość z samych wskaźników: przy wyrównaniu do prawej nadmiar wychodzi w lewo i scrollWidth go nie widzi)
+    const need = () => { const v = [...box.children].filter((c) => c.style.display !== 'none' && c.offsetWidth > 0); return v.reduce((sum, c) => sum + c.offsetWidth, 0) + 6 * Math.max(v.length - 1, 0); };
+    for (const id of CHIP_ORDER) { if (need() <= box.clientWidth) break; $(id).style.display = 'none'; }
+  }
+  window.addEventListener('resize', fitChips);
   function fitMap() {
     const box = $('mapBox'), W = box.clientWidth, H = box.clientHeight;
     if (!W || !H) return;
-    let w = W, h = H;
-    if (!v3.on) { const r = NXD / NYD; if (W / H > r) w = H * r; else h = W / r; }
-    $('mapInner').style.width = `${Math.floor(w)}px`;
-    $('mapInner').style.height = `${Math.floor(h)}px`;
-    // mapa lekko w prawo od środka: 5% szerokości pola, najwyżej tyle, ile jest wolnego miejsca; na pełnym ekranie na środku
-    $('mapInner').style.left = document.fullscreenElement ? '0' : `${Math.round(Math.min((W - Math.floor(w)) / 2, 0.05 * W))}px`;
+    const fit = (Wa) => { let w = Wa, h = H; if (!v3.on) { const r = NXD / NYD; if (Wa / H > r) w = H * r; else h = Wa / r; } return [Math.floor(w), Math.floor(h)]; };
+    // otwarty panel zakładki zasłania lewą część pola mapy (dawniej ~130 px mapy i legendy pod nim przy 1920 px, przy wolnym miejscu po prawej):
+    // mapa mieści się obok niego, jeśli traci przez to najwyżej ~25% wielkości; inaczej przesuwa się najdalej w prawo, jak się da
+    let ov = 0;
+    const s = $('side');
+    if (document.body.classList.contains('drawer') && !document.fullscreenElement && s.offsetParent) {
+      ov = Math.max(0, Math.min(W, s.offsetParent.getBoundingClientRect().left + s.offsetLeft + s.offsetWidth + 8 - box.getBoundingClientRect().left));
+    }
+    let [w, h] = fit(W), A;
+    if (document.fullscreenElement) A = (W - w) / 2;
+    else if (ov > 0) {
+      const [w2, h2] = fit(W - ov);
+      if (w2 >= 0.75 * w) { w = w2; h = h2; A = ov + (W - ov - w) / 2 + Math.min((W - ov - w) / 2, 0.05 * (W - ov)); }
+      else A = Math.min(Math.max(ov, (W - w) / 2), W - w);
+    } else A = (W - w) / 2 + Math.min((W - w) / 2, 0.05 * W);    // lekko w prawo od środka: 5% szerokości pola, najwyżej tyle, ile jest wolnego miejsca
+    $('mapInner').style.width = `${w}px`;
+    $('mapInner').style.height = `${h}px`;
+    $('mapInner').style.left = `${Math.round(A - (W - w) / 2)}px`;      // (pole wyśrodkowane – left to przesunięcie od środka)
+    // nagłówek z legendą też wychodzi spod panelu
+    $('mapHead').style.paddingLeft = ov > 0 && !document.fullscreenElement ? `${Math.round(Math.min(ov, W * 0.6))}px` : '';
   }
   sim.fitMap = fitMap;
   new ResizeObserver(fitMap).observe($('mapBox'));
@@ -3120,7 +3223,7 @@ async function init() {
     else if (e.key === 's' || e.key === 'S') setProfMode(profMode === 'point' ? 'mean' : 'point');
     else if (e.key === 'w' || e.key === 'W') { $('windArrows').checked = !$('windArrows').checked; savePrefs(); }
     else if (e.key === 'h' || e.key === 'H' || e.key === '?') showHelp(!$('helpDlg').classList.contains('on'));
-    else if (e.key === 'a' || e.key === 'A') setAna(document.body.classList.contains('noana'));
+    else if (e.key === 'a' || e.key === 'A') setAna(document.body.classList.contains('noana'), true);
     else if (e.key === 'm' || e.key === 'M') setDrawer(!document.body.classList.contains('drawer'));
     else if (e.key === 'Escape') { if ($('sndFull').classList.contains('on')) sndFull(false); else { showHelp(false); setDrawer(false); } }
     else if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
@@ -3213,7 +3316,8 @@ async function init() {
       if (fd.cmap === 31) { lo = ''; hi = ''; ticks = []; note = `Surface type, left to right: ${VEG_NAMES.join(' · ')}`; }
       if (fd.cmap === 16) note += ' – dark: dry air (subsidence), light: moist upper troposphere and high clouds';
       if (fd.cmap === 30) { lo = 'stationary · warm'; hi = 'sharp cold'; ticks = [[0, 1 / 2], [1, 3 / 4]]; note = 'Surface fronts (axis from the synoptic model, sharpened in the domain and bent by the flow): purple – stationary (wind along the front), red – warm, light blue – gentle cold (wide precipitation band), navy – sharp cold (sudden temperature drop, lift line, possible squall line); background – T 2 m'; }
-      if (r.id === 37) { lo = 'none'; hi = 'dense'; ticks = []; note += ` – low (< ${fmZ(2)}) orange, middle (${fmZ(2)} – ${fmZ(6)}) green, high (> ${fmZ(6)}) blue`; }
+      // (trzy kolory pięter, każdy od braku chmur do gęstych – nie skala koloru satelity)
+      if (r.id === 37) { el.querySelector('.bar').style.background = 'linear-gradient(90deg, rgb(90,90,90) 0%, rgb(255,158,56) 33.3%, rgb(90,90,90) 33.3%, rgb(89,217,102) 66.6%, rgb(90,90,90) 66.6%, rgb(140,199,255) 100%)'; lo = 'low'; hi = 'high'; ticks = []; note += ` – low (< ${fmZ(2)}) orange, middle (${fmZ(2)} – ${fmZ(6)}) green, high (> ${fmZ(6)}) blue; each colour from none (grey) to dense`; }
       else if (fd.cmap === 9) { lo = 'ground'; hi = 'clouds'; ticks = []; note += ' – visible light, dark at night'; }
       if (fd.cmap === 10) {
         const hd = toD(sim.hmax, 'm');
@@ -3869,6 +3973,8 @@ async function init() {
     stop() { sim.halted = true; },
     // pełny zapis przebiegu: stan gotowy, plik, sumy kontrolne buforów (testy)
     ready() { return !sim.busy; },
+    // gęstszy teren i pokrycie do obrazu wczytane (testy zrzutów)
+    hiInfo: () => ({ dem: demHiOk(), veg: vegHiOk(), F: DEMF }),
     runBlob(onProgress) { return buildRunFile(onProgress); },
     stashRun, resumeUrl, openRun,
     async fingerprint() {
@@ -4319,12 +4425,18 @@ async function init() {
     if (cv.width !== W || cv.height !== H) { cv.width = W; cv.height = H; }
     const ctx = cv.getContext('2d');
     ctx.clearRect(0, 0, W, H);
-    if (drv.mode !== 'syn' || !drv.fc.length) return;
+    // (dopóki kopia modelu synoptycznego nie policzy prognozy, napis zamiast pustego prostokąta)
+    const fcWait = () => {
+      const ahead = drv.fcModel ? Math.max(0, (drv.fcModel.time - drv.start.time - sim.time) / 86400) : 0;
+      ctx.font = `${Math.round(12 * dpr)}px system-ui`; ctx.fillStyle = '#a2a7c0'; ctx.textAlign = 'center';
+      ctx.fillText(drv.mode === 'syn' ? `Forecast is being computed… ${Math.min(ahead, 7).toFixed(1)} of 7 days ready` : 'Forecast only with the synoptic model', W / 2, H / 2);
+    };
+    if (drv.mode !== 'syn' || !drv.fc.length) { fcWait(); return; }
     fcClamp();
     const t0 = fcStart() + fcv.a, t1 = t0 + fcv.span;
     // zakres osi z tego, co widać: po powiększeniu krzywe zajmują całą wysokość
     const rec = drv.fc.filter((r) => r.t >= t0 - 3 * 3600 && r.t <= t1 + 3 * 3600);
-    if (rec.length < 2) return;
+    if (rec.length < 2) { fcWait(); return; }
     const L = FC_MARGIN * dpr, R = FC_MARGIN * dpr, T = 8 * dpr, B = 26 * dpr;
     const X = (t) => L + (t - t0) / (t1 - t0) * (W - L - R);
     let pmin = Math.min(...rec.map((r) => r.p)), pmax = Math.max(...rec.map((r) => r.p));
@@ -4879,6 +4991,7 @@ async function init() {
       $('chipRain').textContent = st ? fm(st[15], 'mm/h', 1) : '–';
       $('chipSpeed').textContent = sim.paused ? 'paused' : `${simPerReal.toFixed(0)}×`;
       $('chipGpu').textContent = sim.msPerStep ? `${sim.msPerStep.toFixed(1)} ms/step` : '–';
+      fitChips();
       $('perf').textContent = [
         `speed            ${simPerReal.toFixed(0)}×, one day = ${isFinite(dayMin) ? dayMin.toFixed(1) + ' min' : '—'}`,
         `GPU per step     ${sim.msPerStep ? sim.msPerStep.toFixed(2) + ' ms' : '—'}${ts ? '' : ' (est.)'}${sim.flat ? '' : ' (terrain)'}`,

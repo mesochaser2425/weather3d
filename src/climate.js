@@ -41,7 +41,7 @@ export const VEG_NAMES = ['fields and meadows', 'deciduous / mixed forest', 'tai
   'maquis / sclerophyll forest'];
 
 // Biom w kolumnie z klimatu i wysokości. landClass: 0 otwarte (pola), 1 las, 2 zabudowa, 3 woda.
-export function biome(landClass, lat, cont, hum, h) {
+export function biome(landClass, lat, cont, hum, h, r = 0.5) {
   if (landClass === 3) return VEG.WATER;
   if (landClass === 2) return VEG.URBAN;
   const c = climate(lat, 200, cont, h);
@@ -52,7 +52,9 @@ export function biome(landClass, lat, cont, hum, h) {
   if (hum < 0.4) return forest && hum > 0.3 ? VEG.SCLERO : VEG.STEPPE;
   if (c.tAnn > 22) return forest && hum > 0.6 ? VEG.RAINFOREST : VEG.SAVANNA;
   if (c.tAnn > 15 && hum < 0.6) return forest ? VEG.SCLERO : VEG.STEPPE;
-  if (c.tAnn < 3) return forest ? VEG.TAIGA : VEG.GRASS;
+  // Las iglasty z temperatury rocznej, a przez nią z wysokości: poniżej 5.5 °C większość drzew iglasta (Zakopane ~5.9 °C, regiel górny), do 7.5 °C pas mieszany –
+  // coraz więcej oczek liściastych (r – stała liczba losowa oczka). Wcześniej dopiero poniżej 3 °C: lasy wokół Tatr wychodziły liściaste
+  if (forest && c.tAnn < 7.5 && (c.tAnn < 5.5 || r > (c.tAnn - 5.5) / 2)) return VEG.TAIGA;
   return forest ? VEG.DECID : VEG.GRASS;
 }
 

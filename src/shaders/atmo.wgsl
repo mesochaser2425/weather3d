@@ -118,10 +118,11 @@ fn stepInt(ext: vec3f, ds: f32) -> vec3f {
 }
 
 // albedo podłoża (realne odbicie: trawa ~0.15, las ~0.05–0.1, śnieg ~0.85): typ roślinności, jej zieleń i śnieg
-fn vegCol(v: u32, g: f32) -> vec3f {
+fn vegCol(v: u32, g0: f32) -> vec3f {
+  let g = abs(g0);
   switch v {
     case 0u: { return mix(vec3f(0.22, 0.20, 0.14), vec3f(0.11, 0.16, 0.06), g); }
-    case 1u: { return mix(vec3f(0.09, 0.08, 0.065), vec3f(0.045, 0.10, 0.035), g); }
+    case 1u: { return 0.31 * mix(leafCol(g0), vec3f(0.09, 0.20, 0.12), 0.3 * (1.0 - g)); }
     case 2u: { return vec3f(0.03, 0.065, 0.04); }
     case 3u: { return mix(vec3f(0.20, 0.18, 0.15), vec3f(0.14, 0.16, 0.10), g); }
     case 4u: { return vec3f(0.80, 0.83, 0.87); }
