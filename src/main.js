@@ -8,7 +8,7 @@ import { PEModel, DTQ, NXP, NYP, DXP, LXP, LYP, classifyCenter, nestNodes, sstCl
 import { parVec, paramGrid, paramAt, airTz, embed } from './nesting.js';
 import { sunVector, dayOfYear, dateFromDoy, moonSky } from './sun.js';
 import { FIELDS, FIELDS_3D, FIELDS_MAP, LAYER_GROUPS, rangeFor, legendCss, RADAR_STEPS, ACC_STEPS, ACC_WGSL, legendTicks, niceStep } from './fields.js';
-import { WXS, WX_CMAP0, WX_WGSL, WX_INDEX, wxTicks, wxColor, wxLegendCss } from './wxscales.js';
+import { WXS, WX_CMAP0, WX_WGSL, WX_INDEX, wxTicks, wxColor, wxLegendCss, wxOf } from './wxscales.js';
 const tempColor = (t) => wxColor('temp', t);
 const radarColor = (r) => wxColor('prate', r);
 import { drawProfile, drawMeteogram, newView, attachView, MET_L, MET_R } from './profile.js';
@@ -31,7 +31,7 @@ const SLOT = 256;           // odstęp slotów parametrów w buforze uniform (wy
 const WG = 256;
 const CG_ITERS = (+new URLSearchParams(location.search).get('cg')) || 4;   // iteracje gradientów sprzężonych na krok (tylko z terenem; z FFT 4 wystarczą – błąd ~2e-7 1/s; test: ?cg=20)
 const PARAM_BYTES = 144;
-const VIEW_BYTES = 144 + 2 * 576;   // + przesunięcie wzoru cumulusów (36 kafli × vec4): wiatr warstwy cumulusów i średni 0–6 km
+const VIEW_BYTES = 144 + 3 * 576;   // + przesunięcie wzoru cumulusów (36 kafli × vec4): wiatr warstwy cumulusów i średni 0–6 km; funkcja prądu do ulic chmur
 // zoom mapy: powiększenie s (1 = cała mapa, ≤ 16) i lewy górny róg okna widoku (x, y – ułamek domeny, y w dół)
 const mz = { s: 1, x: 0, y: 0 };
 const STATS_BYTES = 64;
@@ -92,7 +92,7 @@ async function init() {
   const g3 = document.createElement('optgroup'); g3.label = 'Surface maps';
   for (const id of FIELDS_MAP) {
     const o = new Option(fieldOpt(id), id);
-    o.hidden = id >= 80 && id <= 88;           // mapy miesięczne – wybierane w zakładce Miesiące (krótsza lista)
+    o.hidden = id >= 80 && id <= 90;           // mapy miesięczne – wybierane w zakładce Miesiące (krótsza lista)
     g3.appendChild(o);
   }
   const g4 = document.createElement('optgroup'); g4.label = 'Horizontal section at height';
@@ -127,7 +127,7 @@ async function init() {
   const tmpBuf = buf(STATE_LEN * 4, U.STORAGE | U.COPY_DST | U.COPY_SRC, 'tmp');
   const W_MSC = W_MEAN + 4 * NZ + 8 * NPART;
   const W_MUV = W_MSC + 4 + 6 * CFG.MEB + 2 * NZ;      // średni wiatr na poziomach (2 · NZ), sondaż średniej domeny
-  const workBuf = buf((W_MUV + 2 * NZ + 1) * 4, U.STORAGE | U.COPY_DST | U.COPY_SRC, 'work');   // + W_HM (średni strumień ciepła z gruntu)
+  const workBuf = buf((W_MUV + 2 * NZ + 1 + 32 * 16 + 4) * 4, U.STORAGE | U.COPY_DST | U.COPY_SRC, 'work');   // + W_HM (średni strumień ciepła z gruntu) + burze trybu lekkiego
   const cxBuf = buf(2 * N * 8, U.STORAGE, 'complex');
   const vgBuf = buf(grid.data.byteLength, U.STORAGE | U.COPY_DST | U.COPY_SRC, 'vgrid');
   const statsBuf = buf(STATS_BYTES, U.STORAGE | U.COPY_SRC | U.COPY_DST, 'stats');
@@ -192,6 +192,10 @@ async function init() {
     if (it < CG_ITERS - 1) iters.push(...precond, one('cg_beta'), K('cg_p', N));
   }
   const seqTerrain = [...head, ...precond, one('cg_rz0'), K('cg_p', N), ...iters, K('project', T_OFF)];
+  if (CFG.LITE) $('brandLite').hidden = false;
+  // tryb lekki: diagnostyka konwekcji (cumulus: CAPE, MUCAPE, ścinanie, SRH, ruch burz – z profilu poprzedniego kroku; jego zmiany w atmosferze nadpisuje
+  // lite_col), atmosfera z pól docelowych + kolumna (lite_col), potem zwykłe jądro powierzchni (grunt, śnieg, diagnostyka map i stacji)
+  const seqLite = CFG.LITE ? [K('cumulus', NXY, 64), one('lite_storm'), K('lite_col', NXY, 64), K('surface', NXY, 64), K('route', NXY, 64)] : null;
   const statsPipe = K('stats_k', N);
   const tgtBuild = K('tgt_build', NXY, 64);
   // wiatr docelowy bez części rozbieżnej (2D na każdym poziomie)
@@ -211,10 +215,17 @@ async function init() {
   const demHiBuf = buf(Math.max(16, DEMF >= 2 ? NXD * NYD * DEMF * DEMF * 4 : 16), U.STORAGE | U.COPY_DST, 'demHi');
   // gęstsze pokrycie terenu tylko do obrazu (satelita, „Surface type”): typ powierzchni w tych samych punktach co gęstszy teren, 1 bajt na punkt
   const vegHiBuf = buf(Math.max(16, DEMF >= 2 ? Math.ceil(NXD * NYD * DEMF * DEMF / 4) * 4 : 16), U.STORAGE | U.COPY_DST, 'vegHi');
+  // szum 3D (Perlin–Worley, Worley, Perlin; vol.wgsl noise_gen) – faktura chmur na satelicie i detal chmur w widoku 3D
+  const NOISE_N = 128, NOISE_MIPS = 8;
+  const noiseTex = device.createTexture({ size: [NOISE_N, NOISE_N, NOISE_N], dimension: '3d', format: 'rgba8unorm', mipLevelCount: NOISE_MIPS, usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING, label: 'noise' });
+  const sRep = device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'repeat', addressModeV: 'repeat', addressModeW: 'repeat' });
+  const sRepMip = device.createSampler({ magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear', addressModeU: 'repeat', addressModeV: 'repeat', addressModeW: 'repeat' });
   const renderLayout = device.createBindGroupLayout({
     entries: [
       { binding: 0, visibility: F, buffer: { type: 'uniform' } },
       ...[1, 2, 3, 4, 5, 6].map((b) => ({ binding: b, visibility: F, buffer: { type: 'read-only-storage' } })),
+      { binding: 7, visibility: F, texture: { sampleType: 'float', viewDimension: '3d' } },
+      { binding: 8, visibility: F, sampler: { type: 'filtering' } },
     ],
   });
   const renderPipe = device.createRenderPipeline({
@@ -232,7 +243,8 @@ async function init() {
     const ubuf = buf(VIEW_BYTES, U.UNIFORM | U.COPY_DST, 'view');
     const bg = device.createBindGroup({
       layout: renderLayout,
-      entries: [ubuf, vgBuf, stateBuf, workBuf, sfcBuf, demHiBuf, vegHiBuf].map((b, i) => ({ binding: i, resource: { buffer: b } })),
+      entries: [...[ubuf, vgBuf, stateBuf, workBuf, sfcBuf, demHiBuf, vegHiBuf].map((b, i) => ({ binding: i, resource: { buffer: b } })),
+        { binding: 7, resource: noiseTex.createView() }, { binding: 8, resource: sRepMip }],
     });
     return { ...v, ctx, ubuf, bg };
   });
@@ -245,10 +257,9 @@ async function init() {
   // a przy dużym tempie dłuższy (4 s rzeczywiste × tempo) – chmura żyje na ekranie ≥ ~2 s; podczas pauzy wzór stoi.
   // Przesunięcie pokoleń D (vec4 na kafel: pokolenie 0 – xy, 1 – zw) = całka z wiatru warstwy chmur (pola CWU/CWV) uśrednionego
   // na kafle ~40 km; okres ograniczony tak, żeby różnica przesunięć sąsiednich kafli w czasie życia ≤ ~80% ich odległości (bez zawijania wzoru)
-  const cuc = { ph: 0, Te: 1800, rate: 0, nx: 1, ny: 1, U: new Float32Array(72), D: new Float32Array(144), U2: new Float32Array(72), D2: new Float32Array(144), N: new Float32Array(4), gen: [NaN, NaN], sfcT: null, gmax: 0 };
+  const cuc = { ph: 0, Te: 1800, rate: 0, nx: 1, ny: 1, U: new Float32Array(72), D: new Float32Array(144), U2: new Float32Array(72), D2: new Float32Array(144), N: new Float32Array(4), W: new Float32Array(144), Ws: new Float32Array(144), wT: 0, Pt: new Float64Array(36), gen: [NaN, NaN], sfcT: null, gmax: 0 };
   const TU = GPUTextureUsage;
   const tex3 = (w, h, d, fmt, label) => device.createTexture({ size: [w, h, d], dimension: '3d', format: fmt, usage: TU.STORAGE_BINDING | TU.TEXTURE_BINDING, label });
-  const noiseTex = tex3(64, 64, 64, 'rgba8unorm', 'noise');
   const densTex = device.createTexture({ size: [NXD, NYD, NZ], dimension: '3d', format: 'rgba16float', usage: TU.STORAGE_BINDING | TU.TEXTURE_BINDING | TU.COPY_SRC, label: 'dens' });
   const densPrev = device.createTexture({ size: [NXD, NYD, NZ], dimension: '3d', format: 'rgba16float', usage: TU.TEXTURE_BINDING | TU.COPY_DST, label: 'densPrev' });
   const lightTex = tex3(NXD, NYD, NZ, 'rgba16float', 'light');
@@ -261,11 +272,12 @@ async function init() {
   const volP = buf(32, U.UNIFORM | U.COPY_DST, 'volP');
   const v3U = buf(160 + 2 * 576, U.UNIFORM | U.COPY_DST, 'v3U');
   const sClamp = device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge', addressModeW: 'clamp-to-edge' });
-  const sRep = device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'repeat', addressModeV: 'repeat', addressModeW: 'repeat' });
   const cpipe = (entry) => device.createComputePipeline({ layout: 'auto', compute: { module: volModule, entryPoint: entry } });
   const pNoise = cpipe('noise_gen'), pGround = cpipe('ground_build'), pVol = cpipe('vol_build'), pLight = cpipe('vol_light');
   const bgOf = (p, entries) => device.createBindGroup({ layout: p.getBindGroupLayout(0), entries: entries.map(([b, r]) => ({ binding: b, resource: r })) });
-  const bNoise = bgOf(pNoise, [[4, noiseTex.createView()]]);
+  const noiseLevel = (l) => noiseTex.createView({ baseMipLevel: l, mipLevelCount: 1 });
+  const bNoise = bgOf(pNoise, [[4, noiseLevel(0)]]);
+  const pNoiseMip = cpipe('noise_mip');
   const bGround = bgOf(pGround, [[0, { buffer: volP }], [1, { buffer: vgBuf }], [2, { buffer: stateBuf }], [3, { buffer: sfcBuf }], [5, groundTex.createView()], [11, frzTex.createView()]]);
   const bVol = bgOf(pVol, [[0, { buffer: volP }], [1, { buffer: vgBuf }], [2, { buffer: stateBuf }], [3, { buffer: sfcBuf }], [6, densTex.createView()], [7, densPrev.createView()]]);
   const bLight = bgOf(pLight, [[0, { buffer: volP }], [1, { buffer: vgBuf }], [2, { buffer: stateBuf }], [7, densTex.createView()], [8, groundTex.createView()], [9, sClamp], [10, lightTex.createView()]]);
@@ -319,8 +331,14 @@ async function init() {
   {
     const enc = device.createCommandEncoder();
     const pass = enc.beginComputePass();
-    pass.setPipeline(pNoise); pass.setBindGroup(0, bNoise); pass.dispatchWorkgroups(16, 16, 16);
+    pass.setPipeline(pNoise); pass.setBindGroup(0, bNoise); pass.dispatchWorkgroups(NOISE_N / 4, NOISE_N / 4, NOISE_N / 4);
     pass.end();
+    // mipmapy szumu: każdy poziom z poprzedniego (osobne przebiegi – odczyt i zapis różnych poziomów tej samej tekstury)
+    for (let l = 1; l < NOISE_MIPS; l++) {
+      const mp = enc.beginComputePass(), n = Math.max(1, Math.ceil((NOISE_N >> l) / 4));
+      mp.setPipeline(pNoiseMip); mp.setBindGroup(0, bgOf(pNoiseMip, [[12, noiseLevel(l - 1)], [13, noiseLevel(l)]])); mp.dispatchWorkgroups(n, n, n);
+      mp.end();
+    }
     device.queue.submit([enc.finish()]);
   }
 
@@ -352,6 +370,7 @@ async function init() {
   const sim = {
     time: 0, step: 0, paused: false, debt: 0, msPerStep: 0, statsPending: false, lastStats: 0,
     stats: null, means: null, sfc: null, busy: true,
+    satOld: new URLSearchParams(location.search).get('sat') === '0',     // dawny obraz chmur na satelicie VIS (?sat=0)
     flat: true, seed: 1, h: new Float32Array(NXY), hv: new Float32Array(NXV * NYV), hmax: 0, startHour: 6, doy0: 172, year: 2026,
     paint: null,
     probe: { i: MG + Math.floor(NXD / 2), j: MG + Math.floor(NYD / 2) },   // sonda (domyślnie środek mapy)
@@ -519,26 +538,29 @@ async function init() {
   // Manipulacja atmosfery (zakładka Weather, strona tytułowa): T – anomalia temperatury [K], R – mnożnik opadu, V – zmienność pogody. Przy starcie działa od razu
   // (stan początkowy, rozbieg modelu synoptycznego), a zmiana w trakcie przebiegu wchodzi liniowo przez wybrany czas (odcinek from → to w t0…t1). Ten sam odcinek
   // widzą kopie modelu synoptycznego w swoim czasie, więc prognoza już pokazuje to, co nadchodzi. log – historia nastaw (ostatni wiersz CSV).
-  const manip = { T: seg(0), R: seg(1), V: seg(1), log: [] };
+  const manip = { T: seg(0), R: seg(1), V: seg(1), S: seg(0), log: [] };
   {
     const q = new URLSearchParams(location.search);
     if (q.has('tan')) $('tanom').value = +q.get('tan');
     if (q.has('rnf')) $('manipR').value = nearest(MANIP_RAIN, +q.get('rnf'));
     if (q.has('vrf')) $('manipV').value = nearest(MANIP_VAR, +q.get('vrf'));
+    if (q.has('sst')) $('manipS').value = +q.get('sst');
   }
-  const manipTarget = () => ({ T: num('tanom'), R: MANIP_RAIN[num('manipR')], V: MANIP_VAR[num('manipV')] });
-  const mAt = (k, t) => (drv.mode === 'syn' ? segAt(manip[k], t) : (k === 'T' ? 0 : 1));
+  const manipTarget = () => ({ T: num('tanom'), R: MANIP_RAIN[num('manipR')], V: MANIP_VAR[num('manipV')], S: num('manipS') });
+  const mAt = (k, t) => (drv.mode === 'syn' ? segAt(manip[k], t) : (k === 'T' || k === 'S' ? 0 : 1));
   const manipVarAt = (t) => segAt(manip.V, t);
+  // temperatura morza: anomalia [K] w chwili t (model synoptyczny i jego kopie – każda w swoim czasie)
+  const manipSstAt = (t) => segAt(manip.S, t);
   // start przebiegu: od razu pełne nastawy
   function manipFlat() {
     const m = manipTarget();
-    for (const k of ['T', 'R', 'V']) manip[k] = seg(m[k]);
+    for (const k of ['T', 'R', 'V', 'S']) manip[k] = seg(m[k]);
     manip.log = [{ t: 0, ...m }];
   }
   // suwak w trakcie przebiegu: od bieżącej wartości do nowej przez czas „kick-in”
   function manipApply() {
     const m = manipTarget(), now = sim.time, ramp = +$('manipRamp').value * 86400;
-    for (const k of ['T', 'R', 'V']) if (manip[k].to !== m[k]) manip[k] = { from: segAt(manip[k], now), to: m[k], t0: now, t1: now + ramp };
+    for (const k of ['T', 'R', 'V', 'S']) if (manip[k].to !== m[k]) manip[k] = { from: segAt(manip[k], now), to: m[k], t0: now, t1: now + ramp };
     const last = manip.log[manip.log.length - 1];
     if (last && now - last.t < 1800) Object.assign(last, m); else manip.log.push({ t: now, ...m });
     manipUi();
@@ -548,14 +570,15 @@ async function init() {
     $('tanomV').textContent = fmtT(m.T); on('tanomV', m.T !== 0);
     $('manipRV').textContent = fmtX(m.R); on('manipRV', m.R !== 1);
     $('manipVV').textContent = fmtX(m.V); on('manipVV', m.V !== 1);
-    const left = Math.max(manip.T.t1, manip.R.t1, manip.V.t1) - now;
+    $('manipSV').textContent = fmtT(m.S); on('manipSV', m.S !== 0);
+    const left = Math.max(manip.T.t1, manip.R.t1, manip.V.t1, manip.S.t1) - now;
     const txt = left > 0 ? `Kicking in, ${left >= 86400 ? `${(left / 86400).toFixed(1)} days` : `${Math.max(1, Math.round(left / 3600))} h`} left. Now ${fmtT(+segAt(manip.T, now).toFixed(1))}, precipitation ${fmtX(segAt(manip.R, now))}, variability ${fmtX(segAt(manip.V, now))}.` : '';
     if ($('manipNow').textContent !== txt) $('manipNow').textContent = txt;
   }
   // ostatni wiersz CSV: historia nastaw (bez niej raportu z przebiegu nie da się jednoznacznie opisać)
   function manipCsv() {
-    if (!manip.log.some((e) => e.T !== 0 || e.R !== 1 || e.V !== 1)) return 'atmosphere manipulation none';
-    return `atmosphere manipulation ${manip.log.map((e) => `day ${Math.floor(e.t / 86400) + 1}: T ${e.T} K, precip x${e.R}, variability x${e.V}`).join(' | ')}`;
+    if (!manip.log.some((e) => e.T !== 0 || e.R !== 1 || e.V !== 1 || (e.S || 0) !== 0)) return 'atmosphere manipulation none';
+    return `atmosphere manipulation ${manip.log.map((e) => `day ${Math.floor(e.t / 86400) + 1}: T ${e.T} K, precip x${e.R}, variability x${e.V}, sea ${e.S || 0} K`).join(' | ')}`;
   }
   const nextFrame = () => new Promise((r) => requestAnimationFrame(() => r()));
   function constParams() {
@@ -567,7 +590,8 @@ async function init() {
   // pola docelowe w slocie (budowane na GPU): siatka parametrów z modelu synoptycznego (liczona na GPU,
   // zapis wprost do bufora vg) albo ze stałej masy powietrza (pg z CPU)
   function buildSlot(slot, pg = null) {
-    if (pg) device.queue.writeBuffer(vgBuf, grid.off.PGRID * 4, pg);
+    // (stała masa powietrza: bez cyklonów tropikalnych z modelu synoptycznego w celu – lista pusta)
+    if (pg) { device.queue.writeBuffer(vgBuf, grid.off.PGRID * 4, pg); device.queue.writeBuffer(vgBuf, grid.off.TCL * 4, new Float32Array(8 * 16)); }
     const ab = new ArrayBuffer(PARAM_BYTES);
     new Uint32Array(ab)[22] = slot;
     new Float32Array(ab)[31] = mAt('T', sim.time);     // manipulacja atmosfery: anomalia temperatury, mnożnik opadu
@@ -575,7 +599,7 @@ async function init() {
     device.queue.writeBuffer(paramBuf, 0, ab);
     const enc = device.createCommandEncoder();
     const pass = enc.beginComputePass();
-    if (!pg) drv.model.encodeParams(pass);
+    if (!pg) { drv.model.encodeParams(pass); drv.model.encodeTC(pass); }
     pass.setPipeline(tgtBuild.p);
     pass.setBindGroup(0, simBG, [0]);
     pass.dispatchWorkgroups(tgtBuild.g[0], tgtBuild.g[1]);
@@ -694,9 +718,9 @@ async function init() {
       const zc = nd.norm.elev, c0 = nd.corr[0] + (nd.corr[1] - nd.corr[0]) * Math.min(1, zc / 1500);
       // wilgotność: wykładnik a w RH → RH^a (sim.wgsl tgt_build), dobrany tak, by średnia wilgotność właściwa przy gruncie była równa normie (bisekcja; a < 1 – wilgotniej, a > 1 – sucho)
       const zcp = pAt(zc), qsm = s.map((x) => qsatMixJ(x.tq + c0, zcp)), rh0 = s.map((x, i) => Math.min(1, x.pv[5] * qsatJ(x.tq + c0, zcp) / qsm[i]));
-      // (w cieple cel +8%: domena stoi latem ~0.7–1 g/kg poniżej celu przy gruncie – mieszanie z suchszym powietrzem nad warstwą graniczną – a to wilgotność domeny ma trafiać w normę)
+      // (w cieple cel +4% (?cq8=): domena stoi latem poniżej celu przy gruncie – mieszanie z suchszym powietrzem nad warstwą graniczną – a to wilgotność domeny ma trafiać w normę; przy +8% za częste dni parne: sekcja 17 CLAUDE.md)
       const tqm = s.reduce((v, x, i) => v + wt[i] * x.tq, 0) / ws, wq = Math.min(1, Math.max(0, (tqm - 278) / 12));
-      nd.fq = ccExp((a) => s.reduce((v, _, i) => v + wt[i] * qsm[i] * Math.max(rh0[i], 1e-4) ** a, 0), qr * (1 + 0.08 * wq));
+      nd.fq = ccExp((a) => s.reduce((v, _, i) => v + wt[i] * qsm[i] * Math.max(rh0[i], 1e-4) ** a, 0), qr * (1 + CCQ_PLUS * wq));
       // wilgotność swobodnej atmosfery: RH na 850 i 700 hPa (NCEP; wobec radiosondaży IGRA do −4 punktów) / RH celu na 1.5 i 3 km (cel latem za wilgotny: Kraków, lipiec,
       // ~77% przy ~70% w pomiarach na 850 hPa – za duże CAPE)
       nd.fqa = [0, 1].map((q) => {
@@ -710,13 +734,17 @@ async function init() {
       if (nd.norm.P) {
         let pn = 0, pm = 0;
         s.forEach((x, i) => { pn += wt[i] * ccMon(nd.norm.P, x.doy); pm += wt[i] * 24 * (x.pr || 0); });
-        if (pm > 0) nd.fp = Math.min(1, Math.max(0.3, pn / pm));
+        // (tryb lekki: mnożnik działa na cały opad domeny – zakres 0.1–1.5; przy 0.3–1 zostawał nadmiar, gdy model pada > 3× za dużo)
+        nd.pnd = pn / ws; nd.pmd = pm / ws;   // (norma i średni opad modelu [mm/dobę] – diagnostyka, sim.cc())
+        if (pm > 0) nd.fp = CFG.LITE ? Math.min(1.5, Math.max(0.1, pn / pm)) : Math.min(1, Math.max(0.3, pn / pm));
       }
     }
     ccUpload();
   }
   const ccOn = () => drv.mode === 'syn' && $('climcorr').checked && !cc.off;
   // wykładnik a ∈ [0.5, 2] taki, że f(a) = cel (f maleje z a); poza zakresem – granica
+  // dodatek do normy wilgotności w cieple (?cq8= , testy A/B)
+  const CCQ_PLUS = (() => { const v = new URLSearchParams(location.search).get('cq8'); return v === null ? 0.04 : Number(v); })();
   function ccExp(f, target) {
     let lo = 0.5, hi = 2;
     if (f(lo) <= target) return lo;
@@ -730,16 +758,19 @@ async function init() {
     const a = new Float32Array(8 * 36), on = ccOn();
     cc.nodes.forEach((nd, t) => {
       for (let k = 0; k < 4; k++) a[8 * t + k] = on ? nd.corr[k] : 0;
-      a[8 * t + 4] = on ? nd.fq : 1; a[8 * t + 5] = on ? nd.fqa[0] : 1; a[8 * t + 6] = on ? nd.fqa[1] : 1; a[8 * t + 7] = on ? nd.fp : 1;
+      a[8 * t + 4] = on ? nd.fq : 1; a[8 * t + 5] = on ? nd.fqa[0] : 1; a[8 * t + 6] = on ? nd.fqa[1] : 1;
+      // (tryb lekki: zamiast mnożnika z kopii norma opadu [mm/h] dla bieżącego dnia roku – lite_col skaluje opad do niej; −1 – brak normy albo korekta wyłączona)
+      a[8 * t + 7] = CFG.LITE ? (on && nd.norm && nd.norm.P ? ccMon(nd.norm.P, ccDoy(sim.time)) / 24 : -1) : on ? nd.fp : 1;
     });
     device.queue.writeBuffer(vgBuf, grid.off.CCG * 4, a);
+    device.queue.writeBuffer(vgBuf, grid.off.CCE * 4, new Float32Array(36).map((_, t) => (cc.nodes[t] && cc.nodes[t].norm ? cc.nodes[t].norm.elev || 0 : 0)));
     const el = $('ccInfo');
     if (!el) return;
     if (!on) { el.textContent = cc.off ? `correction off: ${cc.src}` : 'correction off'; return; }
     const m = [0, 1, 2, 3, 4, 5, 6, 7].map((k) => cc.nodes.reduce((s, nd) => s + (k < 4 ? nd.corr[k] : k === 4 ? nd.fq : k === 7 ? nd.fp : nd.fqa[k - 5]), 0) / cc.nodes.length);
     el.textContent = `correction${cc.nodes.length > 1 ? ` (mean of ${cc.nodes.length} nodes)` : ''}: ${m.slice(0, 4).map((v) => (v >= 0 ? '+' : '') + v.toFixed(1)).join(' · ')} K `
       + `(ground · 1.5 · 3 · 5.6 km), humidity near the ground RH^${m[4].toFixed(2)}, at 1.5 km ×${m[5].toFixed(2)}, at 3 km ×${m[6].toFixed(2)}, `
-      + `large-scale precipitation ×${m[7].toFixed(2)}; data: ${cc.src}`;
+      + `large-scale precipitation ${CFG.LITE ? 'scaled to the monthly norm' : '×' + m[7].toFixed(2)}; data: ${cc.src}`;
   }
   // ta sama poprawka na wysokości z w punkcie (X, Y) siatki (jak climCorr w sim.wgsl) – temperatura gruntu na starcie
   function ccAt(z, ztr, X, Y) {
@@ -867,7 +898,7 @@ async function init() {
   // dób, opad i śnieg sumowane. Przyciski map (pola 80–85), suwak okresu, tabela średnich po widocznej domenie.
   const MON_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
   const SEASONS = ['winter', 'spring', 'summer', 'autumn'];
-  const MON_F = [S.MTS, S.MTX, S.MTN, S.MPR, S.MSN, S.MXA, S.MNA, S.MPD];
+  const MON_F = [S.MTS, S.MTX, S.MTN, S.MPR, S.MSN, S.MXA, S.MNA, S.MPD, S.MHOT, S.MTRO];
   const monDay = K('mon_day', NXY, 64), monAbs = K('mon_abs', NXY, 64);
   const mon = { list: [], key: -1, t0: 0, days: 0, dayT0: 0, pending: null };
   const monKey = (t) => {
@@ -875,7 +906,7 @@ async function init() {
     return d.getUTCFullYear() * 12 + d.getUTCMonth();
   };
   const monLabel = (k) => `${MON_NAMES[k % 12]} ${Math.floor(k / 12)}`;
-  const monFld = (f = num('fieldH')) => f >= 80 && f <= 88;
+  const monFld = (f = num('fieldH')) => f >= 80 && f <= 90;
   // okresy rodzaju kind ('m' miesiące, 's' pory roku, 'y' lata): { key, months (zapisane), cur (obejmuje bieżący miesiąc) } –
   // chronologicznie; klucz pory roku = rok·4 + pora (zima z grudniem roku poprzedniego)
   let anaKind = 'm';
@@ -935,7 +966,7 @@ async function init() {
   async function monFinish(p) {
     await p.rb.mapAsync(GPUMapMode.READ);
     const a = new Float32Array(p.rb.getMappedRange()), n = NXD * NYD;
-    const T = [new Int16Array(n), new Int16Array(n), new Int16Array(n), new Int16Array(n), new Int16Array(n)], P = [new Uint16Array(n), new Uint16Array(n), new Uint16Array(n)];
+    const T = [new Int16Array(n), new Int16Array(n), new Int16Array(n), new Int16Array(n), new Int16Array(n)], P = [new Uint16Array(n), new Uint16Array(n), new Uint16Array(n)], C = [new Uint16Array(n), new Uint16Array(n)];
     const q = (x) => Math.max(-32767, Math.min(32767, Math.round(100 * x)));
     for (let j = 0; j < NYD; j++) for (let i = 0; i < NXD; i++) {
       const c = (j + MG) * NX + i + MG, v = j * NXD + i, tm = a[c] / p.secs;
@@ -947,10 +978,11 @@ async function init() {
       T[3][v] = q(a[5 * NXY + c] - 1000);
       T[4][v] = q(1000 - a[6 * NXY + c]);
       P[2][v] = Math.min(65535, Math.round(10 * a[7 * NXY + c]));
+      C[0][v] = Math.round(a[8 * NXY + c]); C[1][v] = Math.round(a[9 * NXY + c]);
     }
     p.rb.unmap(); p.rb.destroy();
     const avg = (x, sc) => x.reduce((s, y) => s + y, 0) / n / sc;
-    mon.list.push({ key: p.key, days: p.days, secs: p.secs, T, P,
+    mon.list.push({ key: p.key, days: p.days, secs: p.secs, T, P, C,
       avg: { t: avg(T[0], 100), tx: avg(T[1], 100), tn: avg(T[2], 100), p: avg(P[0], 10), s: avg(P[1], 10),
         // ekstrema w widocznej domenie
         tX: T[3].reduce((m, y) => Math.max(m, y), -32768) / 100, tN: T[4].reduce((m, y) => Math.min(m, y), 32767) / 100, pD: P[2].reduce((m, y) => Math.max(m, y), 0) / 10 } });
@@ -961,6 +993,15 @@ async function init() {
   // (only ≥ 0 – tylko to oczko, wynik o długości 1)
   function perField(p, f, only = -1) {
     const v0 = only >= 0 ? only : 0, v1 = only >= 0 ? only + 1 : NXD * NYD, acc = new Float64Array(v1 - v0);
+    if (f >= 89) {
+      // liczba dni upalnych / nocy tropikalnych: zapisane miesiące + liczniki bieżącego
+      for (const m of p.months) if (m.C) for (let v = v0; v < v1; v++) acc[v - v0] += m.C[f - 89][v];
+      if (p.cur && sim.sfc) {
+        const o = S[f === 89 ? 'MHOT' : 'MTRO'] * NXY;
+        for (let v = v0; v < v1; v++) acc[v - v0] += sim.sfc[o + (Math.floor(v / NXD) + MG) * NX + (v % NXD) + MG];
+      }
+      return acc;
+    }
     if (f >= 86) {
       // ekstrema okresu: T maks. i min. absolutna, największy opad dobowy – po zapisanych miesiącach i bieżącym (liczniki, bieżąca doba)
       const up = f !== 87;
@@ -1031,7 +1072,7 @@ async function init() {
     if (f || !monFld()) $('fieldH').value = String(monLast);
     monUi(); monShow(); labels();
   }
-  for (const [f, name] of [[80, 'Mean T'], [81, 'Mean T max'], [82, 'Mean T min'], [86, 'Absolute T max'], [87, 'Absolute T min'], [88, 'Max daily precip.'], [83, 'Precip.'], [84, 'Rain'], [85, 'Snow']]) {
+  for (const [f, name] of [[80, 'Mean T'], [81, 'Mean T max'], [82, 'Mean T min'], [86, 'Absolute T max'], [87, 'Absolute T min'], [88, 'Max daily precip.'], [83, 'Precip.'], [84, 'Rain'], [85, 'Snow'], [89, 'Hot days'], [90, 'Tropical nights']]) {
     const b = document.createElement('button');
     b.className = 'btn'; b.textContent = name; b.title = FIELDS[f].name; b.dataset.f = f;
     b.onclick = () => monPick(f);
@@ -1120,7 +1161,7 @@ async function init() {
     if (!pr) return '–';
     const v = j * NXD + i, at = (f) => perField(pr, f, v)[0];
     const t = at(80), tx = at(81), tn = at(82), p = at(83), s = at(85), ax = at(86), an = at(87), pd = at(88);
-    return `T ${fT(t)} (${nD(tn, '°C', 1)} … ${nD(tx, '°C', 1)}) · precip. ${fm(p, 'mm', 1)} (rain ${nD(Math.max(0, p - s), 'mm', 1)}, snow ${nD(s, 'mm', 1)}) · absolute ${nD(an, '°C', 1)} … ${fT(ax)} · max day ${pd.toFixed(1)} mm`;
+    return `T ${fT(t)} (${nD(tn, '°C', 1)} … ${nD(tx, '°C', 1)}) · precip. ${fm(p, 'mm', 1)} (rain ${nD(Math.max(0, p - s), 'mm', 1)}, snow ${nD(s, 'mm', 1)}) · absolute ${nD(an, '°C', 1)} … ${fT(ax)} · max day ${pd.toFixed(1)} mm · hot days ${at(89)} · tropical nights ${at(90)}`;
   }
   // skala sumy opadu rozciągana z długością okresu: progi WX Charts (0.1 … 2000 mm, pomyślane dla ~16 dób) × (dni/16)^0.7 –
   // doba: do ~290 mm, 7 dni ~1100, 30 dni ~3100, 90 dni ~6000 (okres „od startu” – liczba dób symulacji, co najmniej 1)
@@ -1172,8 +1213,8 @@ async function init() {
     if ($('location').value === 'custom') {
       try { const w = await worldDem(); geo = { lon: num('lon'), elev: (la, lo) => worldElev(w, la, lo) }; } catch { geo = null; }
     }
-    const m = await PEModel.create(device, { varAt: manipVarAt, lat: num('lat'), lon: num('lon'), cont: num('cont'), hum: num('hum'), doy: dayOfYear($('date').value), hour: num('hour'),   // godzina startu: słońce w PE zgodne z domeną
-      seed: drv.seed, geo, nest: { vgBuf, pgOff: grid.off.PGRID, ...NODES } });
+    const m = await PEModel.create(device, { varAt: manipVarAt, sstAt: manipSstAt, lat: num('lat'), lon: num('lon'), cont: num('cont'), hum: num('hum'), doy: dayOfYear($('date').value), hour: num('hour'),   // godzina startu: słońce w PE zgodne z domeną
+      seed: drv.seed, geo, nest: { vgBuf, pgOff: grid.off.PGRID, tclOff: grid.off.TCL, half: [CFG.NXV * CFG.DX / 2, CFG.NYV * CFG.DY / 2], ...NODES } });
     await m.spinup(SPIN, (f) => { $('wxNow').textContent = `The synoptic model is spinning up: ${Math.round(SPIN * f)} / ${SPIN} days…`; });
     // korekta klimatu: kopia modelu z zaburzonym stanem i innym losowaniem rdzenia arktycznego (własna pogoda) liczy CC_START dób
     // naprzód (próbki co 12 h), dalej w tle – zawsze CC_WIN dób przed symulacją (weatherTick)
@@ -1347,6 +1388,7 @@ async function init() {
       f[27] = $('hydro').checked ? 1 : 0;                                         // hydrologia
       f[31] = mAt('T', t);                                                        // manipulacja atmosfery: anomalia temperatury dużej skali, mnożnik opadu
       f[33] = mAt('R', t);
+      f[34] = mAt('S', t + DT) - mAt('S', t);                                     // temperatura morza: zmiana anomalii w tym kroku [K] (woda domeny)
       // zmiana deklinacji [rad/dobę] – fenologia (dzień się wydłuża / skraca)
       f[32] = 23.44 * Math.PI / 180 * 2 * Math.PI / 365 * Math.cos(2 * Math.PI * (284 + ck.doy) / 365);
     }
@@ -1359,7 +1401,7 @@ async function init() {
     const pass = enc.beginComputePass(useTS
       ? { timestampWrites: { querySet: ts.qs, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 } } : {});
     for (let s = 0; s < n; s++) {
-      for (const k of sim.flat ? seqFlat : seqTerrain) {
+      for (const k of seqLite || (sim.flat ? seqFlat : seqTerrain)) {
         pass.setPipeline(k.p);
         pass.setBindGroup(0, simBG, [s * SLOT]);
         pass.dispatchWorkgroups(k.g[0], k.g[1]);
@@ -1533,16 +1575,20 @@ async function init() {
       f[12] = sun.x; f[13] = sun.y; f[14] = sun.z; f[15] = sim.hmax; f[16] = num('cloudAlpha') / 100;
       u[17] = ($('reliefShade').checked ? 1 : 0) | ($('reliefIso').checked ? 2 : 0)
         | ($('clLow').checked ? 4 : 0) | ($('clMid').checked ? 8 : 0) | ($('clHigh').checked ? 16 : 0)
-        | ($('windArrows').checked ? 32 : 0) | ($('gridLines').checked ? 64 : 0);
+        | ($('windArrows').checked ? 32 : 0) | ($('gridLines').checked ? 64 : 0) | (sim.satOld ? 128 : 0);   // bit 7: dawny obraz chmur na satelicie (?sat=0)
       f[18] = (performance.now() / 1000) % 1000;            // czas do migania błyskawic
       f[19] = cuc.ph; f[27] = cuc.nx; f[28] = cuc.ny; f[29] = cuc.N[0]; f[30] = cuc.N[1]; f.set(cuc.D, 36); f.set(cuc.D2, 36 + 144);   // zegar i przesunięcie wzoru cumulusów (cuGen)
+      // ulice chmur (cuStream), kierunek włókien cirrusów: wiatr wzoru zmienia się skokowo przy każdym kopiowaniu pól (w MAX co ~0.4 s) – obraz dochodzi do niego
+      // płynnie w ~0.6 s (wcześniej ulice i włókna przeskakiwały co kopię – użytkownik)
+      { const tw = performance.now(), aw = cuc.wT ? Math.min(1, (tw - cuc.wT) / 600) : 1; cuc.wT = tw; for (let q = 0; q < 144; q++) cuc.Ws[q] += aw * (cuc.W[q] - cuc.Ws[q]); }
+      f.set(cuc.Ws, 36 + 288);
       f[34] = leafAut(ck.doy);
       f[31] = sim.time - mon.t0; f[32] = mon.days; f[33] = monLive() ? 1 : 0;   // analizy klimatyczne: sam bieżący miesiąc – z liczników
       if (demHiOk()) { f[20] = DEMF; f[21] = sim.demHi.hmax; }        // gęstszy teren do obrazu (loadDemHi)
       f[35] = vegHiOk() ? DEMF : 0;                                    // gęstsze pokrycie terenu do obrazu (buildVegHi)
       if (v.mode === 0) { f[22] = mz.x; f[23] = mz.y; f[24] = mz.s; } else { f[24] = 1; }   // zoom (tylko mapa)
       f[25] = psumF(r.id);                                    // skala sumy opadu wg okresu (albo miesiąca)
-      f[26] = Math.min(10000, Math.max(3000, 2 * CFG.DX)) * (v3.newView ? 1 : Math.max(1, 0.5 * exagAuto * v3.exagMul));   // bok siatki cumulusów jak w 3D
+      f[26] = Math.min(4500, Math.max(3000, 2 * CFG.DX));     // bok siatki kłębów na satelicie [m] – tylko obraz, model tego nie czyta (przy skali z widoku 3D kłęby miały rozmiar komórek burzowych); widok 3D ma własny bok
       device.queue.writeBuffer(v.ubuf, 0, ab);
       const pass = enc.beginRenderPass({
         colorAttachments: [{ view: v.ctx.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] }],
@@ -2098,6 +2144,16 @@ async function init() {
   layInfoBuild();
 
   // --- prędkość, pauza, restart ---
+  // tryb lekki: własne prędkości (krok jest tani – w MAX 150–220 tys.× przy kilku klatkach na sekundę, użytkownik wybrał stałe 5–100 tys.× i MAX)
+  if (CFG.LITE) {
+    const LS = [[5000, 'One day in ~17 seconds'], [20000, 'One day in ~4 seconds'], [50000, 'One year in ~10 minutes'], [100000, 'One year in ~5 minutes (if the GPU keeps up)']];
+    [...document.querySelectorAll('#speedSeg button')].filter((b) => b.dataset.speed !== 'max').forEach((b, i) => {
+      if (i >= LS.length) { b.remove(); return; }
+      b.dataset.speed = String(LS[i][0]); b.title = LS[i][1]; b.textContent = `${LS[i][0].toLocaleString('en-US')}×`;
+      b.classList.toggle('on', LS[i][0] === 20000);
+    });
+    $('speed').value = '20000';
+  }
   document.querySelectorAll('#speedSeg button').forEach((b) => b.addEventListener('click', () => {
     $('speed').value = b.dataset.speed;
     document.querySelectorAll('#speedSeg button').forEach((x) => x.classList.toggle('on', x === b));
@@ -2184,7 +2240,7 @@ async function init() {
       if (el.type === 'checkbox') el.checked = st.ui[el.id]; else el.value = st.ui[el.id];
     }
     CLIM.bias = num('tbias');
-    if (st.manip) Object.assign(manip, st.manip); else manipFlat();
+    if (st.manip) { Object.assign(manip, st.manip); if (!st.manip.S) manip.S = seg(0); } else manipFlat();
     gridSync();
     sim.seed = st.seed;
     drv.seed = st.synSeed;
@@ -2280,14 +2336,14 @@ async function init() {
         acc: { days: [...acc.days], last: acc.last },
         mon: { key: mon.key, t0: mon.t0, days: mon.days, dayT0: mon.dayT0, list: mon.list.map((x) => ({ key: x.key, days: x.days, secs: x.secs, avg: x.avg })) },
         cc: { off: cc.off, nodes: cc.nodes.map((nd) => ({ norm: nd.norm, hasN: nd.hasN, corr: nd.corr, fq: nd.fq, fqa: nd.fqa, fp: nd.fp, smp: nd.smp.filter((x) => x.t >= keepFrom) })) },
-        cuc: { ...cuc, U: [...cuc.U], D: [...cuc.D], U2: [...cuc.U2], D2: [...cuc.D2], N: [...cuc.N], sfcT: null },
+        cuc: { ...cuc, U: [...cuc.U], D: [...cuc.D], U2: [...cuc.U2], D2: [...cuc.D2], N: [...cuc.N], W: undefined, Pt: undefined, sfcT: null },
         meteo: { hist: meteo.hist, col: meteo.col },
         pe: syn ? { main: m.saveInfo(), cc: c ? c.saveInfo() : null } : null };
       const sf = stations.exportFull();
       chunks.push({ name: 'js', data: jsonPack(js) }, { name: 'stLive', data: jsonPack({ sel: sf.sel, live: sf.live }) }, { name: 'stHist', data: jsonPack(sf.hist, 4) });
-      // miesiące analiz: 5 × Int16 + 3 × Uint16 na oczko widocznej części
-      const nv = NXD * NYD, mb = new Uint8Array(16 * nv * mon.list.length);
-      mon.list.forEach((x, i) => [...x.T, ...x.P].forEach((a, k) => mb.set(new Uint8Array(a.buffer, a.byteOffset, a.byteLength), (i * 8 + k) * 2 * nv)));
+      // miesiące analiz: 5 × Int16 + 5 × Uint16 na oczko widocznej części (opad, śnieg, maks. doba, dni upalne, noce tropikalne)
+      const nv = NXD * NYD, mb = new Uint8Array(20 * nv * mon.list.length);
+      mon.list.forEach((x, i) => [...x.T, ...x.P, ...(x.C || [new Uint16Array(nv), new Uint16Array(nv)])].forEach((a, k) => mb.set(new Uint8Array(a.buffer, a.byteOffset, a.byteLength), (i * 10 + k) * 2 * nv)));
       chunks.push({ name: 'mon', data: mb });
       // teren i mokradła dokładnie (w zapisie ustawień zaokrąglone – inne nachylenia i inne pola docelowe przy gruncie)
       chunks.push({ name: 'hv', data: sim.hv.slice() });
@@ -2378,7 +2434,7 @@ async function init() {
         status('loading the saved run: synoptic model…');
         const Ts = await read('land.Ts');
         const land = { sea: await read('land.sea'), encl: await read('land.encl'), hgt: await read('land.hgt'), ...(Ts ? { lc: { Ts, ha: await read('land.ha'), ta: await read('land.ta') } } : {}) };
-        const opts = { varAt: manipVarAt, land, nest: { vgBuf, pgOff: grid.off.PGRID, ...NODES } };
+        const opts = { varAt: manipVarAt, sstAt: manipSstAt, land, nest: { vgBuf, pgOff: grid.off.PGRID, tclOff: grid.off.TCL, half: [CFG.NXV * CFG.DX / 2, CFG.NYV * CFG.DY / 2], ...NODES } };
         const mk = async (p, info) => PEModel.restore(device, opts, info, { S: await read(`${p}.S`), wk: await read(`${p}.wk`), dg: await read(`${p}.dg`) });
         drv.model = await mk('pe', js.pe.main);
         drv.ccModel = js.pe.cc ? await mk('cc', js.pe.cc) : null;
@@ -2387,6 +2443,7 @@ async function init() {
         drv.fcModel = drv.model.clone(); drv.fc = []; drv.fcBusy = false; drv.ccBusy = false;
         const enc = device.createCommandEncoder(), pass = enc.beginComputePass();
         drv.model.encodeParams(pass);
+        drv.model.encodeTC(pass);
         pass.end();
         device.queue.submit([enc.finish()]);
         refreshCenter();
@@ -2397,7 +2454,8 @@ async function init() {
       for (const [n, b] of [['state', stateBuf], ['tmp', tmpBuf]]) q.writeBuffer(b, 0, await read(n));
       const wk = await read('work');
       // (plik sprzed W_HM ma bufor krótszy o jedną liczbę na końcu – reszta zostaje, strumień liczy się od zera)
-      if (ok(wk, workBuf) || (wk && wk.byteLength + 4 === workBuf.size)) q.writeBuffer(workBuf, 0, wk);
+      // (… i bez miejsc burz trybu lekkiego – krótszy o 2048 bajtów)
+      if (wk && wk.byteLength <= workBuf.size && wk.byteLength >= workBuf.size - 4 - 2048 - 16) q.writeBuffer(workBuf, 0, wk);
       const sf0 = await read('sfc'), sf = new Float32Array(NSF * NXY);
       js.sfcNames.forEach((n, i) => { if (n in S) sf.set(sf0.subarray(i * NXY, (i + 1) * NXY), S[n] * NXY); });
       q.writeBuffer(sfcBuf, 0, sf);
@@ -2410,8 +2468,10 @@ async function init() {
       Object.assign(sim, { time: js.sim.time, step: js.sim.step, startHour: js.sim.startHour, doy0: js.sim.doy0, year: js.sim.year, debt: 0, accInfo: js.sim.accInfo, probe: js.sim.probe });
       drv.tA = js.drv.tA; drv.slot = js.drv.slot;
       const nv = NXD * NYD, mb = await read('mon');
-      const arr = (T, i, k) => new T(mb.buffer.slice(mb.byteOffset + (i * 8 + k) * 2 * nv, mb.byteOffset + (i * 8 + k + 1) * 2 * nv));
-      mon.list = js.mon.list.map((x, i) => ({ ...x, T: [0, 1, 2, 3, 4].map((k) => arr(Int16Array, i, k)), P: [5, 6, 7].map((k) => arr(Uint16Array, i, k)) }));
+      // (pliki sprzed liczników dni upalnych i nocy tropikalnych: 8 tablic na miesiąc – liczniki zerowe)
+      const KM = js.mon.list.length ? Math.round(mb.length / (2 * nv * js.mon.list.length)) : 10;
+      const arr = (T, i, k) => new T(mb.buffer.slice(mb.byteOffset + (i * KM + k) * 2 * nv, mb.byteOffset + (i * KM + k + 1) * 2 * nv));
+      mon.list = js.mon.list.map((x, i) => ({ ...x, T: [0, 1, 2, 3, 4].map((k) => arr(Int16Array, i, k)), P: [5, 6, 7].map((k) => arr(Uint16Array, i, k)), C: KM >= 10 ? [8, 9].map((k) => arr(Uint16Array, i, k)) : [new Uint16Array(nv), new Uint16Array(nv)] }));
       Object.assign(mon, { key: js.mon.key, t0: js.mon.t0, days: js.mon.days, dayT0: js.mon.dayT0, pending: null });
       const stL = jsonUnpack(await text('stLive'));
       stations.importFull({ sel: stL.sel, live: stL.live, hist: jsonUnpack(await text('stHist')) });
@@ -2997,6 +3057,11 @@ async function init() {
     const i = Math.floor(x), j = Math.floor(y);
     if (i < MG || i >= MG + NXD || j < MG || j >= MG + NYD) return;
     if (stations.addMode) { stations.addAt(x, y); document.body.classList.remove('addst'); return; }
+    if (tc.armed && drv.model) {
+      // punkt domeny → oczko kanału (środek domeny w kanale: x = 0, y = yc)
+      tcSpawnAt((LXP / 2 + (x - MG - NXD / 2) * CFG.DX) / DXP - 0.5, (LYP / 2 + drv.model.yc + (y - MG - NYD / 2) * CFG.DY) / DXP - 0.5);
+      return;
+    }
     sim.probe = { i, j };
     setProfMode('point');
   });
@@ -3141,10 +3206,24 @@ async function init() {
   gridInfo();
   $('gridBc').value = CFG.OPEN ? 'open' : 'per';
   const startArg = () => `${$('location').value === 'custom' ? `${num('lat').toFixed(3)},${num('lon').toFixed(3)}` : ','},${+($('date').value || '2026-06').slice(5, 7) - 1}`;
-  $('gridApply').onclick = () => { const g = gridPlan(), m = manipTarget(); location.search = `?dx=${g.dx}&nx=${g.nx}&ny=${g.ny}${$('gridBc').value === 'per' ? '&bc=per' : ''}&start=${startArg()}${manipQuery(m.T, m.R, m.V)}`; };
-  for (const id of ['tanom', 'manipR', 'manipV']) $(id).addEventListener('input', manipApply);
-  $('manipZero').onclick = () => { $('tanom').value = 0; $('manipR').value = MANIP_RAIN.indexOf(1); $('manipV').value = MANIP_VAR.indexOf(1); manipApply(); };
+  $('gridApply').onclick = () => { const g = gridPlan(), m = manipTarget(); location.search = `?dx=${g.dx}&nx=${g.nx}&ny=${g.ny}${$('gridBc').value === 'per' ? '&bc=per' : ''}${CFG.LITE ? '&lite=1' : ''}&start=${startArg()}${manipQuery(m.T, m.R, m.V, m.S)}`; };
+  for (const id of ['tanom', 'manipR', 'manipV', 'manipS']) $(id).addEventListener('input', manipApply);
+  $('manipZero').onclick = () => { $('tanom').value = 0; $('manipR').value = MANIP_RAIN.indexOf(1); $('manipV').value = MANIP_VAR.indexOf(1); $('manipS').value = 0; manipApply(); };
   $('manipBox').addEventListener('toggle', () => savePrefs());
+  // Huragan kliknięciem: kategoria → głębokość niżu w modelu synoptycznym (ośrodek wobec pierścienia ~375 km [hPa]; przy otoczeniu ~1010 hPa w ośrodku
+  // ~982 / 970 / 955 / 938 / 920 hPa – jak progi ciśnienia skali Saffira–Simpsona), czas kick-in; potem decyduje model (pe.js spawnTC, pe_tcforce)
+  const TC_CAT_DP = { 1: 28, 2: 40, 3: 55, 4: 72, 5: 90 };
+  const tc = { armed: false };
+  const tcArm = (on) => { tc.armed = on; $('tcSpawn').classList.toggle('on', on); $('tcSpawn').textContent = on ? 'Click the map…' : 'Spawn'; };
+  $('tcSpawn').onclick = () => tcArm(!tc.armed);
+  // X, Y – położenie w oczkach kanału modelu synoptycznego
+  function tcSpawnAt(X, Y) {
+    tcArm(false);
+    if (!drv.model || drv.mode !== 'syn') { toast('Hurricanes need the synoptic model mode'); return; }
+    const cat = num('tcCat'), days = num('tcRamp');
+    if (!drv.model.spawnTC(X, ((Y % NYP) + NYP) % NYP, TC_CAT_DP[cat], days * 86400)) { toast('Too many hurricanes are being spawned at once (max. 8)'); return; }
+    toast(`Hurricane spawned – it reaches category ${cat} in ${days < 1 ? `${Math.round(days * 24)} hours` : `${days} day${days > 1 ? 's' : ''}`}, then the simulation decides`);
+  }
   $('toTitle').onclick = () => { location.href = location.pathname; };
   $('gridBc').onchange = gridInfo;
   $('ys').max = String(LY_KM);
@@ -3275,10 +3354,10 @@ async function init() {
       let ticks = legendTicks(dl, dh).filter((t) => t > dl + 1e-9 && t < dh - 1e-9).map((t) => [t, (t - dl) / (dh - dl)]);
       const dT = (t) => (isImp() ? rnd(toD(t, unitOf)) : t);   // próg stałej skali w jednostkach na ekranie
       let unitOf = fd.unit;
-      if (fd.cmap >= WX_CMAP0 && fd.cmap < WX_CMAP0 + WXS.length) {
+      if (wxOf(fd.cmap) >= 0) {
         // skale WX Charts: równe klasy, podpisy progów
-        const ws = WXS[fd.cmap - WX_CMAP0];
-        [lo, hi, ticks] = wxLegend(fd.cmap - WX_CMAP0);
+        const ws = WXS[wxOf(fd.cmap)];
+        [lo, hi, ticks] = wxLegend(wxOf(fd.cmap));
         if (ws.key === 'psum') {
           // suma opadu: progi przeskalowane do okresu (podpisy zaokrąglone do 2 cyfr znaczących)
           const fa = psumF(r.id), r2 = (x) => { const v = toD(x * fa, 'mm'); return +v.toPrecision(v < 1 ? 1 : 2); };
@@ -3440,6 +3519,29 @@ async function init() {
       return { nx: NXD, ny: NYD, dx: CFG.DX, v: out };
     },
     // narysuj jedną klatkę (przy zatrzymanej pętli) – do zrzutów ekranu
+    // czas GPU jednego rysowania mapy [ms] (znaczniki czasu, n powtórzeń w jednym poleceniu) – koszt obrazu, np. satelity; stan z ostatniego draw()
+    satOld(on) { sim.satOld = !!on; },
+    // huragan (testy): dx, dy [km] od środka domeny, kategoria 1–5, kick-in [doby]
+    peTC: () => drv.model.readTC(),
+    peTCD: () => drv.model.readTCD(),   // ślady cyklonów tropikalnych dla domeny (pe_tcdom)
+    spawnTC(dx, dy, cat = 3, days = 1) { $('tcCat').value = cat; $('tcRamp').value = days; tcSpawnAt((LXP / 2 + dx * 1000) / DXP - 0.5, (LYP / 2 + drv.model.yc + dy * 1000) / DXP - 0.5); },
+    async mapMs(n = 20) {
+      if (!hasTS) return null;
+      const v = views[0];
+      const qs = device.createQuerySet({ type: 'timestamp', count: 2 }), rb = buf(16, U.QUERY_RESOLVE | U.COPY_SRC, 'mapMsR'), rd = buf(16, U.MAP_READ | U.COPY_DST, 'mapMsM');
+      const enc = device.createCommandEncoder(), tex = v.ctx.getCurrentTexture().createView();
+      for (let i = 0; i < n; i++) {
+        const tw = i === 0 || i === n - 1 ? { timestampWrites: { querySet: qs, ...(i === 0 ? { beginningOfPassWriteIndex: 0 } : {}), ...(i === n - 1 ? { endOfPassWriteIndex: 1 } : {}) } } : {};
+        const pass = enc.beginRenderPass({ colorAttachments: [{ view: tex, loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] }], ...tw });
+        pass.setPipeline(renderPipe); pass.setBindGroup(0, v.bg); pass.draw(3); pass.end();
+      }
+      enc.resolveQuerySet(qs, 0, 2, rb, 0); enc.copyBufferToBuffer(rb, 0, rd, 0, 16);
+      device.queue.submit([enc.finish()]);
+      await rd.mapAsync(GPUMapMode.READ);
+      const t = new BigUint64Array(rd.getMappedRange()), ms = Number(t[1] - t[0]) / 1e6 / n;
+      rd.unmap(); qs.destroy(); rb.destroy(); rd.destroy();
+      return ms;
+    },
     async draw() {
       writeParams(1);
       const enc = device.createCommandEncoder();
@@ -3959,7 +4061,9 @@ async function init() {
     // okno czasu meteogramu tygodniowego [s od początku okna tygodnia] (testy)
     fcView: () => ({ a: fcv.a, span: fcv.span, week: FC_WEEK, n: drv.fc.length }),
     // manipulacja atmosfery: odcinki, historia i wartości w tej chwili (testy)
-    manip: () => ({ ...JSON.parse(JSON.stringify(manip)), now: { T: mAt('T', sim.time), R: mAt('R', sim.time), V: mAt('V', sim.time) }, forcV: drv.model ? drv.model.forcV : null, fcV: drv.fcModel ? drv.fcModel.forcV : null, csv: manipCsv() }),
+    manip: () => ({ ...JSON.parse(JSON.stringify(manip)), now: { T: mAt('T', sim.time), R: mAt('R', sim.time), V: mAt('V', sim.time), S: mAt('S', sim.time) }, forcV: drv.model ? drv.model.forcV : null, fcV: drv.fcModel ? drv.fcModel.forcV : null, csv: manipCsv() }),
+    // pole mapy modelu synoptycznego (readMap: psl, pr [mm/h], …) z wymiarami kanału (testy)
+    async peField(k) { if (!drv.model) return null; const mp = await drv.model.readMap(); return { nx: NXP, ny: NYP, v: Array.from(mp[k]) }; },
     // bieżący stan modelu synoptycznego w środku domeny (średnia 3 × 3 oczka): T przy gruncie, ~1.5, 3, 5 km (testy)
     async peNow() {
       if (!drv.model) return null;
@@ -3967,10 +4071,20 @@ async function init() {
       for (const k of ['ts', 't15', 't3', 't5']) { let v = 0; for (let j = jc - 1; j <= jc + 1; j++) for (let i = ic - 1; i <= ic + 1; i++) v += mp[k][j * NXP + i]; out[k] = v / 9; }
       return out;
     },
+    // zachmurzenie modelu synoptycznego nad domeną (±r oczek 75 km wokół środka): średnie pole chmur i część oczek z OLR jak wierzchołki < −30 °C (testy)
+    async peCloud(r = 5) {
+      if (!drv.model) return null;
+      const mp = await drv.model.readMap(), ic = NXP >> 1, jc = (NYP >> 1) + Math.round(drv.model.yc / DXP);
+      let c = 0, cold = 0, n = 0;
+      for (let j = jc - r; j < jc + r; j++) for (let i = ic - r; i < ic + r; i++) { const k = j * NXP + i; c += mp.cloud[k]; if (Math.sqrt(Math.sqrt(Math.max(mp.olr[k], 1) / 5.67e-8)) - 273.15 < -30) cold++; n++; }
+      return { cloud: c / n, cold: cold / n };
+    },
     async mode(m) { drv.mode = m; $('wxMode').value = m; await reset(); },
     async roll(seed) { drv.seed = seed; drv.mode = 'syn'; $('wxMode').value = 'syn'; await reset(); },
     set(id, value) { $(id).value = value; $(id).dispatchEvent(new Event('change')); labels(); },
     stop() { sim.halted = true; },
+    // czas symulacji i chwila ostatniej kopii pól (testy w pętli klatek, np. MAX)
+    t() { return { simHours: sim.time / 3600, sfcHours: (sim.sfcT ?? 0) / 3600 }; },
     // pełny zapis przebiegu: stan gotowy, plik, sumy kontrolne buforów (testy)
     ready() { return !sim.busy; },
     // gęstszy teren i pokrycie do obrazu wczytane (testy zrzutów)
@@ -4010,7 +4124,7 @@ async function init() {
     // sondaż (zakładka Atmosphere): wynik analizy i czas analizy + rysowania – testy
     snd() { sndKey = ''; drawSnd(true); return sim.sndLast || null; },
     sndTime() { const t0 = performance.now(), pr = sndProfile(), A = analyzeSounding(pr), t1 = performance.now(); renderSounding($('csnd'), A, { parcel: sndPar, zg: pr.zg, layout: 'compact' }); return { analyzeMs: +(t1 - t0).toFixed(1), drawMs: +(performance.now() - t1).toFixed(1) }; },
-    cc() { return { on: ccOn(), nodes: cc.nodes.map((nd) => ({ X: nd.X, Y: nd.Y, corr: nd.corr.map((v) => +v.toFixed(2)), fq: +nd.fq.toFixed(3), fqa: nd.fqa.map((v) => +v.toFixed(3)), fp: +nd.fp.toFixed(3), n: nd.smp.length, elev: nd.norm.elev, ref: ccRef(nd, ccDoy(sim.time)).t.map((v) => +(v - 273.15).toFixed(2)) })), src: cc.src, tsOff: drv.model ? 0.4 * drv.model.halfDiur : 0 }; },
+    cc() { return { on: ccOn(), nodes: cc.nodes.map((nd) => ({ X: nd.X, Y: nd.Y, corr: nd.corr.map((v) => +v.toFixed(2)), fq: +nd.fq.toFixed(3), fqa: nd.fqa.map((v) => +v.toFixed(3)), fp: +nd.fp.toFixed(3), pn: +(nd.pnd || 0).toFixed(2), pm: +(nd.pmd || 0).toFixed(2), n: nd.smp.length, elev: nd.norm.elev, ref: ccRef(nd, ccDoy(sim.time)).t.map((v) => +(v - 273.15).toFixed(2)) })), src: cc.src, tsOff: drv.model ? 0.4 * drv.model.halfDiur : 0 }; },
   };
 
 
@@ -4210,12 +4324,14 @@ async function init() {
       synZoom(Math.exp(e.deltaY * 0.0015), (e.clientX - r.left) / r.width - 0.5, 0.5 - (e.clientY - r.top) / r.height);
     }, { passive: false });
     cv.addEventListener('pointerdown', (e) => {
+      syn.moved = false;
       syn.drag = { x: e.clientX, y: e.clientY, ox: syn.x, oy: syn.y };
       cv.setPointerCapture(e.pointerId); cv.classList.add('drag');
     });
     cv.addEventListener('pointermove', (e) => {
       if (!syn.drag) return;
       const r = cv.getBoundingClientRect();
+      if (Math.hypot(e.clientX - syn.drag.x, e.clientY - syn.drag.y) > 4) syn.moved = true;
       syn.x = syn.drag.ox - (e.clientX - syn.drag.x) / r.width * syn.span;
       syn.y = syn.drag.oy + (e.clientY - syn.drag.y) / r.height * syn.span;
       synRedraw();
@@ -4224,6 +4340,13 @@ async function init() {
     cv.addEventListener('pointerup', up);
     cv.addEventListener('pointercancel', up);
     cv.addEventListener('dblclick', () => { syn.span = SYN_HOME; syn.x = 0; syn.y = 0; synRedraw(); });
+    // huragan kliknięciem na mapie synoptycznej (bez przeciągania)
+    cv.addEventListener('click', (e) => {
+      if (!tc.armed || syn.moved || !drv.model) return;
+      const r = cv.getBoundingClientRect();
+      const x = syn.x + ((e.clientX - r.left) / r.width - 0.5) * syn.span, y = syn.y + (0.5 - (e.clientY - r.top) / r.height) * syn.span;
+      tcSpawnAt((LXP / 2 + x) / DXP - 0.5, (LYP / 2 + drv.model.yc + y) / DXP - 0.5);
+    });
     $('synZp').onclick = () => synZoom(1 / 1.5);
     $('synZm').onclick = () => synZoom(1.5);
   }
@@ -4533,20 +4656,30 @@ async function init() {
       ccSample(t, pg, 0.4 * (cm.halfDiur ?? drv.start.halfDiur)); ccUpdate(sim.time);
     }).finally(() => { if (cm === drv.ccModel) drv.ccBusy = false; });
   }
+  // kopie w tle za blisko symulacji: korekta klimatu < 30 dób przed nią albo prognoza < 1 doby. W trybie lekkim na MAX (100–200 tys.×) symulacja
+  // przesuwała się o kilkanaście terminów na klatkę, a kopie najwyżej o 4 razem (nadwyżka budżetu przepadała) – kopia korekty po kilku miesiącach
+  // była > 90 dób w tyle, w oknie korekty brakowało próbek i mnożnik opadu wracał do 1 (surowy opad modelu, jesienią i zimą ~2× za dużo)
+  function bgLag() {
+    const fm = drv.fcModel, cm = drv.ccModel;
+    if (drv.mode !== 'syn' || !fm) return false;
+    const ahead = (m) => (m ? m.time - drv.start.time - sim.time : Infinity);
+    return ahead(cm) < 30 * 86400 || ahead(fm) < 86400;
+  }
   function bgTick() {
     const fm = drv.fcModel, cm = drv.ccModel, w = performance.now();
     const dw = Math.min((w - (drv.bgW ?? w)) / 1000, 0.25), ds = Math.max(sim.time - (drv.bgS ?? sim.time), 0);
     drv.bgW = w; drv.bgS = sim.time;
     if (drv.mode !== 'syn' || !fm) return;
     const behind = (m, h) => m && m.time - drv.start.time < sim.time + h;
-    drv.bgB = (drv.bgB || 0) + dw * BG_CATCHUP + 2 * ds / DTQ;
-    for (let n = 0; n < 4 && drv.bgB >= 1; n++) {
+    const lag = bgLag();
+    drv.bgB = (drv.bgB || 0) + dw * BG_CATCHUP + 2 * ds / DTQ + (lag ? 8 : 0);
+    for (let n = 0; n < (lag ? 8 : 4) && drv.bgB >= 1; n++) {
       if (!drv.fcBusy && behind(fm, 7 * 86400)) bgFc(fm);
       else if (!drv.ccBusy && behind(cm, CC_WIN)) bgCc(cm);
       else break;
       drv.bgB--;
     }
-    drv.bgB = Math.min(drv.bgB, 1);
+    drv.bgB = Math.min(drv.bgB, lag ? 8 : 1);
   }
   // API run (testy bez pętli klatek): kopia korekty klimatu nadąża za symulacją – CC_START dób przed nią
   async function bgSync() {
@@ -4813,25 +4946,50 @@ async function init() {
   new ResizeObserver(() => { if (sndFullOn()) { sndKey = ''; drawSnd(true); } }).observe($('csndF'));
 
   let last = performance.now(), lastUi = 0;
+  // Ulice chmur (render.wgsl, cuStreet) idą wzdłuż linii prądu: funkcja prądu ψ wiatru warstwy chmur na kaflach (u = ∂ψ/∂y, v = −∂ψ/∂x) bez części od średniego wiatru domeny – najmniejsze kwadraty po parach
+  // sąsiednich kafli (Gauss–Seidel, start z poprzedniej). Wygładzona w czasie (τ 6 h), bo położenie pasm zależy wprost od ψ: przy szybkiej zmianie pasma przesuwałyby się w poprzek (w MAX o swój odstęp na sekundę)
+  function cuStream(nx, ny, dx, dy, dT) {
+    const n = nx * ny, U = cuc.U, P = cuc.Pt;
+    let um = 0, vm = 0, s2 = 0;
+    for (let t = 0; t < n; t++) { um += U[2 * t]; vm += U[2 * t + 1]; s2 += U[2 * t] * U[2 * t] + U[2 * t + 1] * U[2 * t + 1]; }
+    um /= n; vm /= n; s2 = Math.sqrt(s2 / n);
+    for (let it = 0; it < 40; it++) for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
+      const t = j * nx + i, ut = U[2 * t] - um, vt = U[2 * t + 1] - vm;
+      let s = 0, m = 0;
+      if (i > 0) { s += P[t - 1] - 0.5 * dx * (U[2 * (t - 1) + 1] - vm + vt); m++; }
+      if (i + 1 < nx) { s += P[t + 1] + 0.5 * dx * (U[2 * (t + 1) + 1] - vm + vt); m++; }
+      if (j > 0) { s += P[t - nx] + 0.5 * dy * (U[2 * (t - nx)] - um + ut); m++; }
+      if (j + 1 < ny) { s += P[t + nx] - 0.5 * dy * (U[2 * (t + nx)] - um + ut); m++; }
+      if (m) P[t] = s / m;
+    }
+    let pm = 0;
+    for (let t = 0; t < n; t++) pm += P[t] / n;
+    const a = dT > 0 ? 1 - Math.exp(-dT / 21600) : 1, W = cuc.W;
+    for (let t = 0; t < n; t++) W[4 * t] += a * (P[t] - pm - W[4 * t]);
+    W[1] += a * (um - W[1]); W[2] += a * (vm - W[2]); W[3] += a * (s2 - W[3]);
+  }
   function cuWind() {
     if (!sim.sfc || sim.sfcT === cuc.sfcT) return;
+    const dTw = cuc.sfcT == null ? Infinity : sim.sfcT - cuc.sfcT;
     cuc.sfcT = sim.sfcT;
     const LXd = NXD * CFG.DX, LYd = NYD * CFG.DY;
     const nx = Math.max(1, Math.min(6, Math.round(LXd / 40000))), ny = Math.max(1, Math.min(6, Math.round(LYd / 40000)));
     const su = new Float64Array(nx * ny), sv = new Float64Array(nx * ny), sn = new Float64Array(nx * ny);
-    const su2 = new Float64Array(nx * ny), sv2 = new Float64Array(nx * ny);
-    const ou = S.CWU * NXY, ov = S.CWV * NXY, ou2 = S.MWU * NXY, ov2 = S.MWV * NXY;
+    const su2 = new Float64Array(nx * ny), sv2 = new Float64Array(nx * ny), sw2 = new Float64Array(nx * ny);
+    const ou = S.CWU * NXY, ov = S.CWV * NXY, ou2 = S.CMU * NXY, ov2 = S.CMV * NXY, ow2 = S.CLM * NXY;
     for (let j = 0; j < NYD; j++) {
       const tj = Math.min(ny - 1, Math.floor(j * ny / NYD));
       for (let i = 0; i < NXD; i++) {
         const t = tj * nx + Math.min(nx - 1, Math.floor(i * nx / NXD)), c = (j + MG) * NX + i + MG;
         su[t] += sim.sfc[ou + c]; sv[t] += sim.sfc[ov + c]; sn[t]++;
-        su2[t] += sim.sfc[ou2 + c]; sv2[t] += sim.sfc[ov2 + c];
+        // (piętro średnie: kafel liczą głównie oczka, w których są takie chmury – waga 1 + ich woda [g/m²])
+        const w2 = 1 + Math.max(sim.sfc[ow2 + c], 0);
+        su2[t] += w2 * sim.sfc[ou2 + c]; sv2[t] += w2 * sim.sfc[ov2 + c]; sw2[t] += w2;
       }
     }
-    if (nx !== cuc.nx || ny !== cuc.ny) { cuc.nx = nx; cuc.ny = ny; cuc.D.fill(0); cuc.D2.fill(0); }
+    if (nx !== cuc.nx || ny !== cuc.ny) { cuc.nx = nx; cuc.ny = ny; cuc.D.fill(0); cuc.D2.fill(0); cuc.W.fill(0); cuc.Ws.fill(0); cuc.Pt.fill(0); }
     let g = 0;
-    for (let t = 0; t < nx * ny; t++) { cuc.U[2 * t] = su[t] / sn[t]; cuc.U[2 * t + 1] = sv[t] / sn[t]; cuc.U2[2 * t] = su2[t] / sn[t]; cuc.U2[2 * t + 1] = sv2[t] / sn[t]; }
+    for (let t = 0; t < nx * ny; t++) { cuc.U[2 * t] = su[t] / sn[t]; cuc.U[2 * t + 1] = sv[t] / sn[t]; cuc.U2[2 * t] = su2[t] / sw2[t]; cuc.U2[2 * t + 1] = sv2[t] / sw2[t]; }
     for (let tj = 0; tj < ny; tj++) for (let ti = 0; ti < nx; ti++) {
       const t = tj * nx + ti;
       for (const U of [cuc.U, cuc.U2]) {   // oba wzory (niskie i piętro średnie)
@@ -4840,6 +4998,7 @@ async function init() {
       }
     }
     cuc.gmax = g;
+    cuStream(nx, ny, LXd / nx, LYd / ny, dTw);
   }
   function cuTick(dS, dW) {
     if (dW > 0) cuc.rate += Math.min(1, dW / 1.5) * (dS / dW - cuc.rate);
@@ -4903,6 +5062,7 @@ async function init() {
     }
 
     if (sim.busy || sim.saving) n = 0;
+    if (bgLag()) n = 0;     // (symulacja czeka, aż kopie w tle – korekta klimatu, prognoza – nadrobią: bgTick dostaje wtedy większy budżet)
     if (n > 0) {
       runSteps(n, true);
       speedHist.push({ t: now, sim: n * DT });

@@ -62,7 +62,8 @@ fn cloudAt(rho: f32, qc: f32, qi: f32, qr: f32, rhw: f32, rhi: f32, t: f32, z: f
     // pokrycie rośnie od zera z wodą chmur schematu (CUL [g/m²] średnio w oczku): ~3% przy 5, ~9% przy 16, ~22% przy 45,
     // ~57% przy 300 g/m²; wcześniej co najmniej 12% przy każdym śladzie CUL i woda 0.6 g/kg na całej wysokości –
     // w dni z CAPE średnio ~16 g/m² CUL dawało ~500 g/m² wody na obrazie: całe niebo zakryte wieżami
-    fcv = 0.6 * (1.0 - exp(-cul / 100.0)) * mix(1.0, 1.6, deep * smoothstep(0.75, 0.95, zr));
+    // (chmury płytkie: pokrycie szybciej rośnie z wodą – ?ccv=100 dawniej, 40: ~20% przy 16, ~40% przy 45 g/m² zamiast ~9 i ~22%; słońce ponad normę i za małe zachmurzenie latem; chmury głębokie bez zmian)
+    fcv = 0.6 * (1.0 - exp(-cul / mix(CCV, 100.0, deep))) * mix(1.0, 1.6, deep * smoothstep(0.75, 0.95, zr));
     // zanikająca chmura (CUL → 0) blednie płynnie, bez nagłego zniknięcia przy progu
     fcv = min(fcv, 0.9) * smoothstep(0.0, 0.05, zr) * (1.0 - smoothstep(0.93, 1.0, zr)) * smoothstep(0.02, 4.0, cul);
     let anvil = t < 250.0;
@@ -128,14 +129,17 @@ fn cuFbm(p: vec2f) -> f32 { return 0.55 * cuVal(p) + 0.3 * cuVal(p * 2.03 + vec2
 // żyje pół okresu, promień rośnie i maleje jak √sin (pole ∝ sin); suma pokryć dwóch pokoleń jest wtedy stała w czasie
 // (2/π·π/2 = 1), a chmury nie bledną wszystkie naraz (wcześniej waga całego pokolenia – co 15 min wszystkie na połowie gęstości:
 // cumulusy w 3D „znikały na chwilę” co 1–3 s)
-// Zwraca (odległość od najbliższego środka z zaburzonym brzegiem, promień) – chmura tam, gdzie x < y
-fn cuShape(q0: vec2f, fc: f32, tau: f32) -> vec2f {
-  let pa = min(fc / 0.287, 1.0);
+// Zwraca (odległość od najbliższego środka z zaburzonym brzegiem, promień, kierunek od środka kłębu × ρ; ρ = 0 w środku, 1 na gładkim brzegu) – chmura tam, gdzie x < y.
+// fe0 – najmniejsza część komórki wzoru zajęta przez czynny kłąb (CU_FE0; większa – przy tym samym pokryciu mniej, ale większych kłębów)
+const CU_FE0: f32 = 0.287;
+fn cuShape(q0: vec2f, fc: f32, tau: f32, fe0: f32) -> vec4f {
+  let pa = min(fc / fe0, 1.0);
   let fe = fc / max(pa, 1e-3);
   let r = sqrt(fe) * (0.5435 + fe * (-0.0589 + 0.2586 * fe));
   let q = q0 + 0.45 * vec2f(cuFbm(q0 * 0.9 + vec2f(3.1, 7.7)) - 0.5, cuFbm(q0 * 0.9 + vec2f(11.3, 1.9)) - 0.5);
   let ci = vec2i(floor(q));
   var d = 9.0;
+  var rv = vec2f(0.0);
   for (var a = -1; a <= 1; a++) {
     for (var b = -1; b <= 1; b++) {
       let c = ci + vec2i(a, b);
@@ -144,12 +148,15 @@ fn cuShape(q0: vec2f, fc: f32, tau: f32) -> vec2f {
       let life = (tau - 0.5 * cuRnd(c, 3u).x) * 2.0;
       if (g.x < pa && life > 0.0 && life < 1.0) {
         let k = max(1.2533 * sqrt(sin(3.14159265 * life)), 1e-3);
-        d = min(d, length(q - (vec2f(c) + 0.5 + 0.9 * (h - 0.5))) / ((0.55 + 0.9 * g.y) * k));
+        let rc = q - (vec2f(c) + 0.5 + 0.9 * (h - 0.5));
+        let s = (0.55 + 0.9 * g.y) * k;
+        let dn = length(rc) / s;
+        if (dn < d) { d = dn; rv = rc / s; }
       }
     }
   }
   let dd = d - r * (0.55 * (cuFbm(q0 * 4.0 + vec2f(2.7, 9.1)) - 0.5) + 0.3 * (cuVal(q0 * 9.0) - 0.5));
-  return vec2f(dd, r);
+  return vec4f(dd, r, rv / max(r, 1e-3));
 }
 
 // Pokolenia cumulusów płynące z wiatrem warstwy chmur: dwa pokolenia przesunięte o pół okresu; każde ma własny wzór (chmury w nim

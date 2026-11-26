@@ -19,6 +19,8 @@ import { autoDx, dtFor, r4 } from './gridplan.js';
 const urlQ = typeof location !== 'undefined' ? new URLSearchParams(location.search) : new URLSearchParams();
 const urlDt = Number(urlQ.get('dt'));
 const OPEN = urlQ.get('bc') !== 'per';
+// tryb lekki (?lite=1): bez dynamiki domeny – atmosfera z pól docelowych modelu synoptycznego + jądro kolumnowe lite_col (sim.wgsl)
+const LITE = urlQ.has('lite') && urlQ.get('lite') !== '0';
 const NI0 = OPEN ? 6 : 0;          // rampa relaksacji za krawędzią widocznej domeny [oczka]
 const NE0 = OPEN ? 2 * NI0 + 4 : 0; // cała strefa niewidoczna: rampa + przejście + rampa
 // wymiary siatki z parametrów: { dx, nx, ny } (nx, ny – komórki widocznej domeny)
@@ -62,7 +64,9 @@ export const CFG = {
   DX: DX0, DY: DX0,        // [m]
   HTOP: 20000,             // wierzch domeny [m]
   STRA: 0.15,              // rozciągnięcie: dz ≈ 60 m przy ziemi, ≈ 740 m u góry
-  DT: urlDt >= 2 && urlDt <= 90 ? urlDt : dtFor(DX0),   // krok czasowy [s] (do testów: ?dt=10)
+  LITE,
+  // krok czasowy [s] (do testów: ?dt=10); w trybie lekkim 300 s (dzielnik terminu 30 min), ?dt= 60–900
+  DT: LITE ? (urlDt >= 60 && urlDt <= 900 && 1800 % urlDt === 0 ? urlDt : 300) : urlDt >= 2 && urlDt <= 90 ? urlDt : dtFor(DX0),
   // wagi schematów zależnych od skali: warstwa graniczna (K-profil) i konwekcja głęboka
   // (Betts–Miller) – zero na siatkach LES, pełne na siatkach mezoskalowych
   W_PBL: clamp01((DX0 - 800) / 1700),
@@ -85,11 +89,37 @@ export const SFC = ['TS', 'TD', 'W', 'H', 'LE', 'CDU', 'T2', 'TD2', 'PR', 'PACC'
   // widok „Miesiące”: liczniki bieżącego miesiąca – Σ T 2 m·Δt [°C·s], Σ dobowych T maks. i T min. (pełne doby), opad i śnieg
   // (woda) [mm]; MV – wybrana wielkość zapisanego miesiąca (main.js wpisuje ją do mapy)
   'MTS', 'MTX', 'MTN', 'MPR', 'MSN', 'MV',
+  // widok „Miesiące”: liczniki pełnych dób z T maks. ≥ 30 °C (dni upalne) i T min. ≥ 20 °C (noce tropikalne)
+  'MHOT', 'MTRO',
   // ekstrema bieżącego miesiąca do analiz (aktualizowane o północy, 0 – brak danych): T maks. absolutna + 1000, 1000 − T min. absolutna [°C],
   // największy opad dobowy [mm]; PD0 – suma opadu PACC o ostatniej północy
   'MXA', 'MNA', 'MPD', 'PD0',
   // grubość pokrywy śnieżnej [m] (gęstość = SWE / SND: świeży śnieg wg temperatury powietrza, potem osiadanie)
-  'SND'];
+  'SND',
+  // część kopuły zimnego powietrza pochodząca z prądów zstępujących schematu (źródło WKSRC; dwa bufory jak ORG / ORGB)
+  'ORGS', 'ORGSB',
+  // wiatr na wysokości chmur piętra średniego (2–6 km nad gruntem, ważony wodą chmur) – ruch ich wzoru na satelicie i w 3D
+  'CMU', 'CMV',
+  // temperatura jasnościowa wygładzona w czasie (τ 10 min) – wysokość wierzchołków do cieni i światłocienia na satelicie VIS
+  'TBS',
+  // diagnostyka: która droga schematu konwekcji dała opad w tym kroku (0 brak, 1 głęboka, 2 podniesiona, 3 płytka)
+  'PRK',
+  // opad schematu konwekcji dochodzący do gruntu [mm/h]: po wygładzeniu w czasie, rozłożeniu na 3 × 3 oczka i odparowaniu słabego opadu pod chmurą (cu_spread) – radar
+  'PRCG',
+  // promieniowanie długofalowe netto przy gruncie [W/m², ujemne – grunt traci] (diagnostyka i mapa)
+  'LWN',
+  // tryb lekki: odchyłka θ i q_v warstwy granicznej od celu (cykl dobowy z bilansu ciepła przy gruncie) i średnie kroczące tempa ich zmian (≈ doba)
+  'LBT', 'LBQ', 'LBH', 'LBE', 'LBT2', 'LBQ2',
+  // tryb lekki: opad modelu synoptycznego płynący z wiatrem (dwa bufory) [mm/h]
+  'LPR', 'LPR2',
+  // tryb lekki – liczniki diagnostyczne [mm]: opad modelu synoptycznego z korektą klimatu i opad rdzeni burz
+  'LPB', 'LPS',
+  // tryb lekki: średni opad bez skalowania z ~30 dób [mm/h] (dwa bufory) – skalowanie opadu do normy
+  'LRM', 'LRM2',
+  // tryb lekki: średnia różnica T 2 m − powietrze 1. warstwy z ~2 dób [K] (cel przy gruncie podniesiony o nią – średnia T 2 m w normie)
+  'LT21',
+  // tryb lekki: mnożnik opadu do normy (regulator całkujący) i średnie zachmurzenie z ~doby (zakres dobowy)
+  'LKP', 'LCV'];   // (LBT2, LBQ2 – drugi bufor odchyłki: przenoszenie z wiatrem)
 
 // Parametry sondażu w węzłach siatki parametrów (co GS oczek): T przy morzu [K], gradient [K/m],
 // tropopauza [m], podstawa i siła inwersji [m, K], RH dołem i górą, wiatr przy gruncie i ścinanie
@@ -211,6 +241,8 @@ export function buildGrid(c, snd) {
     ['RCV', NXY],                  // odbiornik spływu (D8: sąsiad o największym spadku, −1 – bezodpływ)
     ['PGRID', NPAR * (c.NX / c.GS) * (c.NY / c.GS)],   // siatka parametrów sondażu (model synoptyczny)
     ['CCG', 8 * 36],               // korekta klimatu w węzłach (≤ 6 × 6): 4 temperatury [K], mnożniki wilgotności – grunt, 850, 700 hPa – i opadu (main.js ccUpload)
+    ['CCE', 36],                   // wysokość danych normy klimatu w węzłach korekty [m] (tryb lekki: opad z wysokością)
+    ['TCL', 8 * 24],               // cyklony tropikalne z modelu synoptycznego dla drobnego jądra w celu (pe_tcdom → tgt_build): 8 × 24
   ];
   const off = {};
   let total = 0;
@@ -302,6 +334,7 @@ export function wgslHeader(c, grid) {
     `const HTOP: f32 = ${f(c.HTOP)};`, `const STRA: f32 = ${f(c.STRA)};`,
     `const G: f32 = ${f(G)};`, `const CP: f32 = ${f(CP)};`, `const RD: f32 = ${f(RD)};`,
     `const P0: f32 = ${f(P0)};`, `const LV: f32 = ${f(LV)};`, `const Z0: f32 = ${f(c.Z0)};`,
+    `const LITE: f32 = ${c.LITE ? '1.0' : '0.0'};`,
     `const W_PBL: f32 = ${f(c.W_PBL)};`, `const W_CU: f32 = ${f(c.W_CU)};`,
     `const W_SH: f32 = ${f(c.W_SH)};`,
     // waga odchyłki swobodnej atmosfery z wnętrza na brzegach: 0 dla domen ≤ 300 km, 1 od 1000 km
@@ -336,6 +369,8 @@ export function wgslHeader(c, grid) {
     `const W_MUV: u32 = W_EBM + 2u * MEB;`,
     // średni po domenie strumień ciepła z gruntu, średnia wykładnicza z doby [W/m²]
     `const W_HM: u32 = W_MUV + 2u * NZ;`,
+    // tryb lekki: burze jako obiekty (32 miejsca × 16 liczb, lite_storm)
+    `const W_STM: u32 = W_HM + 1u;`,
   ];
   SFC.forEach((name, i) => lines.push(`const S_${name}: u32 = ${i}u;`));
   for (const [k, v] of Object.entries(grid.off)) lines.push(`const VG_${k}: u32 = ${v}u;`);
@@ -362,6 +397,43 @@ export function wgslHeader(c, grid) {
   // cienka komórka przy gruncie łączona mieszaniem z warstwą wyżej (?tlk=1 – włączone; domyślnie wyłączone: odwracała artefakt – cienkie oczka nocą cieplejsze od sąsiadów), wychładzanie mgły na ~300 m (?fsp=0), mgła na stacji i mapie z wody na 2 m (?fgd=0), ograniczenie bardzo dużego CAPE (?cul= próg [J/kg], 0 – bez)
   // próg lodowego wierzchołka cumulusa płytkiego nad lądem przy ciepłej podstawie o GLI [K] chłodniej (?gli=0 – dawniej wszędzie −5…−15 °C)
   lines.push(`const GLI: f32 = ${f(qnum('gli', 10))};`);
+  // deficyt wilgotności w oporze szparkowym: hs [(kg/kg)⁻¹] (?vpd=0 – dawniej)
+  lines.push(`const VPD: f32 = ${f(qnum('vpd', 55))};`);
+  // próg CAPE [J/kg] braku opadu z cumulusów przy ciepłej podstawie (?shc=0 – dawniej) i kowadło tylko z chmur, które padają (?anv=0 – dawniej)
+  lines.push(`const SHC: f32 = ${f(qnum('shc', 100))};`, `const ANV: f32 = ${f(qnum('anv', 1))};`);
+  // czynnik narodzin chmur na frontach podmuchowych w szarej strefie tylko dla kopuł ze schematu (?wks=0 – dawniej dla wszystkich kopuł)
+  lines.push(`const WKS: f32 = ${f(qnum('wks', 1))};`);
+  // opad chmur schematu przy ciepłej podstawie dopiero od 80% (pełny od 150%) siły typowej chmury (?rnt=0 – dawniej od 30%, pełny od 80%)
+  lines.push(`const RNT: f32 = ${f(qnum('rnt', 1))};`);
+  // chmury schematu głębokiego: średni strumień w każdym oczku (?lot=1 – dawne losowanie Planta–Craiga)
+  lines.push(`const LOT: f32 = ${f(qnum('lot', 0))};`);
+  // skala pokrycia oczka chmurami płytkimi schematu z ich wody [g/m²] (?ccv=100 – dawniej)
+  lines.push(`const CCV: f32 = ${f(qnum('ccv', 40))};`);
+  // satelita VIS: cienie chmur i światłocień wierzchołków – tylko obraz (?ssh=0 – chmury płaskie, jak dawniej)
+  lines.push(`const SSH: f32 = ${f(qnum('ssh', 1))};`);
+  // ostre fronty chłodne w chłodnej porze: bez podwójnego wznoszenia (unoszenie pary z modelu + skok wiatru Φ; ?fdb=0 – dawniej, ochrona tylko w cieple)
+  lines.push(`const FDB: f32 = ${f(qnum('fdb', 0))};`);
+  // część skoku wiatru na wyostrzonym froncie (zbieżność, która wymusza wznoszenie; ?frw=1 – dawny pełny skok, temperatura i wilgotność frontu bez zmian)
+  lines.push(`const FRW: f32 = ${f(qnum('frw', 1))};`);
+  // pełne unoszenie pary z modelu pomniejszone o wznoszenie, które domena robi sama (?lwd=0 – dawniej pełne zawsze)
+  lines.push(`const LWD: f32 = ${f(qnum('lwd', 1))};`);
+  // pełne unoszenie pary wygaszane w warstwach nasyconych celu (?sfm=0 – dawniej; sim.wgsl lsTend)
+  lines.push(`const SFM: f32 = ${f(qnum('sfm', 1))};`);
+  // ciśnienie na mapie z zaburzeniem od domeny (?psd=0 – tylko duża skala; sim.wgsl lbc_apply)
+  lines.push(`const PSD: f32 = ${f(qnum('psd', 1))};`);
+  // słaby opad schematu konwekcji (średnia z oczka poniżej ~RMN mm/h) paruje pod podstawą chmury (?rmn=0 – dawniej; sim.wgsl cu_spread)
+  lines.push(`const RMN: f32 = ${f(qnum('rmn', 0.3))};`);
+  // cyklony tropikalne – drobne jądro w celu (sim.wgsl tgt_build): kształt profilu Hollanda B = TCB0 + 0.009·Δp [hPa], mnożnik wiatru wiru, ?tcj=0 – bez jądra (wir modelu synoptycznego)
+  lines.push(`const TCB0: f32 = ${f(qnum('tcb', 1.4))};`, `const TCV: f32 = ${f(qnum('tcvw', 1))};`, `const TCSZ: f32 = ${f(qnum('tcsz', 0))};`, `const TCJ: f32 = ${f(qnum('tcj', 1))};`,
+    `const TCN: f32 = ${f(qnum('tcn', 0.3))};`);
+  // (TCN – przyciąganie odchyłki wiatru (τ 1 h / TCN, domyślnie ~3.3 h) i θ' (τ 12 h / TCN) do celu w jądrze, 0 – bez)
+  // chmury wysokie: nasycone warstwy lodowe modelu (≤ −15…−25 °C) przechodzą do celu także latem (?csi=0 – dawniej tylko poza latem); prędkość opadania lodu chmurowego
+  // [m/s przy gruncie, × √(ρ0/ρ): na 10 km ×1.6; ?vfi=0.4 – dawniej, ~0.65 m/s na 10 km – cirrus wypadał w ~25 min]
+  lines.push(`const CSI: f32 = ${f(qnum('csi', 1))};`, `const VFI: f32 = ${f(qnum('vfi', 0.15))};`);
+  // domknięcie CAPE schematu głębokiego: początek rampy oczka [m], pełne od 2× (?ccl=10000 – dawniej, tylko grube siatki), czas usuwania CAPE [s], próg CAPE opadu z tej drogi [J/kg] (pełny 500 wyżej; słabsza konwekcja tylko miesza)
+  lines.push(`const CCL: f32 = ${f(qnum('ccl', 3000))};`, `const CCT: f32 = ${f(qnum('cct', 1200))};`, `const CCR: f32 = ${f(qnum('ccr', 600))};`);
+  // satelita VIS, tylko obraz: wielkość kłębów z siły wznoszenia (?csz=0 – bez), ulice chmur przy silnym wietrze (?cst=0 – bez), łączenie kłębów z pokładami (?cmx=0 – bez)
+  lines.push(`const CSZ: f32 = ${f(qnum('csz', 1))};`, `const CST: f32 = ${f(qnum('cst', 1))};`, `const CMX: f32 = ${f(qnum('cmx', 1))};`);
   lines.push(`const TLK: f32 = ${f(qnum('tlk', 0))};`, `const FSP: f32 = ${f(qnum('fsp', 1))};`, `const FGD: f32 = ${f(qnum('fgd', 1))};`, `const CUL: f32 = ${f(qnum('cul', 2000))};`, `const CUQ: f32 = ${f(qnum('cuq', 1))};`, `const SHL: f32 = ${f(qnum('shl', 0.1))};`);
   // narodziny chmur schematu w płynących skupiskach zamiast kropek po całej mapie (?clu=0 – wyłączone)
   lines.push(`const CLU: f32 = ${typeof location !== 'undefined' && new URLSearchParams(location.search).get('clu') === '0' ? '0.0' : '1.0'};`);

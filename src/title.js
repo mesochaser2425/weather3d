@@ -10,7 +10,7 @@ const $ = (id) => document.getElementById(id);
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 const SIZES = [25, 50, 100, 250, 500, 1000, 2000];
 const KM_DEG = 111.32;
-const st = { lat: 50.06, lon: 19.94, lx: 500, ly: 500, res: 100, dx: 'auto', month: 5 };
+const st = { lat: 50.06, lon: 19.94, lx: 500, ly: 500, res: 100, dx: 'auto', month: 5, lite: false };
 try { Object.assign(st, JSON.parse(localStorage.getItem('w3d-title') || '{}')); } catch { /* bez pamięci przeglądarki – domyślne */ }
 const savePref = () => { try { localStorage.setItem('w3d-title', JSON.stringify(st)); } catch { /* bez pamięci */ } };
 const plan = () => planGrid(st.lx, st.ly, st.res, st.dx);
@@ -66,9 +66,15 @@ function ui() {
   for (const b of $('ttRes').children) b.classList.toggle('on', +b.dataset.r === st.res);
   for (const b of $('ttMonths').children) b.classList.toggle('on', +b.dataset.m === st.month);
   $('ttDx').value = String(st.dx);
-  const sp = fmDx(g.dx), secs = 30 * g.cost;
+  // tryb lekki (osobny ekran): koszt to głównie model synoptyczny z kopiami w tle (~1.2 s na dobę), domena ~0.3 s na 10 000 oczek na dobę
+  // (Polska 7.5 km, 96 × 92: 3 doby w ~5 s na RTX 5060 Ti)
+  $('titleScr').classList.toggle('lite', !!st.lite);
+  $('ttLiteGo').textContent = st.lite ? '← Full simulation' : 'Light mode – for slower computers →';
+  $('ttSub').textContent = st.lite ? 'Light mode: only the synoptic model, downscaled to the map – a year in minutes, also on slower graphics cards.' : 'Choose the map size, the start month and the area – then start.';
+  const sp = fmDx(g.dx), secs = st.lite ? 1.2 + 0.3 * g.nx * g.ny / 1e4 : 30 * g.cost;
   $('ttInfo').innerHTML = `Grid spacing <b>${sp}</b> · <b>${g.nx} × ${g.ny}</b> cells · map <b>${Math.round(toD(g.nx * g.dx / 1000, 'km'))} × ${Math.round(toD(g.ny * g.dx / 1000, 'km'))} ${uKm}</b><br>`
-    + `${g.sc.name[0].toUpperCase()}${g.sc.name.slice(1)}: ${g.sc.use}<br>One day at max speed ≈ <b${secs > 45 ? ' style="color:var(--warn)"' : ''}>${secs < 100 ? secs.toFixed(0) : Math.round(secs / 10) * 10} s</b> (RTX 5060 Ti)`;
+    + (st.lite ? `Light mode · one year at max speed ≈ <b>${Math.max(1, Math.round(secs * 365 / 60))} min</b> (RTX 5060 Ti; slower cards a few times more)`
+      : `${g.sc.name[0].toUpperCase()}${g.sc.name.slice(1)}: ${g.sc.use}<br>One day at max speed ≈ <b${secs > 45 ? ' style="color:var(--warn)"' : ''}>${secs < 100 ? secs.toFixed(0) : Math.round(secs / 10) * 10} s</b> (RTX 5060 Ti)`);
   $('ttPlace').textContent = fmtLL(st.lat, st.lon);
   savePref();
   drawReq();
@@ -255,13 +261,14 @@ async function start(place) {
   const g = plan();
   savePref();
   const a = place ? `${st.lat.toFixed(3)},${st.lon.toFixed(3)},${st.month}` : `,,${st.month}`;
-  history.replaceState(null, '', `${location.pathname}?dx=${g.dx}&nx=${g.nx}&ny=${g.ny}&start=${a}${manipQuery(manT(), manR(), manV())}`);
+  history.replaceState(null, '', `${location.pathname}?dx=${g.dx}&nx=${g.nx}&ny=${g.ny}${st.lite ? '&lite=1' : ''}&start=${a}${manipQuery(manT(), manR(), manV())}`);
   $('titleScr').classList.remove('on');
   $('loadScr').classList.add('on');
   await import('./main.js');
 }
 $('ttStart').onclick = () => start(true);
 $('ttFlat').onclick = () => start(false);
+$('ttLiteGo').onclick = () => { st.lite = !st.lite; ui(); };
 // zapisany przebieg: plik do pamięci przeglądarki, adres z siatką przebiegu (main.js wczyta go od razu, bez rozbiegu)
 $('ttResume').onclick = () => $('ttRunFile').click();
 $('ttRunFile').onchange = async () => {

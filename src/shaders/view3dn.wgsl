@@ -188,7 +188,7 @@ fn blobMask(p: vec3f, fc: f32) -> f32 {
     let g = t & 1u;
     let dd4 = select(dl, dh, mid);
     let gq = cuGen(p.xy, select(dd4.xy, dd4.zw, g == 1u), C.cuPh, S, g);
-    let sh = cuShape(gq.xy + select(vec2f(0.0), CU_MID, mid), fc * w, gq.z);
+    let sh = cuShape(gq.xy + select(vec2f(0.0), CU_MID, mid), fc * w, gq.z, CU_FE0);
     if (sh.x > 2.0 * sh.y) { continue; }
     let n = textureSampleLevel(noiseT, sRep, vec3f(gq.xy, p.z / S), 0.0);
     let dd = sh.x - 0.5 * sh.y * (n.g - 0.55);
@@ -201,7 +201,7 @@ fn cloudExt(p: vec3f, b: vec4f) -> f32 {
   // chmury kłębiaste zajmujące część oczka (b.y < 1, siatki ≥ ~1 km): ta sama średnia ekstynkcja skupiona w kłębach
   // pokrywających b.y powierzchni – jak na satelicie i w zachmurzeniu ogólnym (COVC); warstwowe – równo w całym oczku
   let fc = clamp(b.y, 1e-3, 1.0);
-  let wb = smoothstep(0.3, 0.7, b.w) * smoothstep(300.0, 900.0, DX) * (1.0 - smoothstep(0.85, 0.97, fc));
+  let wb = smoothstep(0.3, 0.7, b.w) * smoothstep(300.0, 900.0, DX) * (1.0 - smoothstep(0.85, 0.97, fc)) * (1.0 - LITE);   // (tryb lekki: bez kłębów)
   if (wb < 1e-3) { return b.x; }
   return mix(b.x, b.x / fc * blobMask(p, fc), wb);
 }

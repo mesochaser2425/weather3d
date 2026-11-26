@@ -1,4 +1,4 @@
-import { WXS, WX_CMAP0, wxLegendCss, wxColor } from './wxscales.js';
+import { WXS, WX_CMAP0, wxLegendCss, wxColor, wxOf } from './wxscales.js';
 import { VEG_COLORS } from './climate.js';
 // Pola do wyświetlenia, ich jednostki, skale kolorów i sposób dobierania zakresu.
 // Numeracja zgodna z shaderami: 0–11 pola 3D, 20–30 mapy przy gruncie.
@@ -37,7 +37,7 @@ export const FIELDS = {
   29: { name: 'Satellite view (visible)', unit: 'g/m²', cmap: 9, range: 'fixed', fixed: [0, 1] },
   30: { name: 'Terrain height', unit: 'm', cmap: 10, range: 'terrain' },
   79: { name: 'Surface type', unit: '', cmap: 31, range: 'fixed', fixed: [0, 11] },
-  31: { name: 'Satellite IR (brightness temperature)', unit: '°C', cmap: 12, range: 'fixed', fixed: [-80, 40] },
+  31: { name: 'Satellite IR (brightness temperature)', unit: '°C', cmap: 29, range: 'fixed', fixed: [-90, 50] },
   32: { name: 'Snow depth', unit: 'cm', cmap: 26, range: 'fixed', fixed: [0, 100] },
   33: { name: 'Vegetation greenness (phenology)', unit: '', cmap: 2, range: 'fixed', fixed: [0, 1] },
   37: { name: 'Cloud cover by level', unit: 'g/m²', cmap: 9, range: 'fixed', fixed: [0, 1] },
@@ -66,7 +66,7 @@ export const FIELDS = {
   53: { name: 'SRH 0–3 km (storm-relative helicity)', unit: 'm²/s²', cmap: 21, range: 'fixed', fixed: [-200, 600] },
   54: { name: 'SRH 0–1 km', unit: 'm²/s²', cmap: 21, range: 'fixed', fixed: [-200, 600] },
   56: { name: 'SCP – supercell composite', unit: '', cmap: 8, range: 'fixed', fixed: [0, 10] },
-  34: { name: 'Mean sea level pressure', unit: 'hPa', cmap: 13, range: 'auto', iso: true, isoMin: 1 },
+  34: { name: 'Mean sea level pressure', unit: 'hPa', cmap: 40, range: 'fixed', fixed: [900, 1050], iso: true, isoMin: 1 },
   // analizy klimatyczne (zakładka – poza listą warstw): wybrany okres – miesiąc, pora roku albo rok symulacji; w toku – do tej chwili
   80: { name: 'Period: mean temperature', unit: '°C', cmap: 22, range: 'fixed', fixed: [-50, 50], iso: true },
   81: { name: 'Period: T max (mean of daily maxima)', unit: '°C', cmap: 22, range: 'fixed', fixed: [-50, 50], iso: true },
@@ -77,6 +77,8 @@ export const FIELDS = {
   86: { name: 'Period: absolute T max', unit: '°C', cmap: 22, range: 'fixed', fixed: [-50, 50], iso: true },
   87: { name: 'Period: absolute T min', unit: '°C', cmap: 22, range: 'fixed', fixed: [-50, 50], iso: true },
   88: { name: 'Period: highest daily precipitation', unit: 'mm', cmap: 24, range: 'fixed', fixed: [0, 2000] },
+  89: { name: 'Period: hot days (T max ≥ 30 °C)', unit: 'days', cmap: 0, range: 'fixed', fixed: [0, 30] },
+  90: { name: 'Period: tropical nights (T min ≥ 20 °C)', unit: 'days', cmap: 0, range: 'fixed', fixed: [0, 30] },
 };
 
 export const FIELDS_3D = [0, 1, 2, 3, 4, 5, 13, 6, 12, 7, 8, 9, 10, 11];
@@ -108,7 +110,7 @@ export const LAYER_GROUPS = [
   ...LAYER_LEVELS.map(([p, z]) => ({ name: `Pressure level – ${p} hPa / ${z}`, p, items: LEVEL_FIELDS })),
   { name: 'Any height (slider above the map)', z: true, items: FIELDS_3D },
 ];
-export const FIELDS_MAP = [20, 21, 46, 47, 48, 50, 49, 34, 22, 38, 42, 43, 55, 44, 57, 65, 68, 66, 67, 51, 52, 53, 54, 56, 23, 80, 81, 82, 83, 84, 85, 86, 87, 88, 45, 32, 40, 41, 24, 25, 26, 27, 28, 62, 63, 64, 33, 29, 58, 37, 31, 39, 30, 79];
+export const FIELDS_MAP = [20, 21, 46, 47, 48, 50, 49, 34, 22, 38, 42, 43, 55, 44, 57, 65, 68, 66, 67, 51, 52, 53, 54, 56, 23, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 45, 32, 40, 41, 24, 25, 26, 27, 28, 62, 63, 64, 33, 29, 58, 37, 31, 39, 30, 79];
 
 // "Ładny" krok skali/izolinii: najmniejszy z 1, 2, 5 × 10^n nie mniejszy niż x
 export function niceStep(x) {
@@ -201,7 +203,7 @@ const DBZ_COLORS = [[0.55, 0.85, 0.95], [0.25, 0.65, 0.95], [0.10, 0.35, 0.90], 
   [0.62, 0.00, 0.10], [0.98, 0.05, 0.98], [0.60, 0.33, 0.78]];
 
 export function legendCss(cm) {
-  if (cm >= WX_CMAP0 && cm < WX_CMAP0 + WXS.length) return wxLegendCss(cm - WX_CMAP0);
+  if (wxOf(cm) >= 0) return wxLegendCss(wxOf(cm));
   if (cm === 15) {
     const n = DBZ_COLORS.length;
     return 'linear-gradient(90deg,' + DBZ_COLORS.map((c, i) => `${rgb(c)} ${(100 * i) / n}% ${(100 * (i + 1)) / n}%`).join(',') + ')';
@@ -214,13 +216,6 @@ export function legendCss(cm) {
   if (cm === 16) {
     const st = [[-75, [0.3, 0.55, 0.95]], [-55, [0.92, 0.94, 0.97]], [-40, [0.55, 0.55, 0.58]], [-25, [0.3, 0.2, 0.12]], [-10, [0.08, 0.05, 0.03]]];
     return 'linear-gradient(90deg,' + st.map(([t, c]) => `${rgb(c)} ${((t + 75) / 65 * 100).toFixed(1)}%`).join(',') + ')';
-  }
-  if (cm === 12) {
-    // od −80 (lewo) do +40 °C (prawo), jak irColor w render.wgsl
-    const st = [[-80, [1, 1, 1]], [-65, [0.3, 0, 0.3]], [-65, [0.85, 0.05, 0.05]], [-55, [1, 0.55, 0.05]],
-      [-55, [0.95, 0.9, 0.1]], [-45, [0.1, 0.7, 0.2]], [-45, [0.1, 0.3, 0.9]], [-30, [0.4, 0.8, 1]],
-      [-30, [0.88, 0.88, 0.88]], [40, [0.08, 0.08, 0.08]]];
-    return 'linear-gradient(90deg,' + st.map(([t, c]) => `${rgb(c)} ${((t + 80) / 120 * 100).toFixed(1)}%`).join(',') + ')';
   }
   if (cm === 11) return 'linear-gradient(90deg,' + TEMP_CLASSIC.map((c, i) => `${rgb(c)} ${i * 10}%`).join(',') + ')';
   if (cm === 0) return 'linear-gradient(90deg,' + Array.from({ length: 11 }, (_, i) => `${rgb(turbo(i / 10))} ${i * 10}%`).join(',') + ')';

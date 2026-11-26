@@ -8,7 +8,7 @@ export const fmtX = (v) => `×${+v.toFixed(2)}`;
 // indeks suwaka najbliższy podanej wartości
 export const nearest = (list, v) => list.reduce((b, x, i) => (Math.abs(x - v) < Math.abs(list[b] - v) ? i : b), 0);
 // parametry adresu (start ze strony tytułowej, zmiana siatki w Settings)
-export const manipQuery = (T, R, V) => (T ? `&tan=${T}` : '') + (R !== 1 ? `&rnf=${R}` : '') + (V !== 1 ? `&vrf=${V}` : '');
+export const manipQuery = (T, R, V, S = 0) => (T ? `&tan=${T}` : '') + (R !== 1 ? `&rnf=${R}` : '') + (V !== 1 ? `&vrf=${V}` : '') + (S ? `&sst=${S}` : '');
 // odcinek zmiany w czasie: od wartości from w chwili t0 liniowo do to w chwili t1 [s czasu symulacji]
 export const seg = (v) => ({ from: v, to: v, t0: 0, t1: 0 });
 export const segAt = (s, t) => (t >= s.t1 ? s.to : t <= s.t0 ? s.from : s.from + (s.to - s.from) * (t - s.t0) / (s.t1 - s.t0));

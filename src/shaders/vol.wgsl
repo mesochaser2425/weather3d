@@ -1,5 +1,6 @@
 // Widok 3D – przygotowanie danych (compute):
-//   noise_gen    – kafelkowy szum 3D 64³ (Perlin–Worley, Worley) do detalu chmur, raz na starcie
+//   noise_gen    – kafelkowy szum 3D 128³ (Perlin–Worley, Worley) do detalu chmur i faktury chmur na satelicie, raz na starcie;
+//   noise_mip    – jego mipmapy (średnia 2 × 2 × 2): na satelicie szczegół drobniejszy od piksela wygładza się sam
 //   ground_build – tekstura 2D gruntu: wysokość, zieleń, śnieg, typ roślinności
 //   vol_build    – tekstura 3D chmur (cloudAt): ekstynkcja, część oczka z chmurą, udział lodu, rodzaj chmury
 //   vol_light    – grubość optyczna od każdego woksela w stronę słońca (cienie chmur i gór), prąd pionowy, zmętnienie
@@ -28,6 +29,8 @@ struct VolP {
 @group(0) @binding(9) var samp: sampler;
 @group(0) @binding(10) var lightOut: texture_storage_3d<rgba16float, write>;
 @group(0) @binding(11) var frzOut: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(12) var mipIn: texture_3d<f32>;
+@group(0) @binding(13) var mipOut: texture_storage_3d<rgba8unorm, write>;
 
 fn ldb(b: u32, i: u32) -> f32 { return state[i]; }
 
@@ -82,8 +85,8 @@ fn worley(x: vec3f, P: i32) -> f32 {
 
 @compute @workgroup_size(4, 4, 4)
 fn noise_gen(@builtin(global_invocation_id) g: vec3u) {
-  if (any(g >= vec3u(64u))) { return; }
-  let p = (vec3f(g) + 0.5) / 64.0;
+  if (any(g >= vec3u(128u))) { return; }
+  let p = (vec3f(g) + 0.5) / 128.0;
   // R: Perlin–Worley (kalafiorowa podstawa cumulusów), G/B: Worley (kłęby), A: Perlin fbm
   var pf = 0.0;
   var amp = 0.5;
@@ -94,6 +97,14 @@ fn noise_gen(@builtin(global_invocation_id) g: vec3u) {
   let w2 = worley(p * 8.0, 8) * 0.625 + worley(p * 16.0, 16) * 0.25 + worley(p * 32.0, 32) * 0.125;
   let pw = clamp(pf + (w1 - 0.5) * 0.9, 0.0, 1.0);
   textureStore(noiseOut, g, vec4f(pw, w1, w2, pf));
+}
+
+@compute @workgroup_size(4, 4, 4)
+fn noise_mip(@builtin(global_invocation_id) g: vec3u) {
+  if (any(g >= textureDimensions(mipOut))) { return; }
+  var a = vec4f(0.0);
+  for (var n = 0u; n < 8u; n++) { a += textureLoad(mipIn, 2u * g + vec3u(n & 1u, (n >> 1u) & 1u, (n >> 2u) & 1u), 0); }
+  textureStore(mipOut, g, a / 8.0);
 }
 
 // ---------- grunt ----------

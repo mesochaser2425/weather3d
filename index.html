@@ -228,7 +228,14 @@
     .ttbtns { display: flex; gap: 6px; flex: none; }
     .ttbtns .btn { flex: 1; min-width: 0; }
     #ttStart { flex: none; padding: 13px 8px; font-size: 16px; letter-spacing: .08em; text-transform: uppercase; }
-    #ttFlat, #ttResume { flex: none; }
+    #ttFlat, #ttResume, #ttLiteGo { flex: none; }
+    /* tryb lekki – osobny ekran strony tytułowej (te same wybory, inny nagłówek, opis i szacunek czasu) */
+    #ttLiteTag { display: none; color: #6fd08c; font-weight: 500; }
+    #titleScr.lite #ttLiteTag { display: inline; }
+    #titleScr.lite .tt-side, #titleScr.lite .tt-map { box-shadow: inset 0 0 0 2px #2f6b45; }
+    #ttLiteBox { display: none; }
+    #titleScr.lite #ttLiteBox { display: block; }
+    #brand .lite { display: block; font-size: 9px; color: #6fd08c; text-align: center; letter-spacing: .05em; }
     /* sondaż */
     #csnd { width: 100%; display: block; background: #fff; flex: none; }
     #sndFull { position: fixed; inset: 0; z-index: 70; background: #fff; display: none; }
@@ -363,7 +370,7 @@
 </head>
 <body class="">
   <div id="top">
-    <div id="brand"><img src="/logo-icon.svg" alt="Weather3D" title="Weather3D" /></div>
+    <div id="brand"><img src="/logo-icon.svg" alt="Weather3D" title="Weather3D" /><span class="lite" id="brandLite" hidden title="Light mode: only the synoptic model, downscaled to the terrain">LIGHT</span></div>
     <div id="clock" title="Local solar time"><span id="clockTime">--:--</span><span id="clockDate"></span><span id="clockSun"></span></div>
     <div id="runCtl">
       <button id="pause" class="iconbtn" title="Pause / resume (space)">⏸ Pause</button>
@@ -442,7 +449,7 @@
   <div id="loadScr" class="on"><img src="/logo.svg" alt="Weather3D" /><div id="loadMsg">Starting…</div></div>
 
   <div id="titleScr">
-    <header><img src="/logo.svg" alt="Weather3D" /><div><h1>Weather3D</h1><span>Choose the map size, the start month and the area – then start.</span></div></header>
+    <header><img src="/logo.svg" alt="Weather3D" /><div><h1>Weather3D<b id="ttLiteTag"> · Light mode</b></h1><span id="ttSub">Choose the map size, the start month and the area – then start.</span></div></header>
     <div class="tt-body">
       <div class="tt-map">
         <canvas id="ttMap" title="Wheel – zoom · drag – pan · click – move the area here · drag the area or its corners – move / resize · double-click – fit the area"></canvas>
@@ -463,6 +470,10 @@
           <label><span class="lbl">Grid spacing</span><select id="ttDx"></select></label>
           <div class="hint" id="ttInfo"></div>
         </div>
+        <div class="box" id="ttLiteBox">
+          <h4>Light mode</h4>
+          <div class="hint">Only the synoptic model (75 km) runs; its weather is downscaled to the map: temperature and dew point follow the real terrain, the boundary layer has its own day–night cycle from the ground heat balance, clouds come from humidity and precipitation from the model. Maps, stations, CSV, climate analysis, satellite, radar, manipulation and hurricanes work as usual. The weather is smooth like a global model: no individual thunderstorms, sharp fronts or cloud streets.</div>
+        </div>
         <div class="box">
           <h4>Start month</h4>
           <div id="ttMonths"></div>
@@ -478,6 +489,7 @@
           <button id="ttFlat" class="btn" title="No download: flat terrain, climate of Kraków">Start on flat terrain</button>
           <button id="ttResume" class="btn" title="Continue a run saved with “Save run” in Settings">Load a saved run…</button>
         </div>
+        <button id="ttLiteGo" class="btn" title="A much faster mode for slower computers: only the synoptic model, downscaled to the terrain">Light mode – for slower computers →</button>
         <input id="ttRunFile" type="file" accept=".w3drun" hidden />
         <div class="hint" id="ttRunInfo"></div>
       </div>
@@ -528,6 +540,14 @@
           </div>
           <div class="strip" title="How active the weather is: the north–south temperature contrast and the jet stream of the synoptic model. Above ×1 stronger lows and fronts and bigger swings, below ×1 quieter weather. Builds up over days">
             <span class="slbl">Variability</span><input id="manipV" type="range" min="0" max="6" step="1" value="2" /><b id="manipVV"></b>
+          </div>
+          <div class="strip" title="Sea surface temperature: warmer or cooler oceans and seas in the synoptic model and in the domain. Warm seas feed tropical cyclones (hurricanes from ~26.5 °C), evaporation and showers">
+            <span class="slbl">Sea temperature</span><input id="manipS" type="range" min="-4" max="5" step="0.5" value="0" /><b id="manipSV"></b>
+          </div>
+          <div class="strip" title="Spawn a tropical cyclone: choose the category and how long it takes to reach it, press Spawn, then click the synoptic map or the domain map. After that the simulation decides – warm sea keeps it going, land, cool water and wind shear weaken it">
+            <span class="slbl">Hurricane</span><select id="tcCat"><option value="1">Cat 1</option><option value="2">Cat 2</option><option value="3" selected>Cat 3</option><option value="4">Cat 4</option><option value="5">Cat 5</option></select>
+            <select id="tcRamp" title="Time to reach the chosen category"><option value="0.25">6 hours</option><option value="0.5">12 hours</option><option value="1" selected>1 day</option><option value="2">2 days</option><option value="3">3 days</option></select>
+            <button id="tcSpawn" class="btn" title="Then click the synoptic map or the domain map">Spawn</button>
           </div>
           <div class="strip" title="How long a change made during the run takes to take full effect">
             <span class="slbl">Kick-in time</span><select id="manipRamp"><option value="0.25">6 hours</option><option value="1">1 day</option><option value="3" selected>3 days</option><option value="7">7 days</option><option value="14">14 days</option></select>

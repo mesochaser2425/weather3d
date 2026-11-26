@@ -49,11 +49,24 @@ export const WXS = [
   { key: 'psnow', unit: 'mm/h',
     t: [2, 5, 10, 20, 30, 40, 70, 100, 150],
     c: ['#e0b4ec', '#b070d0', '#7a2a9a', '#8c1e7e', '#a83c98', '#c060b0', '#d68cd0', '#e8b4e4', '#fae8fa'] },
+  // satelita IR (temperatura wierzchołków) – skala „Satellite Cloud Tops Alert” z obrazka użytkownika; kolory odczytane na oko (obrazek bez pliku), między podpisami po równo jak na pasku
+  { key: 'ir', unit: '°C', tk: [-90, -80, -70, -65, -60, -55, -50, -45, -40, -30, -10, 0, 10, 30, 50],
+    t: [-90, -85, -80, -75, -70, -67.5, -65, -62.5, -60, -57.5, -55, -52.5, -50, -47.5, -45, -42.5, -40, -31, -30, -20, -10, -5, 0, 5, 10, 20, 30, 40, 50],
+    c: ['#000000', '#4a0a0a', '#800000', '#b80000', '#f00000', '#ff3c00', '#ff8000', '#ffaa00', '#ffdc00', '#f0ff00', '#b0ff00', '#50f000', '#00e840', '#00e8c0', '#20d0ff',
+      '#30a0ff', '#1060ff', '#000080', '#ffffff', '#e4e4e4', '#c8c8c8', '#b8b8b8', '#a8a8a8', '#989898', '#888888', '#606060', '#404040', '#222222', '#080808'] },
+  // ciśnienie na poziomie morza [hPa] – stała skala jak na Meteologix (niże fioletowo-niebieskie, ~1010 zielenie, wyże żółcie → czerwienie;
+  // odcienie przybliżone, bez obrazka wzorcowego); wcześniej zakres ruchomy z pola – ten sam kolor znaczył co chwila inne ciśnienie
+  { key: 'mslp', unit: 'hPa', tk: [920, 950, 970, 990, 1000, 1010, 1020, 1030, 1040],
+    t: [900, 920, 940, 950, 960, 970, 980, 985, 990, 995, 1000, 1005, 1010, 1015, 1020, 1025, 1030, 1035, 1040, 1050],
+    c: ['#2a0a3c', '#4b1464', '#6e2896', '#8c3cbe', '#6450d2', '#3c6edc', '#3c96eb', '#46b4f0', '#5ac8e6', '#64d2be', '#6edc96',
+      '#96e173', '#c3e65f', '#f0eb50', '#f5d241', '#f5af37', '#f08c2d', '#e65f28', '#d23228', '#aa1e3c'] },
 ];
 for (const s of WXS) s.rgb = s.c.map(hex);
 export const WX_INDEX = Object.fromEntries(WXS.map((s, i) => [s.key, i]));
-// identyfikatory skal w render.wgsl / fields.js (cmap): 22 + numer skali
+// identyfikatory skal w render.wgsl / fields.js (cmap): 22 + numer skali (0–7); ciśnienie – cmap 40 (30 i 31 zajęte: fronty, typ powierzchni)
 export const WX_CMAP0 = 22;
+export const WX_MSLP = 40;
+export const wxOf = (cm) => (cm === WX_MSLP ? WX_INDEX.mslp : cm >= WX_CMAP0 && cm < WX_CMAP0 + 8 ? cm - WX_CMAP0 : -1);
 
 // kolor płynnie interpolowany między progami (kolor progu = kolor klasy z WX Charts)
 export function wxColor(key, v) {

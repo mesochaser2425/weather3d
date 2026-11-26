@@ -18,7 +18,7 @@ struct View {
   sunZ: f32,
   hmax: f32,      // najwyższy punkt terenu [m]
   cloudAlpha: f32,  // krycie chmur na przekrojach (0 = przezroczyste)
-  relief: u32,      // bit 0: cieniowanie rzeźby na mapach, bit 1: poziomice, 2–4 piętra chmur, 5 strzałki wiatru, 6 siatka
+  relief: u32,      // bit 0: cieniowanie rzeźby na mapach, bit 1: poziomice, 2–4 piętra chmur, 5 strzałki wiatru, 6 siatka, 7 dawny obraz chmur na satelicie
   time: f32,       // czas rzeczywisty [s] (miganie błyskawic)
   cuPh: f32,       // faza pokoleń cumulusów (cuGen; main.js cuTick)
   hiF: f32,        // gęstszy teren do obrazu: punktów na oczko (0 – brak, rzeźba z siatki modelu; main.js loadDemHi)
@@ -39,6 +39,7 @@ struct View {
   vhF: f32,        // gęstsze pokrycie terenu do obrazu: punktów na oczko (0 – z oczek; main.js buildVegHi)
   cuD: array<vec4f, 36>,   // przesunięcie pokoleń 0 (xy) i 1 (zw) [m] w kaflach (wiersze po cuNx)
   cuD2: array<vec4f, 36>,  // to samo z wiatrem średnim 0–6 km – chmury kłębiaste piętra średniego (altocumulus)
+  cuW: array<vec4f, 36>,   // ulice chmur (main.js cuStream): x – odchyłkowa funkcja prądu kafla [m²/s]; w kaflu 0: yz – średni wiatr domeny, w – średnia kwadratowa prędkość [m/s]
 }
 
 @group(0) @binding(0) var<uniform> V: View;
@@ -48,6 +49,8 @@ struct View {
 @group(0) @binding(4) var<storage, read> sfc: array<f32>;
 @group(0) @binding(5) var<storage, read> demHi: array<f32>;   // gęstszy teren (V.hiF × V.hiF punktów na oczko widocznej domeny)
 @group(0) @binding(6) var<storage, read> vegHi: array<u32>;   // gęstsze pokrycie terenu (V.vhF × V.vhF punktów na oczko, 1 bajt na punkt, 12 – skały)
+@group(0) @binding(7) var noiseT: texture_3d<f32>;            // szum 3D kafelkowy (vol.wgsl noise_gen): r Perlin–Worley, g / b Worley (grubszy / drobniejszy), a Perlin fbm
+@group(0) @binding(8) var noiseS: sampler;
 
 fn ldb(b: u32, i: u32) -> f32 {
   if (b == 0u) { return state[i]; }
@@ -141,10 +144,10 @@ fn cmapOf(f: u32) -> u32 {
     case 23u: { return 24u; }
     case 12u: { return 23u; }
     case 32u: { return 26u; }
-    case 34u: { return 13u; }
+    case 34u: { return 40u; }   // ciśnienie: stała skala jak Meteologix (wxPal 8; wcześniej stara skala 13 – legenda pokazywała nową, mapa starą)
     case 27u: { return 8u; }
     case 29u, 37u: { return 9u; }
-    case 31u: { return 12u; }
+    case 31u: { return 29u; }   // satelita IR: skala „Cloud Tops” (wxPal 7; wcześniej stara szara 12 – wierzchołki czarne zamiast kolorowych, legenda z kolorami)
     case 38u: { return 15u; }
     case 39u: { return 16u; }
     case 40u: { return 17u; }
@@ -155,6 +158,7 @@ fn cmapOf(f: u32) -> u32 {
     case 45u: { return 20u; }
     case 46u, 47u, 80u, 81u, 82u, 86u, 87u: { return 22u; }
     case 83u, 84u, 85u, 88u: { return 24u; }
+    case 89u, 90u: { return 0u; }
     case 48u: { return 8u; }
     case 49u, 50u, 51u, 52u: { return 23u; }
     case 53u, 54u: { return 21u; }
@@ -164,16 +168,6 @@ fn cmapOf(f: u32) -> u32 {
     case 79u: { return 31u; }
     default: { return 1u; }
   }
-}
-
-// Klasyczna skala satelity IR (wzmocniona): ciepło – ciemno, zimno – jasno, wierzchołki
-// poniżej −30 °C kolorowe (jak na obrazach wzmocnionych IR)
-fn irColor(tb: f32) -> vec3f {
-  if (tb > -30.0) { return vec3f(mix(0.08, 0.88, clamp((40.0 - tb) / 70.0, 0.0, 1.0))); }
-  if (tb > -45.0) { return mix(vec3f(0.40, 0.80, 1.00), vec3f(0.10, 0.30, 0.90), (-30.0 - tb) / 15.0); }
-  if (tb > -55.0) { return mix(vec3f(0.10, 0.70, 0.20), vec3f(0.95, 0.90, 0.10), (-45.0 - tb) / 10.0); }
-  if (tb > -65.0) { return mix(vec3f(1.00, 0.55, 0.05), vec3f(0.85, 0.05, 0.05), (-55.0 - tb) / 10.0); }
-  return mix(vec3f(0.30, 0.0, 0.30), vec3f(1.0), clamp((-65.0 - tb) / 15.0, 0.0, 1.0));
 }
 
 // Odbiciowość radarowa [dBZ] w klasach co 5 dBZ (paleta jak w serwisach radarowych)
@@ -301,6 +295,9 @@ fn mapCol(f: u32, col: u32) -> f32 {
     case 86u: { let s = sfcAt(S_MXA, col); return select(sfcAt(S_MV, col), max(select(-999.0, s - 1000.0, s > 0.0), sfcAt(S_TMAX, col)), V.monCur > 0.5); }
     case 87u: { let s = sfcAt(S_MNA, col); return select(sfcAt(S_MV, col), min(select(999.0, 1000.0 - s, s > 0.0), sfcAt(S_TMIN, col)), V.monCur > 0.5); }
     case 88u: { return select(sfcAt(S_MV, col), max(sfcAt(S_MPD, col), sfcAt(S_PACC, col) - sfcAt(S_PD0, col)), V.monCur > 0.5); }
+    // liczba dni upalnych (T maks. ≥ 30 °C) i nocy tropikalnych (T min. ≥ 20 °C) w okresie
+    case 89u: { return select(sfcAt(S_MV, col), sfcAt(S_MHOT, col), V.monCur > 0.5); }
+    case 90u: { return select(sfcAt(S_MV, col), sfcAt(S_MTRO, col), V.monCur > 0.5); }
     case 24u: { return sfcAt(S_TS, col) - 273.15; }
     case 25u: { return sfcAt(S_H, col); }
     case 26u: { return sfcAt(S_LE, col); }
@@ -472,22 +469,155 @@ fn cuDisp2(xy: vec2f) -> vec4f {
 // o dziesiątki km (różnica wiatrów × okres pokolenia, w MAX ~4 h), a wm zmienia się na 1–2 oczkach, więc wzór ściskał się w poprzek
 // tego przejścia kilkanaście razy – cienkie, poskręcane białe smugi wzdłuż granicy pięter.
 // Pętla po obu wzorach i pokoleniach, granice zależne od wm: drugi wzór liczony tylko w przejściu (jak blobMask w widokach 3D)
-fn cuBlob(X: f32, Y: f32, fc: f32, wm: f32) -> f32 {
+// Zwraca (maska kłębu, kierunek od jego środka × ρ – do światłocienia). fe0 – patrz cuShape; bnd – mnożnik pokrycia wzoru niskiego (ulice chmur, cuStreet)
+// m – maska × jasność (dawny obraz), gr – kierunek od środka kłębu × ρ, s – głębokość w kłębie (0 na brzegu, 1 w środku; ujemna tuż za brzegiem), q – położenie we wzorze (w bokach siatki kłębów;
+// faktura kłębu płynie razem z nim)
+struct CuB { m: f32, gr: vec2f, s: f32, q: vec2f }
+fn cuBlob(X: f32, Y: f32, fc: f32, wm: f32, fe0: f32, bnd: f32) -> CuB {
   let xy = vec2f((X - f32(MG)) * DX, (Y - f32(MG)) * DY);
   let dl = cuDisp(xy);
   let dh = cuDisp2(xy);
   var m = 0.0;
+  var gr = vec2f(0.0);
+  var sb = -1.0;
+  var qb = vec2f(0.0);
   let t1 = select(4u, 2u, wm <= 0.01);
   for (var t = select(0u, 2u, wm >= 0.99); t < t1; t++) {
     let mid = t >= 2u;
     let g = t & 1u;
     let d = select(dl, dh, mid);
     let gq = cuGen(xy, select(d.xy, d.zw, g == 1u), V.cuPh, V.blobS, g);
-    let sh = cuShape(gq.xy + select(vec2f(0.0), CU_MID, mid), fc * select(1.0 - wm, wm, mid), gq.z);
+    let qq = gq.xy + select(vec2f(0.0), CU_MID, mid);
+    let sh = cuShape(qq, min(fc * select((1.0 - wm) * bnd, wm, mid), 1.0), gq.z, fe0);
     let mk = 1.0 - smoothstep(sh.y - 0.06, sh.y + 0.06, sh.x);
-    m = max(m, mk * (0.75 + 0.5 * clamp(1.0 - sh.x / max(sh.y, 1e-3), 0.0, 1.0)));
+    let sn = 1.0 - sh.x / max(sh.y, 1e-3);
+    let mv = mk * (0.75 + 0.5 * clamp(sn, 0.0, 1.0));
+    if (mv > m) { m = mv; gr = sh.zw; }
+    if (sn > sb) { sb = sn; qb = qq + vec2f(f32(g) * 13.7, f32(g) * 5.3); }
   }
-  return m;
+  return CuB(m, gr, max(sb, -1.0), qb);
+}
+// Satelita VIS (nowy obraz chmur): szum 3D o boku kafla tile [m] przy pikselu px [m], poziom mipmapy z wielkości piksela (+ bias) – szczegół drobniejszy od piksela wygładza się do średniej
+// (bez ziarna i migotania przy oddaleniu); uvw – położenie w kaflach, trzecia współrzędna – czas (powolna ewolucja)
+fn satNz(uvw: vec3f, tile: f32, px: f32, bias: f32) -> vec4f { return textureSampleLevel(noiseT, noiseS, uvw, log2(max(px * 128.0 / tile, 1.0)) + bias); }
+// To samo bez widocznego powtarzania (p [m], z – wymiar czasu): sam satNz powtarza się co bok kafla – przy oddaleniu regularna kratka wzoru, płynąca w jednym
+// kierunku (użytkownik). Współrzędne zniekształcone gładkim szumem nieokresowym (±~0.2 kafla w skali ~3 kafli) i druga próbka w skali ×1.37 obrócona o 36° –
+// okresy się nie pokrywają; suma dwóch niezależnych próbek z zachowanym kontrastem (/√2)
+fn satNzA(p: vec2f, z: f32, tile: f32, px: f32, bias: f32) -> vec4f {
+  let q = p / tile;
+  let q1 = q + 0.45 * vec2f(vnoise(q * 0.31 + vec2f(3.7, 1.9)) - 0.5, vnoise(q * 0.31 + vec2f(8.1, 5.3)) - 0.5);
+  let q2 = mat2x2f(0.809, 0.588, -0.588, 0.809) * q1 / 1.37 + vec2f(0.43, 0.17);
+  return 0.5 + 0.7071 * (satNz(vec3f(q1, z), tile, px, bias) + satNz(vec3f(q2, z + 0.29), 1.37 * tile, px, bias) - 1.0);
+}
+// odbicie warstwy chmur o grubości optycznej tau (przybliżenie dwustrumieniowe, rozpraszanie zachowawcze): 0 – przezroczysta, → 1 – gruba; gam = 2·μ₀/(1 − g)
+fn satRefl(tau: f32, gam: f32) -> f32 { let t = max(tau, 0.0); return t / (t + gam); }
+// jedna warstwa nad tym, co pod nią (L – światło od spodu, W – oświetlenie wierzchołków × barwa): odbite + dwukrotnie przepuszczone, z odbiciami między warstwami
+// (metoda dodawania: R + T²·R₂/(1 − R·R₂)) – cienka chmura nad jasnym pokładem go nie przyciemnia, nad ciemnym gruntem jest szarawą zasłoną
+fn satOver(L: vec3f, R: f32, W: vec3f) -> vec3f {
+  let r2 = clamp(dot(L, vec3f(0.3, 0.5, 0.2)) / max(dot(W, vec3f(0.3, 0.5, 0.2)), 1e-4), 0.0, 0.97);
+  return R * W + (1.0 - R) * (1.0 - R) * L / (1.0 - R * r2);
+}
+
+// Ulice chmur (tylko obraz): mnożnik pokrycia kłębów (średnio 1) – pasma wzdłuż linii prądu wiatru warstwy chmur. Układ fal płaskich wygina funkcja prądu ψ' (bez części od średniego wiatru domeny,
+// main.js cuStream). Część od średniego wiatru to jeden z 12 gotowych kierunków z fazą w układzie Ziemi (sąsiednie przenikają się): ciągła zmiana kierunku przesuwałaby pasma po całej domenie.
+// Mechanizmy jak w naturze: odstęp rośnie z głębokością warstwy granicznej (~3 zi; dwa układy odstępów przenikają się – rozwidlenia), a im silniejsze termiki względem wiatru, tym pasma bardziej falują
+// i rwą się (przejście rolek w komórki)
+fn bspW(t: f32) -> vec4f {
+  let t2 = t * t;
+  let t3 = t2 * t;
+  return vec4f(1.0 - 3.0 * t + 3.0 * t2 - t3, 4.0 - 6.0 * t2 + 3.0 * t3, 1.0 + 3.0 * t + 3.0 * t2 - 3.0 * t3, t3) / 6.0;
+}
+fn cuPsi(xy: vec2f) -> f32 {
+  let nx = V.cuNx;
+  let ny = V.cuNy;
+  let fx = clamp(xy.x / (f32(NXD) * DX) * nx - 0.5, 0.0, nx - 1.0);
+  let fy = clamp(xy.y / (f32(NYD) * DY) * ny - 0.5, 0.0, ny - 1.0);
+  let ix = floor(fx);
+  let iy = floor(fy);
+  let wx = bspW(fx - ix);
+  let wy = bspW(fy - iy);
+  var s = 0.0;
+  for (var b = 0u; b < 4u; b++) {
+    let jj = u32(clamp(iy + f32(b) - 1.0, 0.0, ny - 1.0));
+    for (var a = 0u; a < 4u; a++) {
+      s += wx[a] * wy[b] * V.cuW[jj * u32(nx) + u32(clamp(ix + f32(a) - 1.0, 0.0, nx - 1.0))].x;
+    }
+  }
+  return s;
+}
+fn cuStreetWave(xy: vec2f, dn: f32, i: f32, lam: f32, wig: f32, wm: vec2f) -> f32 {
+  let th = i * 3.14159265 / 12.0;
+  let sg = select(-1.0, 1.0, dot(wm, vec2f(cos(th), sin(th))) >= 0.0);   // zwrot wiatru względem kierunku układu (kierunki tylko w 0…180°)
+  let c = 0.5 + 0.5 * cos(6.2831853 * (dot(vec2f(-sin(th), cos(th)), xy) + sg * dn) / lam + 2.4 * i + wig);
+  return 2.6667 * c * c;
+}
+// włókna cirrusów w układzie stałego kierunku i·15° (pofalowanym grubym szumem – nie równoległe kreski): (włókna, gruba skala)
+fn satFib(pwm: vec2f, i: f32, nra: vec2f, zt: f32, pxm: f32) -> vec2f {
+  let th = i * 3.14159265 / 12.0;
+  let ew = vec2f(cos(th), sin(th));
+  let pa = vec2f(dot(pwm, ew), dot(pwm, vec2f(-ew.y, ew.x))) + 26000.0 * (nra - 0.5);
+  // (współrzędne zniekształcone szumem nieokresowym – bez powtarzania kafla szumu)
+  let qa = vec2f(pa.x / 230000.0, pa.y / 85000.0);
+  let qb = vec2f(pa.x / 64000.0, pa.y / 21000.0 + 0.3);
+  let fA = satNz(vec3f(qa + 0.4 * vec2f(vnoise(qa * 0.33 + vec2f(2.3, 7.7)) - 0.5, vnoise(qa * 0.33 + vec2f(6.1, 3.3)) - 0.5), 0.7 * zt + 0.2), 85000.0, pxm, 0.5).a;
+  let fB = satNz(vec3f(qb + 0.4 * vec2f(vnoise(qb * 0.33 + vec2f(5.9, 1.1)) - 0.5, vnoise(qb * 0.33 + vec2f(9.4, 4.6)) - 0.5), 1.1 * zt + 0.55), 21000.0, pxm, 0.7).a;
+  return vec2f(0.62 * fA + 0.38 * fB, fA);
+}
+fn cuStreet(xy: vec2f, zi: f32, chaos: f32) -> f32 {
+  let wm = V.cuW[0].yz;
+  if (dot(wm, wm) < 1.0) { return 1.0; }
+  let lam = max(2.5 * V.blobS, 9000.0);
+  let idx = fract(atan2(wm.y, wm.x) / 3.14159265) * 12.0;
+  let i0 = floor(idx);
+  let i1 = (i0 + 1.0) % 12.0;
+  let wd = smoothstep(0.35, 0.65, idx - i0);
+  let dn = cuPsi(xy) / max(V.cuW[0].w, 3.0);
+  // (falowanie, przerwy i obszary z ulicami płyną ze średnim wiatrem warstwy chmur – wcześniej stały w miejscu, a kłęby tylko przez nie przepływały: ulice
+  // wyglądały statycznie i „wymuszenie”, użytkownik; same linie zostają w układzie Ziemi – leżą wzdłuż wiatru, więc przesuw wzdłuż nich niczego nie zmienia)
+  let xm = xy - vec2f(V.nofx, V.nofy);
+  let wig = chaos * ((vnoise(xm / 30000.0 + vec2f(17.3, 3.9)) - 0.5) + 0.45 * (vnoise(xm / 11000.0 + vec2f(4.1, 8.8)) - 0.5));
+  let b1 = mix(cuStreetWave(xy, dn, i0, lam, wig, wm), cuStreetWave(xy, dn, i1, lam, wig, wm), wd);
+  let b2 = mix(cuStreetWave(xy, dn, i0, 1.7 * lam, wig, wm), cuStreetWave(xy, dn, i1, 1.7 * lam, wig, wm), wd);
+  // ulice porwane na odcinki ~20–60 km (przerwy płyną z wiatrem) i nieco słabszy kontrast linii
+  let brk = smoothstep(0.25, 0.6, vnoise(xm / 32000.0 + vec2f(8.3, 21.4)));
+  return mix(1.0, mix(1.0, mix(b1, b2, smoothstep(700.0, 1700.0, zi)), 0.85 * brk), smoothstep(0.22, 0.55, vnoise(xm / 24000.0 + vec2f(31.7, 12.2))));
+}
+
+// Interpolacja B-sklejanymi (4 odczyty dwuliniowe): gładka, z ciągłą pochodną – bez śladu siatki oczek w cieniach
+fn sfcBsp(sx: u32, X: f32, Y: f32) -> f32 {
+  let p = vec2f(X, Y) - 0.5;
+  let c = floor(p);
+  let t = p - c;
+  let t2 = t * t;
+  let t3 = t2 * t;
+  let w0 = (1.0 - 3.0 * t + 3.0 * t2 - t3) / 6.0;
+  let w1 = (4.0 - 6.0 * t2 + 3.0 * t3) / 6.0;
+  let w2 = (1.0 + 3.0 * t + 3.0 * t2 - 3.0 * t3) / 6.0;
+  let w3 = t3 / 6.0;
+  let g0 = w0 + w1;
+  let g1 = w2 + w3;
+  let h0 = c + 0.5 + w1 / g0 - 1.0;
+  let h1 = c + 0.5 + w3 / g1 + 1.0;
+  return g0.y * (g0.x * sfcBil(sx, h0.x, h0.y) + g1.x * sfcBil(sx, h1.x, h0.y)) + g1.y * (g0.x * sfcBil(sx, h0.x, h1.y) + g1.x * sfcBil(sx, h1.x, h1.y));
+}
+
+// Satelita VIS, cień rzucany: jak bardzo piętro chmur (sx – jego woda [g/m²]) na wysokości h [m] zasłania słońce punktowi (X, Y).
+// Czytane w stronę słońca (przesunięcie h·ctg wysokości słońca, ctg ≤ 4 – przy samym horyzoncie cień nie odrywa się od chmury).
+// Cień dają tylko chmury zajmujące większość oczka (COVER ≥ 50–90%): rozproszone cumulusy mają wodę na całe oczko,
+// więc przyciemniałyby równo cały grunt między kłębami. Zwraca (krycie, temperatura wierzchołka w miejscu, skąd pada cień [°C])
+fn satCast(sx: u32, h: f32, X: f32, Y: f32) -> vec2f {
+  let mu = max(V.sunZ, 0.24);
+  let Xs = X + h * V.sunX / mu / DX;
+  let Ys = Y + h * V.sunY / mu / DY;
+  let lw = sfcBsp(sx, Xs, Ys);
+  if (lw < 0.05) { return vec2f(0.0); }
+  let cv = sfcBil(S_COVER, Xs, Ys);
+  return vec2f(smoothstep(0.5, 0.9, cv) * (1.0 - exp(-0.15 * lw / (max(cv, 0.05) * mu))), sfcBsp(S_TBS, Xs, Ys));
+}
+// Satelita VIS, światłocień: oświetlenie zbocza wierzchołka o nachyleniu (hx, hy) [m/m] względem płaskiego (płaski = 1)
+fn satRelief(hx: f32, hy: f32) -> f32 {
+  let n = normalize(vec3f(-hx, -hy, 1.0));
+  return clamp(n.z + (n.x * V.sunX + n.y * V.sunY) / max(V.sunZ, 0.15), 0.55, 1.15);
 }
 
 // Cieniowanie rzeźby terenu: światło z NW (mapy) albo ze słońca (widok satelitarny)
@@ -560,15 +690,19 @@ fn vegHiCell(i: i32, j: i32) -> u32 {
   let F = i32(V.vhF);
   return u32(clamp(j / F, 0, i32(NYD) - 1) + i32(MG)) * NX + u32(clamp(i / F, 0, i32(NXD) - 1) + i32(MG));
 }
-struct GroundHi { c: vec3f, vt: u32, col: u32 }
+struct GroundHi { c: vec3f, vt: u32, col: u32, fw: f32 }   // fw – udział lasu (mieszanka czterech punktów – śnieg na lesie bez kwadratów punktów)
 // przy oddaleniu (piksel ekranu obejmuje kilka punktów: fp – punktów na piksel) kolor uśredniony po pikselu (2 × 2 próbki w odstępie fp/2) – bez migotania
 // i ziarna z przypadkowego punktu
 fn groundHiA(X: f32, Y: f32, fp: f32) -> GroundHi {
   let g0 = groundHi(X, Y);
   if (fp < 1.2) { return g0; }
   let e = 0.35 * min(fp, 6.0) / V.vhF;
-  let c = 0.25 * (groundHi(X - e, Y - e).c + groundHi(X + e, Y - e).c + groundHi(X - e, Y + e).c + groundHi(X + e, Y + e).c);
-  return GroundHi(mix(g0.c, c, smoothstep(1.2, 2.0, fp)), g0.vt, g0.col);
+  let g1 = groundHi(X - e, Y - e);
+  let g2 = groundHi(X + e, Y - e);
+  let g3 = groundHi(X - e, Y + e);
+  let g4 = groundHi(X + e, Y + e);
+  let a = smoothstep(1.2, 2.0, fp);
+  return GroundHi(mix(g0.c, 0.25 * (g1.c + g2.c + g3.c + g4.c), a), g0.vt, g0.col, mix(g0.fw, 0.25 * (g1.fw + g2.fw + g3.fw + g4.fw), a));
 }
 fn groundHi(X: f32, Y: f32) -> GroundHi {
   let u = (X - f32(MG)) * V.vhF - 0.5;
@@ -578,15 +712,18 @@ fn groundHi(X: f32, Y: f32) -> GroundHi {
   let fx = u - floor(u);
   let fy = v - floor(v);
   var c = vec3f(0.0);
+  var fw = 0.0;
   for (var q = 0; q < 4; q++) {
     let i = i0 + (q & 1);
     let j = j0 + (q >> 1);
     let w = select(1.0 - fx, fx, (q & 1) == 1) * select(1.0 - fy, fy, (q >> 1) == 1);
-    c += w * vegColorT(vegHiCode(i, j), vegHiCell(i, j), vec2i(i, j));
+    let vq = vegHiCode(i, j);
+    c += w * vegColorT(vq, vegHiCell(i, j), vec2i(i, j));
+    fw += w * select(0.0, 1.0, vq == 1u || vq == 2u || vq == 5u || vq == 11u);
   }
   let ni = i0 + select(0, 1, fx > 0.5);
   let nj = j0 + select(0, 1, fy > 0.5);
-  return GroundHi(c, vegHiCode(ni, nj), vegHiCell(ni, nj));
+  return GroundHi(c, vegHiCode(ni, nj), vegHiCell(ni, nj), fw);
 }
 
 // gładka wysokość terenu (dwuliniowo, bez zawijania przy brzegach otwartych)
@@ -660,7 +797,10 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
 
   // mapy specjalne
   let nw = vec3f(-1.0, 1.0, 1.4);
-  if (cm >= 22u && cm <= 27u) {
+  if (cm == 40u) {
+    // ciśnienie: stała skala (wxscales.js, mslp)
+    col = wxPal(8u, val);
+  } else if (cm >= 22u && cm <= 27u) {
     // skale WX Charts (klasy progowe, wxscales.js): wiatr w km/h; opad i śnieg poniżej pierwszego progu – teren
     let p = cm - 22u;
     let v = select(select(val, val * 3.6, p == 1u), val / max(V.accF, 1e-3), p == 2u);
@@ -765,8 +905,8 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
     if (ph == 3u) { col = vec3f(0.95, 0.10, 0.45); }
     if (ph == 4u) { col = vec3f(0.80, 0.80, 0.80); }
     if (ph == 5u) { col = mix(col, vec3f(0.72, 0.66, 0.86), 0.75); }     // szczyty / zbocza w chmurach
-  } else if (cm == 12u) {
-    col = irColor(val);
+  } else if (cm == 29u) {
+    col = wxPal(7u, val);
   } else if (cm == 9u) {
     // widok satelitarny w świetle widzialnym: teren oświetlony słońcem + chmury
     let sun = vec3f(V.sunX, V.sunY, max(V.sunZ, 0.0));
@@ -783,6 +923,7 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
     // gęstsza mapa pokrycia (ESA WorldCover, ~0.5–1 km): kolory czterech najbliższych punktów zmieszane, punkt przesunięty drobnym szumem (±~0.6 punktu) –
     // rozmyte, nieregularne granice pól, lasów, hal i skał; śnieg i lód jezior z oczka
     var wice = vt == 10u && sfcAt(S_ICE, gcol0) <= 0.0;
+    var fwo = select(0.0, 1.0, vt == 1u || vt == 2u || vt == 5u || vt == 11u);
     if (V.vhF > 1.5) {
       let fpH = max(fwidth(X), fwidth(Y)) * V.vhF;
       let jH = (1.0 - smoothstep(1.0, 2.0, fpH)) / V.vhF;
@@ -790,11 +931,19 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
       let Xh = X + (0.9 * (vnoise(qh + vec2f(4.3, 17.9)) - 0.5) + 0.45 * (vnoise(qh * 2.7 + vec2f(13.1, 2.2)) - 0.5)) * jH;
       let Yh = Y + (0.9 * (vnoise(qh + vec2f(21.7, 3.4)) - 0.5) + 0.45 * (vnoise(qh * 2.7 + vec2f(6.6, 19.5)) - 0.5)) * jH;
       let gh = groundHiA(Xh, Yh, fpH);
-      ground = gh.c; vt = gh.vt; gcol0 = gh.col;
+      ground = gh.c; vt = gh.vt; gcol0 = gh.col; fwo = gh.fw;
       wice = vt == 10u && !waterIce(gcol0);
     }
     let lit = select(0.0, hillshade(X, Y, sun), V.sunZ > 0.0);
-    let fsn = select(clamp(sfcBil(S_SWE, Xg, Yg) / 10.0, 0.0, 1.0) * select(1.0, 0.5, vt == 1u || vt == 2u || vt == 5u || vt == 11u), 0.0, wice);
+    // Śnieg (tylko obraz) w rozdzielczości gęstszego terenu: SWE oczek B-sklejane (dwuliniowo izolinia 10 mm szła prosto wzdłuż oczek – kanciaste łaty), w dolinach
+    // poniżej średniej wysokości oczka mniej, na grzbietach więcej (× e^(Δh/350 m)), strome zbocza (≥ ~35–50°) odsłonięte, brzeg rozmyty nieruchomym szumem
+    // w skali ~1–3 km; las zasłania śnieg wg udziału lasu z czterech punktów mapy pokrycia (wcześniej najbliższy punkt – kwadraty). Model liczy śnieg dalej na oczku
+    let dhS = demAt(X, Y) - hgtAt(X, Y);
+    let slS = length(demSlope(X, Y));
+    let qs = vec2f(X * DX, Y * DY) / 1800.0;
+    let nzS = 0.65 * vnoise(qs + vec2f(5.3, 2.9)) + 0.35 * vnoise(qs * 2.6 + vec2f(1.7, 7.4)) - 0.5;
+    let aS0 = max(sfcBsp(S_SWE, Xg, Yg), 0.0) / 10.0 * exp(clamp(dhS / 350.0, -4.0, 2.0)) * (1.0 - 0.75 * smoothstep(0.7, 1.2, slS));
+    let fsn = select(smoothstep(0.0, 1.0, aS0 + 0.45 * nzS * smoothstep(0.02, 0.3, aS0)) * (1.0 - 0.5 * fwo), 0.0, wice);
     let gcol = mix(ground, vec3f(0.92, 0.94, 0.97), fsn) * (0.25 + 0.75 * lit);
     // zachmurzenie ogólne z tego samego opisu chmur co widok 3D i promieniowanie (cloudAt): w przerwach
     // widać grunt – chmury porwane wg szumu o skali kilku km, płynącego z wiatrem
@@ -806,8 +955,9 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
     let qn = vec2f((X - f32(MG)) * DX - V.nofx, (Y - f32(MG)) * DY - V.nofy) / (3.0 * DX);
     let Xw = X + 1.4 * (vnoise(qn) - 0.5) + 0.7 * (vnoise(qn * 2.3 + vec2f(5.2, 1.7)) - 0.5);
     let Yw = Y + 1.4 * (vnoise(qn + vec2f(11.3, 7.1)) - 0.5) + 0.7 * (vnoise(qn * 2.3 + vec2f(2.9, 13.4)) - 0.5);
-    let lwt = max(mapBlur(29u, Xw, Yw), 0.0);
-    let lwc = clamp(mapBlur(61u, Xw, Yw), 0.0, lwt);
+    // (B-sklejane: 4 odczyty dwuliniowe na pole – gładkie jak dawne wygładzanie 5 × interpolacja dwusześcienna, a ~5× mniej odczytów)
+    let lwt = max(1000.0 * sfcBsp(S_LWP, Xw, Yw), 0.0);
+    let lwc = clamp(1000.0 * sfcBsp(S_LWPC, Xw, Yw), 0.0, lwt);
     // warstwowe: gładko, bez dziur – część oczka działa jak przezroczystość; kłębiaste: miękkie brzegi
     // krycie z grubości optycznej τ ≈ 0.15·LWP[g/m²] – tak samo jak w widoku 3D (exp(−∫ekstynkcja)) i w promieniowaniu
     // (wcześniej 0.06 – ta sama chmura na mapie 2.5× bardziej przezroczysta niż w 3D: piętro średnie jak mgiełka)
@@ -818,23 +968,222 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
     // (wcześniej woda rozłożona na całe oczko: cumulusy na 20% oczka wyglądały jak pełny pokład)
     // kowadła i cirrusy (warstwowe lodowe < −20 °C) leżą nad kłębami – rysowane na końcu, zasłaniają wieże burz (wcześniej
     // wszystkie chmury warstwowe pod kłębami: wieże „na wierzchu” tarczy kowadła)
-    let lwa = clamp(mapBlur(69u, Xw, Yw), 0.0, lwt - lwc);
+    let lwa = clamp(1000.0 * sfcBsp(S_LWPA, Xw, Yw), 0.0, lwt - lwc);
     let aS = 1.0 - exp(-0.15 * (lwt - lwc - lwa));
     let aA = 1.0 - exp(-0.15 * lwa);
-    let fC = clamp(mapBlur(59u, Xw, Yw) / 100.0, 0.05, 1.0);
+    let fCr = sfcBsp(S_COVC, Xw, Yw);
+    let fC = clamp(fCr, 0.05, 1.0);
     // pojedyncze cumulusy (ta sama część oczka): kłęby wokół punktów siatki ~2 oczek, płynące z wiatrem ~1.5 km – jak w widoku 3D
     // (wcześniej krycie rozłożone równo: nieruchome białawe plamy); przy części oczka bliskiej 1 i na siatkach < ~0.5 km – równo
-    let wbC = smoothstep(300.0, 900.0, DX) * (1.0 - smoothstep(0.85, 0.97, fC));
+    // (przy dużym oddaleniu, gdy kłąb ma poniżej ~2 pikseli, równa zasłona o tym samym kryciu – inaczej ziarno i migotanie)
+    let pxC = max(fwidth(X), fwidth(Y)) * DX / V.blobS;
+    // (tryb lekki: bez pojedynczych cumulusów, ulic i rozpadu brzegów pokładów – chmury kłębiaste jako równa zasłona; użytkownik: uprościć obraz)
+    let wbZ = smoothstep(300.0, 900.0, DX) * (1.0 - smoothstep(0.3, 0.8, pxC)) * (1.0 - LITE);
+    // (przejście od kłębów do pełnego zachmurzenia kłębiastego szerokie – przy 0.85–0.97 wzdłuż izolinii pokrycia szedł „mur” gęstych kłębów obok gładkiej warstwy)
+    let wbC = wbZ * (1.0 - smoothstep(0.75, 1.0, fC));
     // (z pól wygładzonych w punkcie przesuniętym – wcześniej z jednego oczka: tam, gdzie chmury przechodziły z piętra niskiego na
     // średnie (nad górami podstawa wyżej), kłęby dwóch wzorów płynących z różnym wiatrem były przycinane na granicach oczek –
     // kwadratowe białe płaty, „pikseloza”)
-    let clmB = sfcBlur(S_CLM, Xw, Yw);
-    let wmC = smoothstep(0.4, 0.8, clmB / max(sfcBlur(S_CLL, Xw, Yw) + clmB, 1e-3));
-    let aC = fC * (1.0 - exp(-0.15 * lwc / fC)) * mix(1.0, cuBlob(X, Y, fC, wmC) / fC, wbC);
+    let clmB = sfcBsp(S_CLM, Xw, Yw);
+    let cllB = sfcBsp(S_CLL, Xw, Yw);
+    let wmC = smoothstep(0.4, 0.8, clmB / max(cllB + clmB, 1e-3));
+    // wielkość kłębów z siły wznoszenia i ulice chmur (tylko tam, gdzie wzór kłębów jest widoczny; pola czytane w punkcie przesuniętym jak obraz chmur)
+    var fe0C = CU_FE0;
+    var bndC = 1.0;
+    if (wbC > 1e-3) {
+      // przy tym samym pokryciu mniej, ale większych kłębów (promień do ~×1.9), gdy chmura sięga wysoko albo cząstka ma dużą energię (w ≈ √(2·CAPE))
+      if (CSZ > 0.0) {
+        let dep = max(sfcBil(S_CUTS, Xw, Yw) - sfcBil(S_CUBS, Xw, Yw), 0.0);
+        let wu = sqrt(2.0 * max(sfcBil(S_CAPE, Xw, Yw), 0.0));
+        fe0C = mix(CU_FE0, 0.75, max(smoothstep(1500.0, 5000.0, dep), smoothstep(10.0, 50.0, wu)));
+      }
+      // ulice chmur: silny wiatr w warstwie chmur wobec prędkości termików (U/w* ≥ ~3.5–7, odpowiada −zi/L ≲ 25…5; Weckwerth i in. 1999) i U ≥ 5–9 m/s, typowe w napływie chłodu
+      if (CST > 0.0) {
+        let uC = sfcBil(S_CWU, Xw, Yw);
+        let vC = sfcBil(S_CWV, Xw, Yw);
+        let spC = length(vec2f(uC, vC));
+        let zi = sfcBil(S_PBLH, Xw, Yw);
+        let wst = pow(max(2.85e-5 * sfcBil(S_H, Xw, Yw) * zi, 0.0), 0.3333);
+        let rU = spC / max(wst, 0.3);
+        let wStr = smoothstep(3.5, 7.0, rU) * smoothstep(5.0, 9.0, spC) * (1.0 - smoothstep(0.5, 0.8, fC));
+        if (wStr > 1e-3) { bndC = mix(1.0, cuStreet(vec2f((X - f32(MG)) * DX, (Y - f32(MG)) * DY), zi, mix(3.4, 1.0, smoothstep(5.0, 9.0, rU))), wStr); }
+      }
+    }
+    // pochodne po pikselach przeliczone na oczka
+    let dXp = dpdx(X);
+    let dYp = dpdy(Y);
+    let idX = select(0.0, 1.0 / dXp, abs(dXp) > 1e-8);
+    let idY = select(0.0, 1.0 / dYp, abs(dYp) > 1e-8);
+    // kłęby a pokłady: brzeg pokładu (duży gradient krycia) przy cumulusach rozpada się na kłęby tego samego wzoru, a kłęby w pokładzie zamiast białych kół z szarymi
+    // przerwami wtapiają się w niego (woda kłębiasta rysowana częściowo równo). Wcześniej granica przebiegała w miejscu zmiany rodzaju chmury w oczku – kanciaste łaty kłębów w pokładzie
+    var eS = 0.0;
+    if (CMX > 0.0) {
+      // (tylko prawdziwy brzeg pokładu – krycie ≤ ~0.5–0.85 – i przy wyraźnych kłębach; przy progach 0.98 i 2% kłębów każda zmiana grubości cienkiego stratusu
+      // dawała pierścienie kłębów wzdłuż izolinii wody, użytkownik)
+      eS = wbZ * smoothstep(0.06, 0.25, length(vec2f(dpdxFine(aS) * idX, dpdyFine(aS) * idY))) * smoothstep(0.02, 0.15, aS) * (1.0 - smoothstep(0.5, 0.85, aS)) * smoothstep(0.1, 0.35, fCr);
+    }
+    let bmC = cuBlob(X, Y, mix(fC, max(fC, aS), eS), wmC, fe0C, bndC);
+    let wbE = wbC * (1.0 - CMX * 0.65 * smoothstep(0.25, 0.7, aS));
     let sunf = 0.55 + 0.45 * clamp(V.sunZ * 2.0, 0.0, 1.0);
-    col = mix(gcol, vec3f(0.92, 0.93, 0.95) * sunf, aS);
-    col = mix(col, vec3f(0.98) * sunf, aC);
-    col = mix(col, vec3f(0.95, 0.96, 0.97) * sunf, aA);
+    // cienie chmur i światłocień wierzchołków (tylko obraz, ?ssh=0 – bez)
+    var shG = 1.0;    // cień na gruncie
+    var shC = 1.0;    // cień na chmurach warstwowych i kłębach
+    var hxT = 0.0;    // nachylenie wierzchołków w skali oczka (z temperatury jasnościowej) [m/m]
+    var hyT = 0.0;
+    let wSh = select(0.0, smoothstep(0.0, 0.08, V.sunZ), SSH > 0.0);
+    if (SSH > 0.0 && V.sunZ > 0.0) {
+      // cień rzucany z pięter (typowe wysokości), w punkcie przesuniętym jak obraz chmur; piętro niskie tylko na drobnych siatkach (dalej przesunięcie mniejsze od oczka)
+      var cL = 0.0;
+      if (DX < 4000.0) { cL = satCast(S_CLL, 1200.0, Xw, Yw).x; }
+      let cM = satCast(S_CLM, 4000.0, Xw, Yw);
+      let cH = satCast(S_CLH, 9500.0, Xw, Yw);
+      // temperatura wierzchołka (wygładzona w czasie i przestrzeni) mówi, jak wysoko naprawdę jest chmura. Na chmury pada cień tylko od wierzchołka wyraźnie wyższego (o ~1.5–4 km):
+      // sama woda piętra w tym nie pomaga – pokład przechodzący przez granicę pięter albo izotermę −20 °C ma w niej ciągły wierzchołek, a dawał „cień” i linie wzdłuż izolinii (użytkownik)
+      let tbL = sfcBsp(S_TBS, Xw, Yw);
+      shG = mix(1.0, mix(0.35, 1.0, (1.0 - cL) * (1.0 - cM.x) * (1.0 - cH.x)), wSh);
+      shC = mix(1.0, mix(0.6, 1.0, (1.0 - cM.x * smoothstep(10.0, 25.0, tbL - cM.y)) * (1.0 - cH.x * smoothstep(10.0, 25.0, tbL - cH.y))), wSh);
+      // światłocień: nachylenie wierzchołków z tej samej temperatury (~154 m/K = 6.5 K/km); w skali oczka nachylenia są zaniżone na grubych siatkach (× 1…2). Równy pokład zostaje gładki.
+      let rG = 154.0 * (1.0 + smoothstep(1000.0, 8000.0, DX));
+      hxT = -rG * dpdxFine(tbL) * idX / DX;
+      hyT = -rG * dpdyFine(tbL) * idY / DY;
+      // nachylenie ze skoku wierzchołków między piętrami (wygładzonego na ~2 oczka) ograniczone łagodnie do ~0.15 – przy 30–40 K skoku wychodziło ~0.8,
+      // a światłocień rysował wzdłuż brzegu wyższego pokładu szeroki ciemny albo jasny pas (użytkownik: dziwne granice między rodzajami chmur)
+      let hTs = vec2f(hxT, hyT) / (1.0 + length(vec2f(hxT, hyT)) / 0.15);
+      hxT = hTs.x;
+      hyT = hTs.y;
+    }
+    if ((V.relief & 128u) == 0u) {
+      // ---- Nowy obraz chmur (?sat=0 – dawny): chmura nie jest białą farbą o kryciu 1 − exp(−τ), tylko warstwą o odbiciu rosnącym z grubością optyczną (cienka – szarawa i półprzezroczysta,
+      // gruba – jasna), z fakturą z szumu 3D niesionego wiatrem i wolno zmiennego w czasie (ta sama woda, inaczej rozłożona w oczku – średnia zachowana) i ze światłocieniem z wysokości wierzchołków.
+      // Rodzaje: pokłady niskie – komórki (Sc), średnie – gładsze fale, lodowe – włókna wzdłuż wiatru, kłęby – kopuły z kalafiorowym brzegiem i własnym cieniem na gruncie.
+      let pwm = vec2f((X - f32(MG)) * DX - V.nofx, (Y - f32(MG)) * DY - V.nofy);
+      let pxm = pxC * V.blobS;                         // piksel [m]
+      let zt = V.cuPh * 0.06;                          // powolna ewolucja faktury
+      let gam = 9.0 * clamp(V.sunZ, 0.35, 1.0);
+      // -- pokłady (woda pięter niskiego i średniego) --
+      let nA = satNzA(pwm, zt, 110000.0, pxm, 0.5);
+      let nB = satNzA(pwm + vec2f(9620.0, 18460.0), 1.7 * zt + 0.31, 26000.0, pxm, 0.7);
+      let nC = satNzA(pwm + vec2f(793.0, 3477.0), 2.3 * zt + 0.63, 6100.0, pxm, 0.7);
+      // pokłady piętra średniego płyną z wiatrem tego piętra – te same przesunięcia co altocumulusy (kafle, cuDisp2), dwa pokolenia przenikające się z nowym
+      // ułożeniem; wcześniej cała faktura przesuwała się ze średnim wiatrem domeny – w huraganie pokłady stały, a kłęby obok krążyły z wiatrem (użytkownik)
+      let xyv = vec2f((X - f32(MG)) * DX, (Y - f32(MG)) * DY);
+      let dhm = cuDisp2(xyv);
+      var nAm = vec4f(0.0);
+      var nBm = vec4f(0.0);
+      var nCm = vec4f(0.0);
+      var wq = 0.0;
+      for (var g = 0u; g < 2u; g++) {
+        let phg = V.cuPh + 0.5 * f32(g);
+        let wg = sin(3.14159 * fract(phg)) * sin(3.14159 * fract(phg));
+        let pg = xyv - select(dhm.xy, dhm.zw, g == 1u) + 61.0 * 26000.0 * cuRnd(vec2i(i32(floor(phg)), i32(g) + 7), 5u);
+        // (także największa skala – ma w pokładzie średnim największą wagę, a płynęła ze średnim wiatrem domeny)
+        nAm += wg * (satNzA(pg, zt, 110000.0, pxm, 0.5) - 0.5);
+        nBm += wg * (satNzA(pg + vec2f(9620.0, 18460.0), 1.7 * zt + 0.31, 26000.0, pxm, 0.7) - 0.5);
+        nCm += wg * (satNzA(pg + vec2f(793.0, 3477.0), 2.3 * zt + 0.63, 6100.0, pxm, 0.7) - 0.5);
+        wq += wg * wg;
+      }
+      // (zachowany kontrast: suma ważona dwóch niezależnych szumów / √Σw²)
+      nAm = 0.5 + nAm / sqrt(max(wq, 0.25));
+      nBm = 0.5 + nBm / sqrt(max(wq, 0.25));
+      nCm = 0.5 + nCm / sqrt(max(wq, 0.25));
+      let cell = 0.5 * nA.b + 0.3 * nB.g + 0.2 * nC.g;
+      let fbm = 0.55 * nAm.a + 0.3 * nBm.a + 0.15 * nCm.a;
+      let wLow = 1.0 - clamp(clmB / max(cllB + clmB, 1e-3), 0.0, 1.0);
+      // stała warstwa (noc, mgła, ochładzane podłoże) – gładsza; z grzaniem od gruntu – wyraźne komórki
+      let rgh = mix(0.45, 1.0, smoothstep(-10.0, 60.0, sfcBil(S_H, Xw, Yw)));
+      // (faktura łagodniejsza: komórki o mniejszym kontraście, wierzchołki bez najdrobniejszej skali – użytkownik: pokłady jak „papier ścierny”)
+      // (pokład średni z wyraźniejszą fakturą – prawie płaski obok komórkowego niskiego wyglądał jak plastik, użytkownik)
+      let mS = 1.0 + rgh * (mix(0.5 + 1.3 * (fbm - 0.5), 0.45 + 1.2 * smoothstep(0.25, 0.72, cell), wLow) - 1.0);
+      // wysokość wierzchołków: głównie grubsze skale (nachylenie rośnie z częstością – drobny szum dawał „papier ścierny”)
+      // (nachylenie liczone z każdej faktury osobno i dopiero mieszane – pochodna wysokości zmieszanej wg wLow dawała jasno-ciemną linię wzdłuż każdej
+      // granicy między pokładem niskim i średnim, bo obie faktury mają inną wysokość; tak samo wagi kowadła i kłębów)
+      let hSm = 650.0 * (0.7 * nAm.a + 0.3 * nBm.a - 0.5);
+      let hSl = 1300.0 * (0.6 * nA.b + 0.4 * nB.g - 0.5);
+      let gS = rgh * mix(vec2f(dpdxFine(hSm), dpdyFine(hSm)), vec2f(dpdxFine(hSl), dpdyFine(hSl)), wLow);
+      // brzeg pokładu (cienka chmura) porwany drobniejszą fakturą – wcześniej pokłady średnie i grube lodowe miały gładki, rozmyty brzeg na ~2 oczka obok
+      // ostro postrzępionych chmur niskich
+      let brk = 0.25 + 1.5 * smoothstep(0.3, 0.7, 0.6 * nCm.a + 0.4 * nBm.a);
+      let eSd = 0.8 * (1.0 - smoothstep(1.0, 8.0, 0.15 * (lwt - lwc - lwa)));     // (każdy pokład – ten sam styl brzegu niskich i średnich)
+      let tauS = 0.15 * (lwt - lwc - lwa) * mS * mix(1.0, brk, eSd) * mix(1.0, clamp(bmC.m, 0.0, 1.3) / max(aS, 0.08), eS);
+      // -- chmury lodowe (cirrusy, kowadła): włókna wzdłuż średniego wiatru --
+      // (w układzie dwóch najbliższych z 12 stałych kierunków co 15°, zmieszanych – jak ulice chmur. Układ obracany wg bieżącego wiatru przesuwał cały wzór:
+      // wiatr zmienia się skokowo przy każdym kopiowaniu pól – w MAX co ~0.4 s – a 2° obrotu to ~17 km przesunięcia włókien 500 km od początku układu;
+      // użytkownik: chmury wysokie przeskakują z pozycji na pozycję)
+      let wmn = V.cuW[0].yz;
+      let iw = fract(select(0.0, atan2(wmn.y, wmn.x), dot(wmn, wmn) > 0.25) / 3.14159265) * 12.0;
+      let iw0 = floor(iw);
+      // (faktura chmur lodowych płynie z tym samym lokalnym wiatrem co pokłady średnie – dwa pokolenia z nowym ułożeniem; wcześniej ze średnim wiatrem domeny:
+      // w huraganie tarcza CDO na wierzchu przesuwała się sama, niezależnie od chmur pod nią – użytkownik)
+      let wsel = smoothstep(0.3, 0.7, iw - iw0);
+      var fv = vec2f(0.0);
+      for (var g = 0u; g < 2u; g++) {
+        let phg = V.cuPh + 0.5 * f32(g);
+        let wg = sin(3.14159 * fract(phg)) * sin(3.14159 * fract(phg));
+        let pg = xyv - select(dhm.xy, dhm.zw, g == 1u) + 61.0 * 85000.0 * cuRnd(vec2i(i32(floor(phg)), i32(g) + 11), 5u);
+        fv += wg * (mix(satFib(pg, iw0, nAm.ra, zt, pxm), satFib(pg, iw0 + 1.0, nAm.ra, zt, pxm), wsel) - 0.5);
+      }
+      fv = 0.5 + fv / sqrt(max(wq, 0.25));
+      let fA = fv.y;
+      let fib = fv.x;
+      let tauA0 = 0.15 * lwa;
+      let mA = mix(1.0, 0.12 + 1.9 * smoothstep(0.3, 0.74, fib), 0.2 + 0.8 * (1.0 - smoothstep(4.0, 22.0, tauA0)));
+      let tauA = tauA0 * mA * mix(1.0, brk, 0.8 * (1.0 - smoothstep(1.0, 8.0, tauA0)));
+      // wierzchołki nad rdzeniami konwekcji (dużo wody kłębiastej pod kowadłem) wypiętrzone i guzowate
+      let wcv = smoothstep(150.0, 900.0, lwc);
+      let gA = 500.0 * vec2f(dpdxFine(fA), dpdyFine(fA)) + wcv * 1500.0 * vec2f(dpdxFine(nBm.r), dpdyFine(nBm.r));   // (szum płynący z lokalnym wiatrem – ze średnim wiatrem domeny „łuski” na wierzchu tarczy przesuwały się same, użytkownik)
+      // -- kłęby --
+      let nD = satNz(vec3f(bmC.q / 1.5, 1.5 * zt + 0.17), 1.5 * V.blobS, pxm, 0.6).r;
+      let nE = satNz(vec3f(bmC.q / 0.42 + vec2f(0.4, 0.9), 2.5 * zt + 0.71), 0.42 * V.blobS, pxm, 1.0).r;
+      let lobes = 0.7 * nD + 0.3 * nE;
+      let sIn = clamp(bmC.s + 0.45 * (lobes - 0.5), 0.0, 1.0);          // brzeg nadgryziony fakturą
+      let mkB = smoothstep(0.0, 0.3, sIn);
+      let hb = sqrt(sIn) * (0.55 + 0.9 * (0.85 * nD + 0.15 * nE));       // kopuła z guzami (0 … ~1.4); wysokość głównie z grubszej skali
+      let tauC0 = 0.15 * lwc / fC;
+      // pełne zachmurzenie kłębiaste i kłęby w pokładzie (część rysowana równo) z fakturą komórkową jak stratocumulus – wcześniej zupełnie płaskie: gęste cumulusy
+      // pod stratusem i ponad nim wyglądały jak gładki pokład, a obok, gdzie pokrycie spadało poniżej ~97%, szedł pas ziarnistych kłębów (użytkownik)
+      let mCu = 0.55 + 0.9 * smoothstep(0.25, 0.72, cell);
+      let tauC = tauC0 * mix(mCu, 0.04 + 1.45 * hb, wbE);              // cienki brzeg, gruby środek
+      let covC = clamp(mix(fC, mkB, wbE), 0.0, 1.0);
+      let gC = wbE * 0.2 * V.blobS * vec2f(dpdxFine(hb), dpdyFine(hb)) + (1.0 - wbE) * 0.6 * vec2f(dpdxFine(hSl), dpdyFine(hSl));
+      // -- światłocień z nachylenia wierzchołków: skala oczka (hxT) + faktura --
+      // (przy niskim słońcu światłocień rośnie jak 1/sin wysokości – faktura słabiej, inaczej cały obraz w „łuskach”)
+      let kR = clamp(V.sunZ / 0.45, 0.3, 1.0);
+      // (światłocień skali oczka i faktury osobno, mnożone: suma nachyleń w jednym wzorze – nieliniowym i obciętym, przy niskim słońcu silnie – wzmacniała
+      // kontrast faktury na pochyłym podłożu kilkukrotnie: wzdłuż schodka wierzchołków między dwoma pokładami szedł pas „klifów”, po obu stronach gładko; użytkownik)
+      let relT = satRelief(hxT, hyT);
+      let relS = mix(1.0, relT * satRelief(kR * gS.x * idX / DX, kR * gS.y * idY / DY), wSh);
+      let relA = mix(1.0, relT * satRelief(kR * gA.x * idX / DX, kR * gA.y * idY / DY), wSh);
+      let relC = mix(1.0, relT * satRelief(kR * gC.x * idX / DX, kR * gC.y * idY / DY), wSh);
+      // -- cień kłębów na gruncie: ten sam wzór czytany w stronę słońca (wysokość ~środka chmury) --
+      // (tylko przy zbliżeniu, gdy kłąb ma ≥ ~6 pikseli – przy oddaleniu cień jest mniejszy od piksela, a drugi odczyt wzoru to najdroższa część obrazu)
+      var shB = 1.0;
+      let wShB = wbE * wSh * (1.0 - smoothstep(0.1, 0.18, pxC));
+      if (wShB > 0.02) {
+        let hcl = clamp(sfcBil(S_PBLH, Xw, Yw), 700.0, 2500.0) + 400.0;
+        let mu = max(V.sunZ, 0.24);
+        let bS = cuBlob(X + hcl * V.sunX / mu / DX, Y + hcl * V.sunY / mu / DY, mix(fC, max(fC, aS), eS), wmC, fe0C, bndC);
+        shB = 1.0 - 0.7 * wShB * smoothstep(0.0, 0.3, bS.s) * satRefl(tauC0, 0.5 * gam);
+      }
+      // -- barwa światła: przy niskim słońcu niskie chmury i grunt cieplejsze niż wysokie --
+      let red = vec3f(0.012, 0.035, 0.09) * min(1.0 / max(V.sunZ, 0.08) - 1.0, 9.0);
+      let tLow = exp(-red);
+      let tHigh = exp(-0.3 * red);
+      // -- składanie w świetle liniowym: grunt → pokłady → kłęby → chmury lodowe --
+      var Ls = pow(gcol * shG * shB, vec3f(2.2)) * tLow;
+      Ls = satOver(Ls, satRefl(tauS, gam), vec3f(0.94, 0.95, 0.97) * pow(sunf * shC * relS * mix(1.0, shB, 0.5), 2.2) * mix(tHigh, tLow, wLow));
+      Ls = mix(Ls, satOver(Ls, satRefl(tauC, 0.7 * gam), vec3f(1.0) * pow(sunf * shC * relC, 2.2) * tLow), covC);
+      Ls = satOver(Ls, satRefl(tauA, 0.75 * gam), vec3f(0.96, 0.97, 0.98) * pow(sunf * relA, 2.2) * tHigh);
+      col = pow(Ls, vec3f(1.0 / 2.2));
+    } else {
+      // dawny obraz: trzy białe warstwy o kryciu 1 − exp(−τ)
+      let relS = mix(1.0, satRelief(hxT, hyT), wSh);
+      let relC = mix(1.0, satRelief(hxT - 0.9 * bmC.gr.x * wbE, hyT - 0.9 * bmC.gr.y * wbE), wSh);
+      let aC = fC * (1.0 - exp(-0.15 * lwc / fC)) * mix(1.0, bmC.m / fC, wbE);
+      let aSm = mix(aS, clamp(bmC.m, 0.0, 1.0), eS);
+      col = mix(gcol * shG, vec3f(0.92, 0.93, 0.95) * sunf * shC * relS, aSm);
+      col = mix(col, vec3f(0.98) * sunf * shC * relC, aC);
+      col = mix(col, vec3f(0.95, 0.96, 0.97) * sunf * relS, aA);
+    }
     // mgiełka atmosferyczna (jak na zdjęciach satelitarnych): powietrze (Rayleigh – niebieskie) i aerozol, droga słońce → grunt →
     // satelita; ciemny ląd i morze niebieskawe i mniej kontrastowe, przy niskim słońcu mocniej
     let mus = max(V.sunZ, 0.08);
@@ -1014,7 +1363,7 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
 
   // siatka pomocnicza: co 10 oczek w poziomie, co 1 km w pionie (przełącznik, bit 6 V.relief); na obrazach
   // satelitarnych wyłączona – na białych chmurach wyglądała jak artefakt
-  let gridOn = (V.relief & 64u) != 0u && !(V.mode == 0u && (cm == 9u || cm == 12u || cm == 16u));
+  let gridOn = (V.relief & 64u) != 0u && !(V.mode == 0u && (cm == 9u || cm == 29u || cm == 16u));
   let Xd = X - f32(MG);
   if (gridOn && abs(Xd - round(Xd / 10.0) * 10.0) < 0.5 * px) { col *= 0.88; }
   if (V.mode == 0u) {

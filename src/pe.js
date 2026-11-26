@@ -83,12 +83,25 @@ const WVI = +(QP.get('wvi') ?? 20);
 const WVF = +(QP.get('wvf') ?? 5);
 // konwekcja Bettsa–Millera: woda z warstwy podchmurowej dla chmur głębokich (?bms=0 – bez)
 const BMS = +(QP.get('bms') ?? 1);
+// współczynnik oporu lądu dla wiatru najniższej warstwy (~200 m; ?pcd=, 2.5e-3 – dawny): 3.5e-3 odpowiada szorstkości ~0.25 m z prawa
+// logarytmicznego (wymiana ciepła liczy z 0.3 m). Przy 2.5e-3 (morze 1.6e-3) niże nad lądem się nie wypełniały: odchylenie std. dobowego
+// ciśnienia w pasie 45–62.5°N rosło w głąb lądu (styczeń, Atlantyk → 30–50°E: 10.3 → 11.2 hPa przy 12.3 → 9.4 w NCEP)
+const PCD = +(QP.get('pcd') ?? 3.5e-3);
+// cyklony tropikalne: parametryzacja genezy (pe.wgsl pe_tcpot / pe_tcpick / pe_tcins, co 6 h): mnożnik częstości (?tcg=0 – bez),
+// tempo na jednostkę sumy potencjału, wiatr maksymalny [m/s] i jego promień [m] zasiewanej depresji, ciepły rdzeń [K]
+const TCG = +(QP.get('tcg') ?? 1);
+const TC_RATE = +(QP.get('tcr') ?? 0.01), TC_VM = +(QP.get('tcv') ?? 22), TC_RM = +(QP.get('tcrm') ?? 130e3), TC_TW = +(QP.get('tctw') ?? 6), TC_SEED = +(QP.get('tcs') ?? 0.35);
+// podtrzymanie cyklonów (pe_tccen / pe_tcamp): głębokość docelowa przy ciepłym morzu [hPa] (ośrodek – pierścień ~375 km) i część wiru zasiewu na 6 h przy pełnym braku głębokości
+// (część na 6 h; stosowana co termin 30 min – 1/12 na termin)
+const TC_DP = +(QP.get('tcdp') ?? 60), TC_AMP = +(QP.get('tcamp') ?? 2.5);
+// wysokość tropopauzy dla domeny z T na 5.6 km i pory roku (?ztn=0 – dawny wzór z T przy gruncie)
+const ZTN = +(QP.get('ztn') ?? 1);
 // woda w glebie lądu przyciągana do klimatologii NCEP (soilclim.js) z czasem SMT dób (?smt=, 0 – bez)
 const SMT = +(QP.get('smt') ?? 20);
 // gradient temperatury w dolnych 1.5 km stanu początkowego [K/km]: 0 – zależny od klimatu (zimą słabszy), ?pegl=6.5 – dawny
 const PEGL = +(QP.get('pegl') || 0);
 const NU4 = DXP ** 4 / (64 * +(QP.get('nu4h') || 12) * 3600);  // ∇⁴: najkrótsze fale tłumione w ~12 h (4 h tłumiło niże – za słaby transport ciepła na północ, lato 45–53°N ~2 K za zimne)
-const UBYTES = 96, USLOT = 256;
+const UBYTES = 112, USLOT = 256;
 const GRADF = 1.0;                     // wzmocnienie gradientu temperatury równowagi względem klimatu
 const S0 = 1361;                         // stała słoneczna [W/m²]
 // promieniowanie długofalowe: pasmo nieprzezroczyste (para wodna τ ∝ u^0.45 – „silne linie”, CO₂ ∝ p·m) i okno
@@ -212,7 +225,15 @@ function header() {
     + `const N2: u32 = ${N2}u;\nconst N3: u32 = ${N3}u;\nconst DXP: f32 = ${DXP.toFixed(1)};\n`
     + `const KVB: f32 = ${(+(QP.get('pkv') ?? 30)).toFixed(3)};\nconst XPS: f32 = ${(+(QP.get('xps') || 1)).toFixed(3)};\nconst XPN: f32 = ${(+(QP.get('xpn') || 0.33)).toFixed(3)};\n`
     + `const KZM: f32 = ${(+(QP.get('kzm') ?? KZM_DEF)).toExponential(3)};\nconst ZCN: f32 = ${ZCN.toFixed(3)};\nconst ZCI: f32 = ${ZCI.toFixed(3)};\nconst ZCU: f32 = ${ZCU.toFixed(3)};\n`
-    + `const WVM: u32 = ${NMW}u;\nconst BMS: f32 = ${BMS.toFixed(3)};\nconst SMR: f32 = ${(SMT > 0 ? 1 / (SMT * 86400) : 0).toExponential(4)};\n`;
+    + `const WVM: u32 = ${NMW}u;\nconst BMS: f32 = ${BMS.toFixed(3)};
+const PCD: f32 = ${PCD.toExponential(3)};
+const TCG: f32 = ${TCG.toFixed(3)};
+const TC_RATE: f32 = ${TC_RATE.toExponential(4)};
+const TC_VM: f32 = ${TC_VM.toFixed(2)};
+const TC_RM: f32 = ${TC_RM.toFixed(1)};
+const TC_TW: f32 = ${TC_TW.toFixed(2)};\nconst TC_DP: f32 = ${TC_DP.toFixed(2)};\nconst TC_AMP: f32 = ${(TC_AMP * DT / 21600).toExponential(4)};\nconst TC_SEEDF: f32 = 0.5;
+const DTS: f32 = ${DT.toFixed(1)};
+const TC_SEED: f32 = ${TC_SEED.toFixed(3)};\nconst ZTN: f32 = ${ZTN.toFixed(1)};\nconst SMR: f32 = ${(SMT > 0 ? 1 / (SMT * 86400) : 0).toExponential(4)};\n`;
 }
 
 async function getShared(device) {
@@ -229,13 +250,13 @@ async function getShared(device) {
       { binding: 1, visibility: C, buffer: { type: 'read-only-storage' } },
       { binding: 2, visibility: C, buffer: { type: 'read-only-storage' } },
       { binding: 3, visibility: C, buffer: { type: 'read-only-storage' } },
-      ...[4, 5, 6, 7].map((b) => ({ binding: b, visibility: C, buffer: { type: 'storage' } })),
+      ...[4, 5, 6, 7, 8].map((b) => ({ binding: b, visibility: C, buffer: { type: 'storage' } })),
     ],
   });
   const pl = device.createPipelineLayout({ bindGroupLayouts: [layout] });
   const pipes = {};
   for (const e of ['pe_zm', 'pe_wv', 'pe_rad', 'pe_diag', 'pe_stage', 'pe_div', 'pe_dft', 'pe_tri', 'pe_idft', 'pe_acc', 'pe_res', 'pe_pmean', 'pe_proj', 'pe_column', 'pe_lap',
-    'pe_hyper', 'pe_params', 'pe_center', 'pe_hist', 'pe_map']) {
+    'pe_hyper', 'pe_params', 'pe_center', 'pe_hist', 'pe_map', 'pe_tcpot', 'pe_tcpick', 'pe_tcins', 'pe_tccen', 'pe_tcamp', 'pe_tcforce', 'pe_tcdom']) {
     pipes[e] = await device.createComputePipelineAsync({ layout: pl, compute: { module: mod, entryPoint: e } });
   }
   const U = GPUBufferUsage;
@@ -297,8 +318,13 @@ export class PEModel {
       + 18 * NMW * NYP * NZP + 3 * N2;
     this.wk = d.createBuffer({ size: this.wkLen * 4, usage: U.STORAGE | U.COPY_SRC | U.COPY_DST });
     this.ub = d.createBuffer({ size: 4 * USLOT, usage: U.UNIFORM | U.COPY_DST });
+    // cyklony wywołane kliknięciem: 8 slotów × 8 (pe_tcforce) i ich plan na CPU (głębokość kategorii, kick-in)
+    // (+ od 64: ślady cyklonów dla domeny – pe_tcdom, 8 × 32)
+    this.tcb = d.createBuffer({ size: 1280, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
+    this.forced = from ? from.forced.map((f) => ({ ...f })) : [];
     this.doyRef = opts.doyRef ?? opts.doy;   // data odpowiadająca chwili tRef modelu
     this.tRef = opts.tRef ?? 0;
+    this.sstAt = opts.sstAt ?? null;   // manipulacja atmosfery: anomalia temperatury morza [K] w chwili t (jak varAt)
     this.varAt = opts.varAt ?? null;   // manipulacja atmosfery: zmienność pogody w chwili t [s czasu symulacji, ujemne – rozbieg]
     this.forcV = opts.forcV ?? null;   // wartość użyta w ostatnich wymuszeniach
     this.hour0 = opts.hour0 ?? opts.hour ?? 12;   // godzina słoneczna w środku kanału (domena) w chwili tRef
@@ -307,7 +333,7 @@ export class PEModel {
       // własna kopia tablic wymuszeń (pory roku: każda kopia może być w innym dniu)
       this.vzData = from.vzData.slice(); this.vzOff = from.vzOff; this.sea = from.sea; this.encl = from.encl; this.tNorm = from.tNorm;
       this.hgt = from.hgt; this.nIter = from.nIter; this.warm = from.warm;
-      this.halfDiur = from.halfDiur; this.summer = from.summer; this.nodeCount = from.nodeCount; this.wvOn = from.wvOn;
+      this.halfDiur = from.halfDiur; this.summer = from.summer; this.sunLag = from.sunLag; this.nodeCount = from.nodeCount; this.wvOn = from.wvOn;
       this.forcDay = from.forcDay; this.doy = from.doy; this.lc = from.lc;
       this.vz = d.createBuffer({ size: this.vzData.byteLength, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
       d.queue.writeBuffer(this.vz, 0, this.vzData);
@@ -413,6 +439,9 @@ export class PEModel {
     // z kanału na danym poziomie, ważonej cos φ) i wiatr zachodni celu × V, do ~10 km, wyżej zanika. Większy kontrast to silniejsza chwiejność baroklinowa:
     // głębsze niże i silniejsze fronty, a nie przesunięcie klimatu (kopia do korekty klimatu ma to samo, więc korekta zabiera ewentualną zmianę średniej).
     // W rozbiegu i przy konstruktorze – wartość z chwili ujemnej (start) albo z pliku zapisu.
+    // temperatura morza z suwaka (otwarte morze, bez lodu)
+    const SA = this.sstAt ? this.sstAt(this.time === undefined ? -1 : this.time - this.tRef) : 0;
+    this.forcS = SA;
     const VF = this.time === undefined ? (this.forcV ?? (this.varAt ? this.varAt(-1) : 1)) : (this.varAt ? this.varAt(this.time - this.tRef) : 1);
     this.forcV = VF;
     if (VF !== 1) {
@@ -526,7 +555,7 @@ export class PEModel {
         const ice = s && (Math.abs(la) >= iceEdge(lonOf ? lonOf(la, i) : null, la, doy) || (this.encl[c] >= 0.4 && tLag0C < 269.15));
         // ląd w górach: klimat z poziomu morza sprowadzony gradientem 6.5 K/km (podłoże, głębsza gleba, śnieg)
         const dTh = 0.0065 * this.hgt[c];
-        v[off.TS + c] = s ? (ice ? 271.15 : tSea + 0.75 * this.encl[c] * (tLagC - tSea)) : tLandC - dTh;
+        v[off.TS + c] = s ? (ice ? 271.15 : tSea + 0.75 * this.encl[c] * (tLagC - tSea) + SA) : tLandC - dTh;
         v[off.BETA + c] = s ? 1 : 0.15 + 0.4 * hum;
         // albedo bez śniegu (śnieg i lód – w pe_rad): morze 0.07, ląd 0.16 (pustynie do 0.28)
         v[off.ALB + c] = s ? 0.07 : 0.16 + 0.12 * (1 - Math.min(1, (lc ? lc.ha[c] : hum) / 0.4));
@@ -573,6 +602,9 @@ export class PEModel {
     const sunf = Math.min(1, Math.max(0, (sunNoon - 0.25) / 0.65));
     this.halfDiur = 1.5 + 4 * sunf + 3 * (1 - hum);
     this.summer = sunf;
+    // to samo nasłonecznienie opóźnione o 25 dób (bezwładność troposfery) – do wysokości tropopauzy
+    const declL = 23.44 * Math.sin(2 * Math.PI * (doy - 25 - 81) / 365);
+    this.sunLag = Math.min(1, Math.max(0, (Math.cos((Math.abs(lat) - Math.sign(lat || 1) * declL) * Math.PI / 180) - 0.25) / 0.65));
   }
 
   // rozkład lądu i morza w kanale (raz): parametrycznie albo z mapy świata (własne miejsce)
@@ -670,6 +702,7 @@ export class PEModel {
         { binding: 5, resource: { buffer: this.dg } },
         { binding: 6, resource: { buffer: this.wk } },
         { binding: 7, resource: { buffer: nestBuf } },
+        { binding: 8, resource: { buffer: this.tcb } },
       ],
     });
     // [parzystość][etap]: etap 0 A→B, 1 B→C, 2 C→D; post: stan bieżący jako sOut
@@ -686,10 +719,15 @@ export class PEModel {
     const wt = this.spinning ? WVS : WVN, wi = this.spinning ? WVS : WVI;
     const wvP = this.wvOn && wt > 0 ? 1 / (wt * 86400) : 0, wvI = this.wvOn && wi > 0 ? 1 / (wi * wi * 86400 * 86400) : 0;
     for (let s = 0; s < 4; s++) {
-      const f = new Float32Array(ab, s * USLOT, 24), u = new Uint32Array(ab, s * USLOT, 24);
+      const f = new Float32Array(ab, s * USLOT, 28), u = new Uint32Array(ab, s * USLOT, 28);
+      // cyklony tropikalne dla domeny (pe_tcdom): przesunięcie listy w buforze vg, połowa wymiarów liczonej domeny [m] (f[25] – czas od
+      // poprzedniej listy, encodeTC)
+      u[24] = this.nest && this.nest.tclOff ? this.nest.tclOff : 0;
+      f[26] = this.nest && this.nest.half ? this.nest.half[0] : 0; f[27] = this.nest && this.nest.half ? this.nest.half[1] : 0;
       f[16] = wvP; f[17] = wvI; f[18] = this.wvOn ? 1 : 0; f[19] = this.spinning || !(WVF > 0) ? 0 : 1; f[20] = WVF > 0 ? 1 / (WVF * 86400) : 0;
+      f[22] = (this.seed >>> 0) % 65536; f[23] = Math.floor(this.time / 21600);   // geneza cyklonów: ziarno i numer okresu 6 h (powtarzalnie w kopiach)
       f[0] = s < 3 ? [DT / 3, DT / 2, DT][s] : DT; f[1] = DT; u[2] = Math.min(s, 2); f[3] = NU4;
-      f[4] = this.halfDiur; f[5] = this.summer; u[6] = this.nodeCount; u[7] = this.nest ? this.nest.pgOff : 0;
+      f[4] = this.halfDiur; f[5] = this.summer; f[21] = this.sunLag; u[6] = this.nodeCount; u[7] = this.nest ? this.nest.pgOff : 0;
       u[8] = this.hslot; u[9] = this.nhist; f[10] = 0; f[11] = this.yc;   // środek domeny w kanale
       // słońce w połowie terminu (30 min): godzina słoneczna w środku kanału, deklinacja, stała słoneczna × odległość
       const tm = this.time + DTQ / 2, dd = this.doyRef + (this.hour0 + (tm - this.tRef) / 3600) / 24;
@@ -798,6 +836,13 @@ export class PEModel {
       d1('pe_lap', 5 * N3, g[2], 2);
       d1('pe_hyper', 5 * N3, g[2], 2);
       this.p = 1 - this.p;
+      // cyklony tropikalne: podtrzymanie i pogłębianie co krok (7.5 min) małymi porcjami – porcje co termin wysyłały fale grawitacyjne (kręgi)
+      if (TCG > 0 || this.forced.length) {
+        pass.setBindGroup(0, this.bgs[this.p][3], [3 * USLOT]);
+        pass.setPipeline(P.pe_tccen); pass.dispatchWorkgroups(Math.ceil(N2 / 64));
+        if (this.forced.length) { pass.setPipeline(P.pe_tcforce); pass.dispatchWorkgroups(1); }
+        pass.setPipeline(P.pe_tcamp); pass.dispatchWorkgroups(Math.ceil(N3 / 64));
+      }
     }
   }
 
@@ -805,8 +850,9 @@ export class PEModel {
   step() {
     // pory roku: raz na dobę modelu nowe wymuszenia (temperatura równowagi, ląd, morze)
     const dNow = this.doyAt(this.time);
-    if (Math.floor(dNow) !== this.forcDay) { this.doy = dNow; this.buildForcing(); this.writeUniforms(); }
+    if (Math.floor(dNow) !== this.forcDay || (this.sstAt && Math.abs(this.sstAt(this.time - this.tRef) - (this.forcS ?? 0)) > 0.1)) { this.doy = dNow; this.buildForcing(); this.writeUniforms(); }
     this.writeUniforms();
+    this.tcPlan();
     const enc = this.device.createCommandEncoder();
     const pass = enc.beginComputePass();
     this.encodeSteps(pass, SPI);
@@ -817,6 +863,17 @@ export class PEModel {
       this.writeUniforms();
       pass.setPipeline(this.sh.pipes.pe_hist); pass.setBindGroup(0, this.bgs[this.p][3], [3 * USLOT]);
       pass.dispatchWorkgroups(Math.ceil(N2 / 64));
+    }
+    // cyklony tropikalne: co 6 h potencjał genezy, losowanie miejsca i zasiew depresji (stan bieżący – bgs[p][3], sOut)
+    // (geneza co 6 h – słaby zawiązek; podtrzymanie i wzmacnianie co krok – encodeSteps)
+    if (TCG > 0) {
+      const g3 = this.bgs[this.p][3], P = this.sh.pipes;
+      pass.setBindGroup(0, g3, [3 * USLOT]);
+      if (Math.round(this.time / DTQ) % 12 === 0) {
+        pass.setPipeline(P.pe_tcpot); pass.dispatchWorkgroups(Math.ceil(N2 / 64));
+        pass.setPipeline(P.pe_tcpick); pass.dispatchWorkgroups(1);
+        pass.setPipeline(P.pe_tcins); pass.dispatchWorkgroups(Math.ceil(N3 / 64));
+      }
     }
     pass.end();
     this.device.queue.submit([enc.finish()]);
@@ -843,6 +900,22 @@ export class PEModel {
     pass.dispatchWorkgroups(Math.ceil(this.nodeCount / 64));
   }
 
+  // cyklony tropikalne dla domeny (pe_tcdom → lista w buforze vg, drobne jądro w celu tgt_build) – tylko model główny, raz na termin
+  encodeTC(pass) {
+    if (!this.nest || !this.nest.tclOff) return;
+    const dt = this.tcT === undefined ? 0 : Math.max(0, this.time - this.tcT);
+    this.tcT = this.time;
+    this.device.queue.writeBuffer(this.ub, 3 * USLOT + 25 * 4, new Float32Array([dt]));
+    pass.setPipeline(this.sh.pipes.pe_tcdom); pass.setBindGroup(0, this.bgs[this.p][3], [3 * USLOT]);
+    pass.dispatchWorkgroups(1);
+  }
+  // ślady cyklonów dla domeny (testy): waga, x, y [m], vx, vy, głębokość, ciśnienie otoczenia, gradient, wiatr otoczenia 1.5 / 6 km, braki, wiek
+  async readTCD() {
+    const rb = this.device.createBuffer({ size: 1024, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const enc = this.device.createCommandEncoder(); enc.copyBufferToBuffer(this.tcb, 256, rb, 0, 1024); this.device.queue.submit([enc.finish()]);
+    await rb.mapAsync(GPUMapMode.READ); const a = Array.from(new Float32Array(rb.getMappedRange())); rb.unmap(); rb.destroy();
+    return Array.from({ length: 8 }, (_, n) => a.slice(32 * n, 32 * n + 32)).filter((x) => x[0] > 0);
+  }
   // odczyt wektora środka domeny (parametry, T, anomalia, opad, trajektoria) – asynchronicznie
   async readCenter() {
     const d = this.device;
@@ -906,13 +979,44 @@ export class PEModel {
     enc.copyBufferToBuffer(this.S[this.p], 0, m.S[0], 0, 5 * N3 * 4);
     enc.copyBufferToBuffer(this.wk, 0, m.wk, 0, this.wkLen * 4);
     enc.copyBufferToBuffer(this.dg, 0, m.dg, 0, (N3 + N2 * NW) * 4);
+    enc.copyBufferToBuffer(this.tcb, 0, m.tcb, 0, 1280);
     this.device.queue.submit([enc.finish()]);
     m.time = this.time; m.hslot = this.hslot; m.nhist = this.nhist; m.center = this.center; m.map = this.map;
     m.writeUniforms();
     return m;
   }
 
-  destroy() { for (const b of [...this.S, this.dg, this.wk, this.ub, this.vz]) b.destroy(); }
+  // Huragan wywołany kliknięciem: X, Y – położenie w oczkach kanału, dp – głębokość kategorii [hPa], ramp – czas kick-in [s]. Zwraca false, gdy brak wolnego slotu
+  spawnTC(X, Y, dp, ramp) {
+    const used = new Set(this.forced.map((f) => f.slot));
+    let slot = 0;
+    while (used.has(slot) && slot < 8) slot++;
+    if (slot >= 8) return false;
+    this.forced.push({ slot, t0: this.time, t1: this.time + Math.max(ramp, DTQ), dp });
+    this.device.queue.writeBuffer(this.tcb, slot * 32, new Float32Array([1, X, Y, 3, 1, 0, 0, 0]));
+    return true;
+  }
+  // stan slotów cyklonów wywołanych kliknięciem (testy): czynny, x, y, cel teraz, zasiew, głębokość, cel użyty, zawirowanie ośrodka ×1e5
+  async readTC() {
+    const rb = this.device.createBuffer({ size: 256, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const enc = this.device.createCommandEncoder(); enc.copyBufferToBuffer(this.tcb, 0, rb, 0, 256); this.device.queue.submit([enc.finish()]);
+    await rb.mapAsync(GPUMapMode.READ); const a = Array.from(new Float32Array(rb.getMappedRange())); rb.unmap(); rb.destroy();
+    return Array.from({ length: 8 }, (_, n) => a.slice(8 * n, 8 * n + 8)).filter((x) => x[0] > 0.5 || x[5] !== 0);
+  }
+  // głębokość docelowa cyklonów wywołanych kliknięciem: rośnie liniowo przez kick-in, potem slot wyłączony
+  tcPlan() {
+    if (!this.forced.length) return;
+    const keep = [];
+    for (const f of this.forced) {
+      const fr = (this.time - f.t0) / (f.t1 - f.t0);
+      // po kick-in: cel z warunków (−1, pe_tcforce) przez najwyżej 20 dób – potem slot wolny (wir i tak zwykle zanika wcześniej)
+      if (fr >= 1 && this.time - f.t1 > 20 * 86400) { this.device.queue.writeBuffer(this.tcb, f.slot * 32, new Float32Array([0])); continue; }
+      this.device.queue.writeBuffer(this.tcb, f.slot * 32 + 12, new Float32Array([fr >= 1 ? -1 : 3 + (f.dp - 3) * Math.max(0, fr)]));
+      keep.push(f);
+    }
+    this.forced = keep;
+  }
+  destroy() { for (const b of [...this.S, this.dg, this.wk, this.ub, this.vz, this.tcb]) b.destroy(); }
 }
 
 // wektor środka → obiekt jak airAt + diagnostyka

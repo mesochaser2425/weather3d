@@ -35,6 +35,10 @@ struct PP {
   wvX1: f32,
   wvX2: f32,
   wvX3: f32,
+  tclOff: u32,     // cyklony tropikalne dla domeny (pe_tcdom): przesunięcie listy w buforze vg domeny (0 – brak)
+  tcDt: f32,       // … czas od poprzedniej listy [s] (0 – pierwsza albo ponowna w tej samej chwili)
+  dhx: f32,        // … połowa wymiarów liczonej domeny [m]
+  dhy: f32,
 }
 
 @group(0) @binding(0) var<uniform> P: PP;
@@ -45,6 +49,8 @@ struct PP {
 @group(0) @binding(5) var<storage, read_write> dg: array<f32>;    // φ (N3) | w (N2·NW)
 @group(0) @binding(6) var<storage, read_write> wk: array<f32>;    // robocze: rzut, opad, historia, środek
 @group(0) @binding(7) var<storage, read_write> nest: array<f32>;  // bufor vg domeny zagnieżdżonej
+@group(0) @binding(8) var<storage, read_write> tcb: array<f32>;   // cyklony wywołane kliknięciem (spawn): 8 slotów × 8 – czynny, x, y [oczka], głębokość
+                                                                  // docelowa teraz [hPa], zasiew w tym kroku, głębokość obecna [hPa]
 
 const G: f32 = 9.81;
 const CP: f32 = 1004.0;
@@ -736,7 +742,7 @@ fn pe_stage(@builtin(global_invocation_id) gid: vec3u, @builtin(num_workgroups) 
       // tarcie przy gruncie: w najniższej otwartej części ściany (w górach – nad wyższym z dwóch gruntów)
       if (k == kbu) {
         let spd = sqrt(u * u + vb * vb) + 1.0;
-        let cd = mix(2.5e-3, 1.6e-3, 0.5 * (sea + vz[VZ_SEA + c2(i - 1, j)]));
+        let cd = mix(PCD, 1.6e-3, 0.5 * (sea + vz[VZ_SEA + c2(i - 1, j)]));
         t -= cd * spd * u / (au * vz[VZ_DZ + ku]);
       }
       // warstwa tłumiąca: tylko zaburzenia (odchyłka od średniej z sąsiedztwa ±8 oczek w x) – tłumienie
@@ -773,7 +779,7 @@ fn pe_stage(@builtin(global_invocation_id) gid: vec3u, @builtin(num_workgroups) 
         t += 0.5 * (vdiff(sv(i, j, k - 1), v, sv(i, j, k + 1), k, c, kbv, av) + vdiff(sv(i, j, k - 1), v, sv(i, j, k + 1), k, c2(i, j - 1), kbv, av));
         if (k == kbv) {
           let spd = sqrt(v * v + ub * ub) + 1.0;
-          let cd = mix(2.5e-3, 1.6e-3, 0.5 * (sea + vz[VZ_SEA + c2(i, j - 1)]));
+          let cd = mix(PCD, 1.6e-3, 0.5 * (sea + vz[VZ_SEA + c2(i, j - 1)]));
           t -= cd * spd * v / (av * vz[VZ_DZ + ku]);
         }
         if (k == i32(NZP) - 1) {
@@ -1498,7 +1504,14 @@ fn air(x: f32, y: f32) -> Air {
   let tS = tday + 0.4 * P.halfDiur;
   // tropopauza: gładko z temperatury masy (wykrywanie z profilu na 12 poziomach dawało skoki między
   // kolumnami – ogromne różnice θ w stratosferze pól docelowych)
-  let ztr = 11200.0 + 110.0 * (tday - 283.15);
+  // z T na 5.6 km i pory roku (P.wvX1 – nasłonecznienie opóźnione o 25 dób) wg sondaży IGRA 2005–2020 (Budapeszt, Szeged, Legionowo, Wrocław, wszystkie miesiące; RMSE 720 m);
+  // ze wzoru z T przy gruncie (?ztn=0) wychodziło latem 12.6 km przy 11.4–11.6 km w pomiarach, w chłodnym powietrzu 12.1 przy 10.5 km – na 12 km model o 3–7 K za zimny, więcej CAPE i za wysoki poziom równowagi
+  let ztr0 = select(11200.0 + 110.0 * (tday - 283.15), 15913.0 + 194.9 * (tAtZ(x, y, 5600.0) - 273.15) - 1786.0 * P.wvX1, ZTN > 0.0);
+  // w tropikach (< ~20°, płynnie do ~30°) tropopauza ≥ 16.5 km: wzór z sondaży Europy Środkowej dawał tu 13–15 km – górna troposfera celu o 10–20 K za ciepła
+  // (Atlantyk 16°N, wrzesień: 13 km −46 °C, 15 km −53 °C przy ~−58 i ~−70 °C w klimatologii), wierzchołki burz i huraganów ~8–10 km zamiast 15–16 km
+  // (użytkownik: huragan bez wysokich echo tops, za mało chmur wysokich)
+  let jTr = u32(round(clamp(y / DXP + f32(NYP) * 0.5 - 0.5, 0.0, f32(NYP) - 1.0)));
+  let ztr = mix(ztr0, max(ztr0, 16500.0), 1.0 - smoothstep(0.34, 0.5, abs(vz[VZ_SLAT + jTr])));
   // wilgotność: warstwa graniczna (wilgotność właściwa ~1 km odniesiona do temperatury przy gruncie),
   // górna troposfera ~6.5 km
   // wilgotność przy gruncie z najniższej warstwy modelu (~200 m), nie z 1 km – para maleje z wysokością
@@ -1545,7 +1558,7 @@ fn air(x: f32, y: f32) -> Air {
   let psl = 1013.25 + vz[VZ_RC] * smp2(WK_PS, x, y) / 100.0;
   A.p[0] = tS;
   A.p[1] = gam;
-  A.p[2] = clamp(ztr, 8500.0, 15000.0);
+  A.p[2] = clamp(ztr, 8500.0, 17000.0);
   // inwersja osiadania: wysokość stała, siła rośnie płynnie z osiadaniem (próg dawał schodki między
   // węzłami siatki parametrów – profil wilgotności skakał)
   A.p[3] = 1000.0 + 1000.0 * P.summer;
@@ -1571,6 +1584,12 @@ fn air(x: f32, y: f32) -> Air {
   let dvy = (v6 - v1) / (6000.0 - zl);
   A.p[7] = u1 - dux * zl;
   A.p[8] = v1 - dvy * zl;
+  // (bez wzmacniania w dół: gdy wiatr słabnie z wysokością – cyklon tropikalny, ciepły rdzeń – prosta 1.5–6 km przedłużona w dół dawała przy
+  // gruncie wiatr silniejszy niż na 1.5 km: huragan 72 m/s w celu przy gruncie przy 48 m/s na 2.5 km. Prędkość przy gruncie ≤ tej z 1.5 km,
+  // kierunek z prostej; różnicę zdejmuje człon dolnych 1.5 km (16, 17 – zanika ku 1.5 km), prosta wyżej bez zmian)
+  let u1v = vec2f(u1, v1);
+  let u0e = vec2f(A.p[7], A.p[8]);
+  let dLow = u0e * (min(1.0, length(u1v) / max(length(u0e), 1e-3)) - 1.0);
   A.p[9] = dux;
   A.p[10] = dvy;
   A.p[11] = w3;
@@ -1591,10 +1610,19 @@ fn air(x: f32, y: f32) -> Air {
     let fs = select(min(fc, -3e-5), max(fc, 3e-5), fc >= 0.0);
     let ugs = -(smp2(WK_PS, x, y + DXP) - smp2(WK_PS, x, y - DXP)) / (2.0 * DXP * fs);
     let vgs = (smp2(WK_PS, x + DXP, y) - smp2(WK_PS, x - DXP, y)) / (2.0 * DXP * fs);
-    var d0 = vec2f(ugs, vgs) - vec2f(A.p[7], A.p[8]);
+    // wiatr gradientowy zamiast geostroficznego w niżu: V = 2·Vg/(1 + √(1 + 2·ζg/f)) (promień krzywizny z zawirowania geostroficznego ζg ≈ 2·Vg/R);
+    // zwykły niż (ζg/f ~0.2) ~0.9·Vg, głęboki niż ~0.5–0.7, cyklon tropikalny i jego pozostałość ~0.1–0.3. Sam geostroficzny dawał nad ciasnymi
+    // niżami silny fałszywy wiatr (obcinany do 15 m/s – pierścienie w porywach, użytkownik); w wyżu bez zmian
+    let lapP = (smp2(WK_PS, x + DXP, y) + smp2(WK_PS, x - DXP, y) + smp2(WK_PS, x, y + DXP) + smp2(WK_PS, x, y - DXP) - 4.0 * smp2(WK_PS, x, y)) / (DXP * DXP);
+    let gr = 2.0 / (1.0 + sqrt(1.0 + 2.0 * max(lapP / (fs * fs), 0.0)));
+    var d0 = gr * vec2f(ugs, vgs) - vec2f(A.p[7], A.p[8]);
     d0 *= min(1.0, 15.0 / max(length(d0), 1e-3));
-    A.p[16] = d0.x;
-    A.p[17] = d0.y;
+    // w tropikach (< ~15–25°) bez poprawki z wiatru geostroficznego: przy małym f i głębokim niżu (cyklon tropikalny) wiatr geostroficzny jest
+    // fałszywy (> 100 m/s), a jego obcięcie do 15 m/s dawało w domenie koncentryczne pierścienie w wietrze i porywach (użytkownik) – tam wiatr
+    // przy gruncie z wiatru modelu ~1.5 km
+    d0 *= smoothstep(0.26, 0.42, abs(vz[VZ_SLAT + u32(round(Yf))]));
+    A.p[16] = d0.x + dLow.x;
+    A.p[17] = d0.y + dLow.y;
     var d3 = vec2f(u3, v3) - vec2f(u1 + (u6 - u1) / 3.0, v1 + (v6 - v1) / 3.0);
     d3 *= min(1.0, 15.0 / max(length(d3), 1e-3));
     A.p[18] = d3.x;
@@ -1610,7 +1638,9 @@ fn air(x: f32, y: f32) -> Air {
   A.p[22] = fw * rhM(x, y, 5000.0);
   A.p[23] = fw * rhM(x, y, 6500.0);
   let z2 = clamp(A.p[2] - 1000.0, 6500.0, 9000.0);
-  A.p[15] = clamp((t56 - tAtZ(x, y, z2)) / (z2 - 5600.0), 0.005, 0.0095);
+  // (w tropikach – jak tropopauza – co najmniej 7.2 K/km: gradient 5.6–9 km z modelu ~5.3 K/km przedłużony do 16.5 km dawał na 13 km −44 °C przy
+  // ~−58 °C w klimatologii; wilgotna adiabata w górnej troposferze tropików ~7–7.5 K/km)
+  A.p[15] = clamp(mix((t56 - tAtZ(x, y, z2)) / (z2 - 5600.0), max((t56 - tAtZ(x, y, z2)) / (z2 - 5600.0), 0.0072), 1.0 - smoothstep(0.34, 0.5, abs(vz[VZ_SLAT + jTr]))), 0.005, 0.0095);
   A.p[24] = gamU;
   A.tDay = tday - 273.15;
   let Y = clamp(y / DXP + f32(NYP) * 0.5 - 0.5, 0.0, f32(NYP) - 1.0);
@@ -1735,4 +1765,585 @@ fn pe_map(@builtin(global_invocation_id) gid: vec3u) {
   // woda w glebie (0…1), konwekcja Bettsa–Millera: CAPE cząstki, działa (pada), zablokowana (sucha warstwa chmurowa)
   wk[WK_LAP + 20u * N2 + c] = wk[WK_SM + c];
   for (var n = 0u; n < 3u; n++) { wk[WK_LAP + (21u + n) * N2 + c] = wk[WK_BMD + n * N2 + c]; }
+}
+
+// ---------------- Cyklony tropikalne: parametryzacja genezy (co 6 h) ----------------
+// Przy oczku 75 km model sam nie rodzi cyklonów tropikalnych (jak modele klimatu tej rozdzielczości) – zawiązki powstają w skali
+// ~100 km, której siatka nie rozdziela. Tu, jak w schematach „bogus vortex” i wskaźnikach genezy (Emanuel i Nolan 2004; Gray 1968):
+// potencjał genezy w każdym oczku (ciepłe morze ≥ 26.5 °C, 5–30° szerokości, słabe ścinanie 1.2–9 km, wilgotna środkowa troposfera,
+// cyklonalne zawirowanie przy gruncie – fala wschodnia, bez istniejącego silnego wiru w promieniu ~750 km); losowo (powtarzalnie: ziarno
+// pogody i czas) z prawdopodobieństwem rosnącym z sumą potencjału – jedno miejsce wybrane proporcjonalnie do potencjału; tam depresja
+// tropikalna (wir ~17 m/s w promieniu ~150 km, ciepły rdzeń, wilgotne wnętrze). Dalej niesie ją i rozwija sam model (parowanie z morza,
+// konwekcja); domena o drobnym oczku nad ciepłym morzem wzmacnia ją do siły huraganu. Wyniki w WK_LAP (wolne między krokami):
+// potencjał (N2), wybór (TC_O: flaga, i, j). TCG – mnożnik częstości (?tcg=0 – bez).
+const TC_O: u32 = WK_LAP + 24u * N2;
+fn so(f: u32, i: i32, j: i32, k: i32) -> f32 { return sOut[f * N3 + ix(i, j, k)]; }
+// zawirowanie względne ~1.2 km (k = 2) w środku oczka [1/s]
+fn tcZeta(i: i32, j: i32) -> f32 {
+  let jm = max(j - 1, 0);
+  let jp = min(j + 1, i32(NYP) - 1);
+  let dvdx = (so(1u, i + 1, j, 2) + so(1u, i + 1, jp, 2) - so(1u, i - 1, j, 2) - so(1u, i - 1, jp, 2)) / (4.0 * DXP);
+  let dudy = (so(0u, i, jp, 2) + so(0u, i + 1, jp, 2) - so(0u, i, jm, 2) - so(0u, i + 1, jm, 2)) / (2.0 * f32(jp - jm) * DXP);
+  return dvdx - dudy;
+}
+@compute @workgroup_size(64)
+fn pe_tcpot(@builtin(global_invocation_id) gid: vec3u) {
+  let c = gid.x;
+  if (c >= N2) { return; }
+  let i = i32(c % NXP);
+  let j = i32(c / NXP);
+  var p = 0.0;
+  let sl = vz[VZ_SLAT + u32(j)];
+  let a = abs(sl);
+  let fl = smoothstep(0.087, 0.156, a) * (1.0 - smoothstep(0.42, 0.53, a));          // ~5–9° … ~25–32°
+  if (TCG > 0.0 && fl > 0.0 && j > 7 && j < i32(NYP) - 8 && vz[VZ_SEA + c] >= 0.5 && !landLike(c)) {
+    let sst = smoothstep(299.65, 301.65, vz[VZ_TS + c]);
+    let du = 0.5 * (so(0u, i, j, 9) + so(0u, i + 1, j, 9) - so(0u, i, j, 2) - so(0u, i + 1, j, 2));
+    let dv = 0.5 * (so(1u, i, j, 9) + so(1u, i, j + 1, 9) - so(1u, i, j, 2) - so(1u, i, j + 1, 2));
+    let shr = 1.0 - smoothstep(8.0, 16.0, length(vec2f(du, dv)));
+    let t6 = (vz[VZ_TH0 + 6u] + so(2u, i, j, 6)) * vz[VZ_PI0 + 6u];
+    let hum = smoothstep(0.45, 0.7, so(3u, i, j, 6) / qsatM(t6, vz[VZ_P0 + 6u]));
+    let s = sign(sl);
+    let vor = smoothstep(0.0, 2.0e-5, s * tcZeta(i, j));
+    p = fl * sst * shr * hum * vor;
+    if (p > 0.0) {
+      var zmax = 0.0;
+      for (var dj = -10; dj <= 10; dj += 2) {
+        for (var di = -10; di <= 10; di += 2) {
+          if (di * di + dj * dj > 100) { continue; }
+          zmax = max(zmax, s * tcZeta(i + di, clamp(j + dj, 1, i32(NYP) - 2)));
+        }
+      }
+      p *= 1.0 - smoothstep(6.0e-5, 1.2e-4, zmax);
+    }
+  }
+  wk[WK_LAP + c] = p;
+}
+fn tcHash(x: u32) -> f32 {
+  var h = x * 747796405u + 2891336453u;
+  h = ((h >> ((h >> 28u) + 4u)) ^ h) * 277803737u;
+  h = (h >> 22u) ^ h;
+  return (f32(h >> 8u) + 0.5) / 16777216.0;
+}
+var<workgroup> tcPart: array<f32, 256>;
+var<workgroup> tcSel: array<u32, 2>;
+@compute @workgroup_size(256)
+fn pe_tcpick(@builtin(local_invocation_index) li: u32) {
+  let ch = (N2 + 255u) / 256u;
+  var s = 0.0;
+  for (var c = li * ch; c < min((li + 1u) * ch, N2); c++) { s += wk[WK_LAP + c]; }
+  tcPart[li] = s;
+  workgroupBarrier();
+  if (li == 0u) {
+    var tot = 0.0;
+    for (var t = 0u; t < 256u; t++) { tot += tcPart[t]; }
+    wk[TC_O] = 0.0;
+    wk[TC_O + 3u] = tot;
+    tcSel[0] = 0u;
+    let key = (u32(P.wvX2) * 2654435761u) ^ (u32(P.wvX3) * 2246822519u);
+    // prawdopodobieństwo genezy w tym okresie 6 h z sumy potencjału (TCG – mnożnik)
+    let prob = 1.0 - exp(-TCG * TC_RATE * tot);
+    if (tot > 0.0 && tcHash(key) < prob) {
+      let pick = tcHash(key ^ 0x9e3779b9u) * tot;
+      var acc = 0.0;
+      for (var t = 0u; t < 256u; t++) {
+        if (acc + tcPart[t] >= pick && tcPart[t] > 0.0) {
+          var a2 = acc;
+          for (var c = t * ch; c < min((t + 1u) * ch, N2); c++) {
+            a2 += wk[WK_LAP + c];
+            if (a2 >= pick && wk[WK_LAP + c] > 0.0) {
+              wk[TC_O] = 1.0;
+              wk[TC_O + 1u] = f32(c % NXP);
+              wk[TC_O + 2u] = f32(c / NXP);
+              break;
+            }
+          }
+          break;
+        }
+        acc += tcPart[t];
+      }
+    }
+  }
+}
+// profil wiatru wiru [m/s] w odległości r [m] (zmodyfikowany wir Rankine'a, zanika na 2.5–4 promieni maksymalnego wiatru – do ~520 km; wcześniej 3–5 promieni,
+// do ~650 km – huragany za rozległe, użytkownik. Promień 130 km zostaje: przy 100 km wir na oczku 75 km nie dochodził do głębokości Cat 5 – 56 przy 86 hPa – i się rozpadał)
+fn tcV(r: f32) -> f32 {
+  let x = r / TC_RM;
+  let v = select(TC_VM * pow(1.0 / max(x, 1e-3), 0.5), TC_VM * x, x < 1.0);
+  return v * (1.0 - smoothstep(2.5, 4.0, x));
+}
+// przyrost od wiru o środku (ic, jc) [oczka] i amplitudzie amp (1 – pełny zasiew) w punkcie (i, j, k): x – u (ściana zachodnia), y – v (ściana
+// południowa), z – θ' (ciepły rdzeń, maksimum ~7 km), w – 1 we wnętrzu (nawilżanie)
+fn tcInc(i: i32, j: i32, k: u32, ic: f32, jc: f32, amp: f32) -> vec4f {
+  let z = vz[VZ_ZC + k];
+  let fz = clamp(1.0 - z / 12000.0, 0.0, 1.0);
+  let s = sign(vz[VZ_SLAT + u32(clamp(i32(floor(jc)), 0, i32(NYP) - 1))]);
+  let L = f32(NXP);
+  var r = vec4f(0.0);
+  let dxu = f32(i) - ic - L * round((f32(i) - ic) / L);
+  let dyu = f32(j) + 0.5 - jc;
+  let ru = max(length(vec2f(dxu, dyu)) * DXP, 1.0);
+  r.x = -s * amp * fz * tcV(ru) * dyu * DXP / ru;
+  let dxv = f32(i) + 0.5 - ic - L * round((f32(i) + 0.5 - ic) / L);
+  let dyv = f32(j) - jc;
+  let rv = max(length(vec2f(dxv, dyv)) * DXP, 1.0);
+  r.y = s * amp * fz * tcV(rv) * dxv * DXP / rv;
+  let rc = length(vec2f(dxv, f32(j) + 0.5 - jc)) * DXP;
+  let g = exp(-(rc / (2.0 * TC_RM)) * (rc / (2.0 * TC_RM)));
+  r.z = amp * TC_TW * g * sin(3.14159 * clamp(z / 14000.0, 0.0, 1.0)) / vz[VZ_PI0 + k];
+  r.w = select(0.0, 1.0, rc < 2.0 * TC_RM && z < 8000.0);
+  return r;
+}
+fn tcApply(id: u32, i: i32, j: i32, k: u32, d: vec4f) {
+  if (vz[VZ_ZW + k + 1u] > hU(i, j)) { sOut[id] += d.x; }
+  if (j > 0 && vz[VZ_ZW + k + 1u] > hV(i, j)) { sOut[N3 + id] += d.y; }
+  sOut[2u * N3 + id] += d.z;
+  if (d.w > 0.0) {
+    let t = (vz[VZ_TH0 + k] + sOut[2u * N3 + id]) * vz[VZ_PI0 + k];
+    sOut[3u * N3 + id] = max(sOut[3u * N3 + id], 0.9 * qsatM(t, vz[VZ_P0 + k]));
+  }
+}
+// Opad cyklonu tropikalnego (oczko 75 km nie rozwiązuje ściany oka ani pasm – opad szedł tylko z wznoszenia modelu, tarcza jak na froncie niżu,
+// użytkownik): wilgotność docelowa względem nasycenia w punkcie (i, j, k) od ośrodka (ic, jc) o głębokości dp [hPa]: ściana oka (pierścień
+// ~0.6 R maks. wiatru – oczko obok środka) i dwa ramiona spiralne do ~3.4 R ponad nasycenie (nadwyżka skrapla się → opad), oko suche (< 0); 0 – bez zmian
+fn tcRain(i: i32, j: i32, k: u32, ic: f32, jc: f32, dp: f32) -> f32 {
+  let z = vz[VZ_ZC + k];
+  if (z > 10000.0) { return 0.0; }
+  let L = f32(NXP);
+  let dx = f32(i) + 0.5 - ic - L * round((f32(i) + 0.5 - ic) / L);
+  let dy = f32(j) + 0.5 - jc;
+  let x = length(vec2f(dx, dy)) * DXP / TC_RM;
+  let ins = smoothstep(3.0, 40.0, dp);
+  if (x < 0.3 && z > 1500.0) { return -(0.95 - 0.25 * ins); }                    // oko: osiadanie, sucho
+  let s = sign(vz[VZ_SLAT + u32(clamp(i32(floor(jc)), 0, i32(NYP) - 1))]);
+  let eye = exp(-((x - 0.6) / 0.35) * ((x - 0.6) / 0.35));   // ściana oka tuż za oczkiem środka (oko ≤ jedno oczko – mniejsze się nie da)
+  // (na półkuli N pasmo idzie do środka przeciwnie do ruchu wskazówek zegara, z wiatrem wpływającym – kąt maleje na zewnątrz)
+  let arm = 0.5 + 0.5 * cos(2.0 * (atan2(dy, dx) + s * 2.2 * log(max(x, 0.3))));
+  let band = arm * arm * smoothstep(0.9, 1.4, x) * (1.0 - smoothstep(2.6, 3.4, x));
+  let w = max(eye, 0.6 * band);
+  if (w < 0.05) { return 0.0; }
+  return 1.0 + 0.025 * ins * w;
+}
+@compute @workgroup_size(64)
+fn pe_tcins(@builtin(global_invocation_id) gid: vec3u, @builtin(num_workgroups) nwg: vec3u) {
+  let id = gid.x + gid.y * nwg.x * 64u;
+  if (id >= N3 || wk[TC_O] < 0.5) { return; }
+  let i = i32(id % NXP);
+  let j = i32((id / NXP) % NYP);
+  let k = id / N2;
+  tcApply(id, i, j, k, tcInc(i, j, k, wk[TC_O + 1u] + 0.5, wk[TC_O + 2u] + 0.5, TC_SEED));
+}
+
+// Podtrzymanie i wzmacnianie istniejących cyklonów tropikalnych (co termin 30 min małymi porcjami – płynnie, bez skoków; jak sztuczny wir w modelach operacyjnych): przy oczku 75 km wir
+// burzy tropikalnej nie pogłębia się sam (jądro huraganu ma ~30–50 km) – w modelu zostawały płytkie niże ~1003 hPa (użytkownik). Ośrodek:
+// maksimum cyklonalnego zawirowania ~1.2 km (9 × 9 oczek, > 6·10⁻⁵ 1/s) z zamkniętym niżem (≥ ~1.5–2.5 hPa poniżej pierścienia) w pasie ~5–35°. Głębokość docelowa (różnica
+// ciśnienia ośrodek – pierścień ~375 km) ze średnich w promieniu 200 km od centrum niżu: energia (temperatura morza 25.5–28 °C i θe powietrza przy powierzchni
+// 335–348 K – suche powietrze obniża cel do 40%), ścinanie 1.2–9 km (10–22 m/s) i udział morza (ląd w tym kole – słabnięcie); gdy ośrodek jest płytszy, dochodzi część wiru zasiewu (wiatr, ciepły rdzeń, wilgotne wnętrze) ∝ brakowi
+// głębokości (× TC_AMP na termin). Nowy zawiązek z genezy jest słaby (TC_SEED wiru) i rośnie tą samą drogą. Nad lądem i chłodną wodą bez wzmacniania – cyklon słabnie sam (tarcie, brak parowania)
+// głębokość niżu: ośrodek wobec pierścienia ~375 km [hPa]
+fn tcDepth(i: i32, j: i32) -> f32 {
+  var pr = 0.0;
+  for (var n = 0; n < 16; n++) {
+    let an = 0.3927 * f32(n);
+    pr += wk[WK_PS + c2(i + i32(round(5.0 * cos(an))), clamp(j + i32(round(5.0 * sin(an))), 0, i32(NYP) - 1))];
+  }
+  return vz[VZ_RC] * (pr / 16.0 - wk[WK_PS + c2(i, j)]) / 100.0;
+}
+// pole stanu f (0 u, 1 v) dwuliniowo w punkcie (x, y) [indeksy punktów pola], poziom k
+fn soBil(f: u32, x: f32, y: f32, k: i32) -> f32 {
+  let xf = floor(x);
+  let yf = clamp(floor(y), 0.0, f32(NYP) - 2.0);
+  let fx = x - xf;
+  let fy = clamp(y - yf, 0.0, 1.0);
+  let i0 = i32(xf);
+  let j0 = i32(yf);
+  return mix(mix(so(f, i0, j0, k), so(f, i0 + 1, j0, k), fx), mix(so(f, i0, j0 + 1, k), so(f, i0 + 1, j0 + 1, k), fx), fy);
+}
+// Głębokość docelowa cyklonu w ośrodku (i, j) [hPa] – intensywność potencjalna ze średnich w promieniu 200 km: energia (temperatura morza, θe przy
+// powierzchni), ścinanie 1.2–9 km, udział morza, pas szerokości. Zwraca (głębokość, czynnik morza – 0 nad lądem)
+fn tcPot(i: i32, j: i32) -> vec2f {
+  let al = abs(vz[VZ_SLAT + u32(clamp(j, 0, i32(NYP) - 1))]);
+  let fl = smoothstep(0.07, 0.12, al) * (1.0 - smoothstep(0.5, 0.6, al));
+  // warunki w promieniu ~200 km od centrum niżu (oczka do 2.7 oczka): udział otwartego morza, energia – temperatura morza i energia
+  // powietrza przy powierzchni (θe najniższej warstwy, które zasila cyklon), ścinanie wiatru 1.2–9 km
+  var nAll = 0.0;
+  var nSea = 0.0;
+  var eSst = 0.0;
+  var eThe = 0.0;
+  for (var dj = -2; dj <= 2; dj++) {
+    for (var di = -3; di <= 3; di++) {
+      if (f32(di * di + dj * dj) * DXP * DXP > 200000.0 * 200000.0 + 1.0) { continue; }
+      let ii = i + di;
+      let jj = clamp(j + dj, 1, i32(NYP) - 2);
+      let cc = c2(ii, jj);
+      nAll += 1.0;
+      let th = vz[VZ_TH0] + so(2u, ii, jj, 0);
+      let tk = th * vz[VZ_PI0];
+      eThe += th * exp(LV * max(so(3u, ii, jj, 0), 0.0) / (CP * tk));
+      if (vz[VZ_SEA + cc] >= 0.5 && !landLike(cc)) { nSea += 1.0; eSst += vz[VZ_TS + cc]; }
+    }
+  }
+  let fSea = nSea / max(nAll, 1.0);
+  let sst = select(273.15, eSst / max(nSea, 1.0), nSea > 0.0);
+  // (powyżej 28 °C dalej w górę jak maksymalna intensywność potencjalna – 28 °C ~950, 29 °C ~930, 30 °C ~910 hPa; wcześniej stała od 28 °C: wywołany huragan Cat 4–5
+  // nad wodą 29 °C słabł po kick-in do Cat 2–3 w ~doby)
+  let energy = (smoothstep(298.65, 301.15, sst) + 0.75 * clamp((sst - 301.15) / 2.0, 0.0, 1.0)) * mix(0.6, 1.0, smoothstep(330.0, 345.0, eThe / max(nAll, 1.0)));    // 25.5–28 °C (+ do 30 °C); θe 335–348 K (suche powietrze – do 60% mniej)
+  // ścinanie otoczenia 1.2–9 km: średni wektor różnicy wiatru na okręgach 200, 300, 400 i 500 km wokół centrum (po 16 punktów, interpolowane) – symetryczny
+  // wir cyklonu się znosi (średnia z koła oczek go nie znosiła: wir udawał ścinanie > 22 m/s); sam okrąg 200 km leży tuż za promieniem maksymalnego
+  // wiatru wiru na oczku 75 km – niesymetryczna część wiru dawała skoki 8 ↔ 30 m/s co kilka godzin (jak w SHIPS: ścinanie z pierścienia 200–800 km)
+  var sh = vec2f(0.0);
+  for (var r = 0; r < 4; r++) {
+    let rr = (200000.0 + 100000.0 * f32(r)) / DXP;
+    for (var n = 0; n < 16; n++) {
+      let an = 0.3927 * (f32(n) + 0.5 * f32(r & 1));
+      let px = f32(i) + 0.5 + rr * cos(an);
+      let py = f32(j) + 0.5 + rr * sin(an);
+      sh += vec2f(soBil(0u, px, py - 0.5, 9) - soBil(0u, px, py - 0.5, 2), soBil(1u, px - 0.5, py, 9) - soBil(1u, px - 0.5, py, 2));
+    }
+  }
+  let shear = 1.0 - smoothstep(12.0, 25.0, length(sh) / 64.0);
+  let sea = smoothstep(0.5, 0.9, fSea);
+  return vec2f(TC_DP * fl * energy * shear * sea, sea);
+}
+@compute @workgroup_size(64)
+fn pe_tccen(@builtin(global_invocation_id) gid: vec3u) {
+  let c = gid.x;
+  if (c >= N2) { return; }
+  let i = i32(c % NXP);
+  let j = i32(c / NXP);
+  var amp = 0.0;
+  let sl = vz[VZ_SLAT + u32(j)];
+  let s = sign(sl);
+  let al = abs(sl);
+  let fl = smoothstep(0.07, 0.12, al) * (1.0 - smoothstep(0.5, 0.6, al));       // ~4–7° … 30–37°
+  var zc = 0.0;
+  var tci = 0.0;   // głębokość cyklonu tropikalnego w ośrodku [hPa] – opad ściany oka i pasm (tcRain); 0 – nie cyklon
+  if (j > 6 && j < i32(NYP) - 7) {
+    let z0 = s * tcZeta(i, j);
+    var isMax = z0 > 2.0e-5;
+    for (var dj = -4; dj <= 4 && isMax; dj++) {
+      for (var di = -4; di <= 4; di++) {
+        if ((di != 0 || dj != 0) && s * tcZeta(i + di, j + dj) > z0) { isMax = false; break; }
+      }
+    }
+    if (isMax) { zc = z0; }   // ośrodek wiru – do śledzenia cyklonów wywołanych kliknięciem (pe_tcforce)
+    if (TCG > 0.0 && fl > 0.0 && isMax && z0 > 6.0e-5) {
+      let dp = tcDepth(i, j);
+      let pot = tcPot(i, j).x;
+      amp = TC_AMP * clamp((pot - dp) / max(pot, 1.0), 0.0, 1.0) * smoothstep(1.0, 2.5, dp);
+      if (pot > 5.0 && dp > 3.0) { tci = dp; }
+    }
+  }
+  wk[WK_LAP + 25u * N2 + c] = amp;
+  wk[WK_LAP + 27u * N2 + c] = tci;
+  wk[WK_LAP + 26u * N2 + c] = zc;
+}
+// Cyklony wywołane kliknięciem (spawn, pe.js spawnTC): w pierwszym kroku zasiew (TC_SEEDF wiru), potem w każdym kroku śledzenie ośrodka (najsilniejszy
+// ośrodek wiru w ±3 oczkach od poprzedniego położenia – cyklon płynie z przepływem) i dokładanie tego, czego brakuje do głębokości docelowej (rośnie
+// przez czas kick-in do głębokości kategorii, pe.js); po kick-in cel z warunków w promieniu 200 km (tcPot) – dalej decyduje model: ciepłe morze
+// podtrzymuje, ląd, chłodna woda i ścinanie osłabiają; slot zwolniony, gdy wir zanikł
+@compute @workgroup_size(1)
+fn pe_tcforce() {
+  for (var n = 0u; n < 8u; n++) {
+    let o = n * 8u;
+    if (tcb[o] < 0.5) { continue; }
+    var x = tcb[o + 1u];
+    var y = tcb[o + 2u];
+    let i0 = i32(floor(x));
+    let j0 = i32(floor(y));
+    var a = 0.0;
+    if (tcb[o + 4u] > 0.5) {
+      a = TC_SEEDF;
+      tcb[o + 4u] = 0.0;
+    } else {
+      var best = 0.0;
+      var bi = i0;
+      var bj = j0;
+      for (var dj = -3; dj <= 3; dj++) {
+        for (var di = -3; di <= 3; di++) {
+          let z = wk[WK_LAP + 26u * N2 + c2(i0 + di, clamp(j0 + dj, 0, i32(NYP) - 1))];
+          if (z > best) { best = z; bi = i0 + di; bj = clamp(j0 + dj, 0, i32(NYP) - 1); }
+        }
+      }
+      if (best > 0.0) { x = f32(((bi % i32(NXP)) + i32(NXP)) % i32(NXP)) + 0.5; y = f32(bj) + 0.5; }
+      let dp = tcDepth(i32(floor(x)), i32(floor(y)));
+      tcb[o + 5u] = dp;
+      // po kick-in (cel < 0): cel = intensywność potencjalna w miejscu (energia, ścinanie, ląd) – huragan nad ciepłym morzem trwa, nad lądem
+      // i chłodną wodą słabnie; slot wolny, gdy wiru już nie ma albo niż zanikł
+      var dpT = tcb[o + 3u];
+      if (dpT < 0.0) {
+        // (cel wygładzony w czasie: od siły kategorii do intensywności potencjalnej płynnie, bez szumu warunków; pogłębianie τ 12 h, słabnięcie nad
+        // morzem τ 30 h – huragan w złych warunkach traci kategorię w ~1–2 doby, nad lądem τ 10 h)
+        let pp = tcPot(i32(floor(x)), i32(floor(y)));
+        let tau = select(mix(36000.0, 108000.0, pp.y), 43200.0, pp.x > tcb[o + 6u]);
+        dpT = tcb[o + 6u] + (pp.x - tcb[o + 6u]) * (DTS / tau);
+        if (best <= 0.0 || dp < 3.0) { tcb[o] = 0.0; continue; }
+      }
+      a = clamp(1.5 * (dpT - dp) / max(dpT, 10.0), 0.0, 0.14);   // (łagodnie – większe porcje rozkołysywały wir: głębokość ±20 hPa w 6 h; przy 0.1 Cat 5 nie nadążał – 62 przy 86 hPa)
+      tcb[o + 6u] = dpT;
+      tcb[o + 7u] = best * 1e5;
+    }
+    tcb[o + 1u] = x;
+    tcb[o + 2u] = y;
+    let c = c2(i32(floor(x)), i32(floor(y)));
+    wk[WK_LAP + 25u * N2 + c] = max(wk[WK_LAP + 25u * N2 + c], a);
+    wk[WK_LAP + 27u * N2 + c] = max(wk[WK_LAP + 27u * N2 + c], tcb[o + 5u]);
+  }
+}
+// Cyklony tropikalne dla domeny (drobne jądro w celu – sim.wgsl tgt_build): raz na termin ośrodki cyklonów w pobliżu domeny → lista w buforze
+// vg domeny (P.tclOff, 8 × 16). Ośrodek: ośrodek wiru (mapa 26 – maksimum zawirowania ~1.2 km) oznaczony jako cyklon tropikalny (mapa 27: pe_tccen –
+// intensywność potencjalna > 5 hPa i głębokość > 3 hPa, albo huragan wywołany kliknięciem) albo blisko śledzonego (nad lądem i chłodną wodą cyklon
+// dalej jest śledzony i słabnie sam). Położenie z minimum ciśnienia z dokładnością do części oczka (parabola przez 3 oczka), wygładzone filtrem α–β
+// (z prędkością ruchu – płynnie, bez skoków o oczko 75 km), głębokość i otoczenie wygładzone (τ 1.5 h). Otoczenie z okręgu 375 km (wir się znosi):
+// ciśnienie (średnia i gradient), wiatr ~1.5 i 6 km. Stan śladów w tcb od 64 (8 × 16): 0 waga 0…1, 1–2 x, y [m], 3–4 vx, vy [m/s], 5 głębokość [hPa],
+// 6 ciśnienie otoczenia [hPa], 7–8 gradient ciśnienia [hPa/m], 9–12 wiatr otoczenia u, v na 1.5 i 6 km, 13 wiek [s], 14 |szerokość| [°], 15 półkula,
+// 16–22 parametry sondażu otoczenia (wygładzone τ 1.5 h), 23 kolejne terminy bez ośrodka, 24 wielkość cyklonu (8 × 32)
+var<workgroup> tdN: atomic<u32>;
+var<workgroup> tdC: array<vec2i, 16>;
+@compute @workgroup_size(64)
+fn pe_tcdom(@builtin(local_invocation_index) li: u32) {
+  if (li == 0u) { atomicStore(&tdN, 0u); }
+  workgroupBarrier();
+  let LX = f32(NXP) * DXP;
+  let ic = i32(round(P.cx / DXP + f32(NXP) * 0.5 - 0.5));
+  let jc = i32(round(P.cy / DXP + f32(NYP) * 0.5 - 0.5));
+  let R = min(i32(ceil((length(vec2f(P.dhx, P.dhy)) + 900000.0) / DXP)), 40);
+  let n = 2 * R + 1;
+  for (var q = i32(li); q < n * n; q += 64) {
+    let i = ic - R + q % n;
+    let j = jc - R + q / n;
+    if (j < 7 || j > i32(NYP) - 8) { continue; }
+    if (wk[WK_LAP + 26u * N2 + c2(i, j)] <= 0.0) { continue; }
+    var tc = false;
+    for (var dj = -1; dj <= 1; dj++) {
+      for (var di = -1; di <= 1; di++) {
+        if (wk[WK_LAP + 27u * N2 + c2(i + di, j + dj)] > 0.0) { tc = true; }
+      }
+    }
+    if (!tc) {
+      let p = vec2f((f32(i) + 0.5) * DXP - 0.5 * LX, (f32(j) + 0.5 - f32(NYP) * 0.5) * DXP);
+      for (var s = 0u; s < 8u; s++) {
+        let o = 64u + 32u * s;
+        if (tcb[o] > 0.0) {
+          var d = p - vec2f(tcb[o + 1u], tcb[o + 2u]);
+          d.x -= LX * round(d.x / LX);
+          if (length(d) < 2.5 * DXP) { tc = true; }
+        }
+      }
+    }
+    if (tc) {
+      let k = atomicAdd(&tdN, 1u);
+      if (k < 16u) { tdC[k] = vec2i(i, j); }
+    }
+  }
+  workgroupBarrier();
+  if (li != 0u) { return; }
+  let nc = min(atomicLoad(&tdN), 16u);
+  let dt = P.tcDt;
+  let a = 1.0 - exp(-dt / 5400.0);
+  var hit = array<bool, 8>(false, false, false, false, false, false, false, false);
+  for (var c = 0u; c < nc; c++) {
+    let i = tdC[c].x;
+    let j = tdC[c].y;
+    // minimum ciśnienia w ±1 oczku i położenie z dokładnością do części oczka (parabola)
+    var im = i;
+    var jm = clamp(j, 1, i32(NYP) - 2);
+    var pm = wk[WK_PS + c2(im, jm)];
+    for (var dj = -1; dj <= 1; dj++) {
+      for (var di = -1; di <= 1; di++) {
+        let jj = clamp(j + dj, 1, i32(NYP) - 2);
+        let pv = wk[WK_PS + c2(i + di, jj)];
+        if (pv < pm) { pm = pv; im = i + di; jm = jj; }
+      }
+    }
+    let pxl = wk[WK_PS + c2(im - 1, jm)];
+    let pxr = wk[WK_PS + c2(im + 1, jm)];
+    let pyl = wk[WK_PS + c2(im, jm - 1)];
+    let pyr = wk[WK_PS + c2(im, jm + 1)];
+    let ox = clamp(0.5 * (pxl - pxr) / max(pxl - 2.0 * pm + pxr, 1e-6), -0.5, 0.5);
+    let oy = clamp(0.5 * (pyl - pyr) / max(pyl - 2.0 * pm + pyr, 1e-6), -0.5, 0.5);
+    let pos = vec2f((f32(im) + 0.5 + ox) * DXP - 0.5 * LX, (f32(jm) + 0.5 + oy - f32(NYP) * 0.5) * DXP);
+    let dp = tcDepth(im, jm);
+    if (dp < 3.0) { continue; }
+    // otoczenie: okrąg 375 km
+    var pr = 0.0;
+    var gp = vec2f(0.0);
+    var w1 = vec2f(0.0);
+    var w6 = vec2f(0.0);
+    for (var m = 0; m < 16; m++) {
+      let an = 0.3927 * f32(m);
+      let e = vec2f(cos(an), sin(an));
+      let q = pos + 375000.0 * e;
+      let pp = 1013.25 + vz[VZ_RC] * smp2(WK_PS, q.x, q.y) / 100.0;
+      pr += pp / 16.0;
+      gp += pp * e / (8.0 * 375000.0);
+      w1 += vec2f(atZ(0u, q.x, q.y, 1500.0), atZ(1u, q.x, q.y, 1500.0)) / 16.0;
+      w6 += vec2f(atZ(0u, q.x, q.y, 6000.0), atZ(1u, q.x, q.y, 6000.0)) / 16.0;
+    }
+    // dopasowanie do śladu: ≤ 2.5 oczka od położenia przewidzianego
+    var sb = 8u;
+    var db = 2.5 * DXP;
+    for (var s = 0u; s < 8u; s++) {
+      let o = 64u + 32u * s;
+      if (tcb[o] <= 0.0 || hit[s]) { continue; }
+      var d = pos - (vec2f(tcb[o + 1u], tcb[o + 2u]) + dt * vec2f(tcb[o + 3u], tcb[o + 4u]));
+      d.x -= LX * round(d.x / LX);
+      if (length(d) < db) { db = length(d); sb = s; }
+    }
+    let fresh = sb == 8u;
+    if (fresh) {
+      for (var s = 0u; s < 8u; s++) { if (tcb[64u + 32u * s] <= 0.0 && !hit[s]) { sb = s; break; } }
+      if (sb == 8u) { continue; }
+    }
+    let o = 64u + 32u * sb;
+    if (fresh || dt <= 0.0) {
+      // nowy ślad (przy pierwszej liście, np. po wczytaniu przebiegu – od razu pełna waga) albo ponowna lista w tej samej chwili
+      if (fresh) {
+        tcb[o] = select(0.5, 1.0, dt <= 0.0);
+        tcb[o + 3u] = 0.0;
+        tcb[o + 4u] = 0.0;
+        tcb[o + 13u] = 0.0;
+        tcb[o + 16u] = 0.0;
+        // wielkość cyklonu: losowa 0.6–1.8 (log-równomiernie – duże i małe huragany), powtarzalna – z położenia narodzin i ziarna pogody
+        let hs = tcHash(bitcast<u32>(pos.x) ^ (bitcast<u32>(pos.y) * 2654435761u) ^ (u32(P.wvX2) * 2246822519u));
+        tcb[o + 24u] = exp(-0.5108 + 1.0986 * hs);
+      }
+      tcb[o + 1u] = pos.x;
+      tcb[o + 2u] = pos.y;
+      tcb[o + 5u] = dp;
+      tcb[o + 6u] = pr;
+      tcb[o + 7u] = gp.x;
+      tcb[o + 8u] = gp.y;
+      tcb[o + 9u] = w1.x;
+      tcb[o + 10u] = w1.y;
+      tcb[o + 11u] = w6.x;
+      tcb[o + 12u] = w6.y;
+    } else {
+      // filtr α–β: położenie i prędkość ruchu
+      let pp = vec2f(tcb[o + 1u], tcb[o + 2u]) + dt * vec2f(tcb[o + 3u], tcb[o + 4u]);
+      var e = pos - pp;
+      e.x -= LX * round(e.x / LX);
+      var np = pp + 0.4 * e;
+      np.x -= LX * round(np.x / LX);
+      var vv = vec2f(tcb[o + 3u], tcb[o + 4u]) + 0.08 * e / dt;
+      vv *= min(1.0, 25.0 / max(length(vv), 1e-3));
+      tcb[o + 1u] = np.x;
+      tcb[o + 2u] = np.y;
+      tcb[o + 3u] = vv.x;
+      tcb[o + 4u] = vv.y;
+      tcb[o + 5u] += (dp - tcb[o + 5u]) * a;
+      tcb[o + 6u] += (pr - tcb[o + 6u]) * a;
+      tcb[o + 7u] += (gp.x - tcb[o + 7u]) * a;
+      tcb[o + 8u] += (gp.y - tcb[o + 8u]) * a;
+      tcb[o + 9u] += (w1.x - tcb[o + 9u]) * a;
+      tcb[o + 10u] += (w1.y - tcb[o + 10u]) * a;
+      tcb[o + 11u] += (w6.x - tcb[o + 11u]) * a;
+      tcb[o + 12u] += (w6.y - tcb[o + 12u]) * a;
+      tcb[o] = min(1.0, tcb[o] + dt / 3600.0);
+      tcb[o + 13u] += dt;
+    }
+    tcb[o + 23u] = 0.0;
+    let sl = vz[VZ_SLAT + u32(jm)];
+    tcb[o + 14u] = degrees(asin(min(abs(sl), 1.0)));
+    tcb[o + 15u] = select(-1.0, 1.0, sl >= 0.0);
+    hit[sb] = true;
+  }
+  // ślady bez ośrodka w tym terminie: dalej z prędkością ruchu; głębokość i waga zanikają (~2 h) dopiero od drugiego terminu bez ośrodka – pojedyncze chybienie
+  // (dwa maksima zawirowania blisko siebie) osłabiało jądro na termin i obraz pulsował
+  if (dt > 0.0) {
+    for (var s = 0u; s < 8u; s++) {
+      let o = 64u + 32u * s;
+      if (tcb[o] <= 0.0 || hit[s]) { continue; }
+      tcb[o + 1u] += dt * tcb[o + 3u];
+      tcb[o + 1u] -= LX * round(tcb[o + 1u] / LX);
+      tcb[o + 2u] += dt * tcb[o + 4u];
+      tcb[o + 23u] += 1.0;
+      if (tcb[o + 23u] < 1.5) { continue; }
+      tcb[o + 5u] *= exp(-dt / 10800.0);
+      tcb[o] -= dt / 7200.0;
+      if (tcb[o] <= 0.0 || tcb[o + 5u] < 2.0) { tcb[o] = 0.0; }
+    }
+  }
+  // lista dla domeny: położenie względem środka domeny [m]
+  if (P.tclOff > 0u) {
+    for (var s = 0u; s < 8u; s++) {
+      let o = 64u + 32u * s;
+      let d = P.tclOff + 24u * s;
+      if (tcb[o] <= 0.0) { nest[d] = 0.0; continue; }
+      var dx = tcb[o + 1u] - P.cx;
+      dx -= LX * round(dx / LX);
+      nest[d] = clamp(tcb[o], 0.0, 1.0);
+      nest[d + 1u] = dx;
+      nest[d + 2u] = tcb[o + 2u] - P.cy;
+      for (var m = 3u; m <= 10u; m++) { nest[d + m] = tcb[o + m + 2u]; }   // 3 głębokość, 4 ciśnienie otoczenia, 5–6 gradient, 7–10 wiatr otoczenia
+      nest[d + 11u] = tcb[o + 15u];
+      nest[d + 12u] = tcb[o + 14u];
+      nest[d + 13u] = tcb[o + 3u];
+      nest[d + 14u] = tcb[o + 4u];
+      nest[d + 15u] = 0.0;
+      // profil temperatury otoczenia: parametry sondażu uśrednione na okręgu 450 km (16–22: T przy gruncie, Γ dolny, tropopauza, inwersja, Γ górnej troposfery,
+      // Γ 3–5.6 km) – w jądrze zastępuje szeroki ciepły rdzeń modelu (oczko 75 km: ~260 km, górna troposfera nad ścianą oka o ~15 K za ciepła)
+      var ep = array<f32, 7>(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+      for (var m = 0; m < 8; m++) {
+        let an = 0.7854 * f32(m);
+        let A = air(tcb[o + 1u] + 450000.0 * cos(an), tcb[o + 2u] + 450000.0 * sin(an));
+        ep[0] += A.p[0] / 8.0;
+        ep[1] += A.p[1] / 8.0;
+        ep[2] += A.p[2] / 8.0;
+        ep[3] += A.p[3] / 8.0;
+        ep[4] += A.p[4] / 8.0;
+        ep[5] += A.p[15] / 8.0;
+        ep[6] += A.p[24] / 8.0;
+      }
+      // (wygładzone w czasie jak głębokość – profil jądra nie skacze co termin)
+      let ae = select(1.0, a, dt > 0.0 && tcb[o + 16u] > 100.0);
+      for (var m = 0u; m < 7u; m++) {
+        tcb[o + 16u + m] += (ep[m] - tcb[o + 16u + m]) * ae;
+        nest[d + 16u + m] = tcb[o + 16u + m];
+      }
+      nest[d + 23u] = tcb[o + 24u];
+    }
+  }
+}
+@compute @workgroup_size(64)
+fn pe_tcamp(@builtin(global_invocation_id) gid: vec3u, @builtin(num_workgroups) nwg: vec3u) {
+  let id = gid.x + gid.y * nwg.x * 64u;
+  if (id >= N3) { return; }
+  let i = i32(id % NXP);
+  let j = i32((id / NXP) % NYP);
+  let k = id / N2;
+  var d = vec4f(0.0);
+  var rp = 0.0;   // ściana oka i pasma (największa wilgotność docelowa)
+  var re = 0.0;   // oko (osuszenie), gdy nie ma ściany innego cyklonu
+  for (var dj = -6; dj <= 6; dj++) {
+    let jj = j + dj;
+    if (jj < 0 || jj >= i32(NYP)) { continue; }
+    for (var di = -6; di <= 6; di++) {
+      let a = wk[WK_LAP + 25u * N2 + c2(i + di, jj)];
+      let ti = wk[WK_LAP + 27u * N2 + c2(i + di, jj)];
+      if (ti > 0.0) {
+        let rr = tcRain(i, j, k, f32(i + di) + 0.5, f32(jj) + 0.5, ti);
+        if (rr > 0.0) { rp = max(rp, rr); } else if (rr < 0.0) { re = rr; }
+      }
+      if (a <= 0.0) { continue; }
+      let e = tcInc(i, j, k, f32(i + di) + 0.5, f32(jj) + 0.5, a);
+      d += vec4f(e.xyz, 0.0);
+      d.w = max(d.w, e.w);
+    }
+  }
+  if (any(d != vec4f(0.0))) { tcApply(id, i, j, k, d); }
+  let rn = select(re, rp, rp > 0.0);
+  if (rn != 0.0) {
+    // ściana oka i pasma: dowilżenie ponad nasycenie z ochłodzeniem równym ciepłu późniejszego skroplenia (opad bez dodatkowego grzania – głębokość
+    // reguluje wymuszenie wiru); oko: osuszenie
+    let t = (vz[VZ_TH0 + k] + sOut[2u * N3 + id]) * vz[VZ_PI0 + k];
+    let qs = qsatM(t, vz[VZ_P0 + k]);
+    let q = sOut[3u * N3 + id];
+    if (rn < 0.0) { sOut[3u * N3 + id] = min(q, -rn * qs); }
+    else {
+      let dq = max(rn * qs - max(q, qs), 0.0) * (DTS / 1800.0);
+      sOut[3u * N3 + id] = q + dq;
+      sOut[2u * N3 + id] -= LV * dq / (CP * vz[VZ_PI0 + k]);
+    }
+  }
 }
