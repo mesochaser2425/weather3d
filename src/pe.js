@@ -20,6 +20,7 @@ export const LYP = NYP * DXP;
 export const DTQ = 1800;                 // odstęp terminów pól docelowych [s]
 const DT = 450;                          // krok modelu [s]
 const SPI = DTQ / DT;                    // kroków na termin
+export const PE_DT = DT, PE_SPI = SPI;
 const NW = NZP + 1;
 // Szerokość kanału W–E: pełne koło szerokości geograficznej miejsca (128–400 oczek). Przy stałych 9600 km na 49°N
 // kanał obejmował 46°W–86°E i za „szwem” powietrze z Syberii wchodziło od razu nad środek Atlantyku – nad Europę
@@ -286,18 +287,18 @@ export class PEModel {
     const m = new PEModel(sh, { ...opts, forcV: info.forcV ?? 1, lat: info.lat, lon: info.lon, cont: info.cont, hum: info.hum, seed: info.seed, doy: info.doy, doyRef: info.doyRef, tRef: info.tRef, hour0: info.hour0,
       geo: info.geoLon === null ? null : { lon: info.geoLon } });
     if (m.wkLen !== info.wkLen) { m.destroy(); throw new Error('the file comes from an incompatible version (synoptic model layout)'); }
-    Object.assign(m, { p: 0, time: info.time, hslot: info.hslot, nhist: info.nhist });
+    Object.assign(m, { p: 0, time: info.time, sub: info.sub || 0, hslot: info.hslot, nhist: info.nhist });
     device.queue.writeBuffer(m.S[0], 0, data.S);
     device.queue.writeBuffer(m.wk, 0, data.wk);
     device.queue.writeBuffer(m.dg, 0, data.dg);
-    m.writeUniforms();
+    if (m.sub) m.termUniforms(); else m.writeUniforms();
     return m;
   }
 
   // opis modelu do pełnego zapisu przebiegu (bufory S, wk i dg czyta main.js)
   saveInfo() {
     return { lat: this.lat, lon: this.lon, cont: this.cont, hum: this.hum, seed: this.seed, doy: this.doy, doyRef: this.doyRef, tRef: this.tRef, hour0: this.hour0,
-      forcV: this.forcV, time: this.time, hslot: this.hslot, nhist: this.nhist, geoLon: this.geo ? this.geo.lon : null, nxp: NXP, nyp: NYP, nzp: NZP, wkLen: this.wkLen };
+      forcV: this.forcV, time: this.time, sub: this.sub, hslot: this.hslot, nhist: this.nhist, geoLon: this.geo ? this.geo.lon : null, nxp: NXP, nyp: NYP, nzp: NZP, wkLen: this.wkLen };
   }
 
   constructor(sh, opts, from = null) {
@@ -332,7 +333,7 @@ export class PEModel {
     if (from) {
       // własna kopia tablic wymuszeń (pory roku: każda kopia może być w innym dniu)
       this.vzData = from.vzData.slice(); this.vzOff = from.vzOff; this.sea = from.sea; this.encl = from.encl; this.tNorm = from.tNorm;
-      this.hgt = from.hgt; this.nIter = from.nIter; this.warm = from.warm;
+      this.hgt = from.hgt; this.nIter = from.nIter; this.warm = from.warm; this.terr = from.terr;
       this.halfDiur = from.halfDiur; this.summer = from.summer; this.sunLag = from.sunLag; this.nodeCount = from.nodeCount; this.wvOn = from.wvOn;
       this.forcDay = from.forcDay; this.doy = from.doy; this.lc = from.lc;
       this.vz = d.createBuffer({ size: this.vzData.byteLength, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
@@ -341,7 +342,8 @@ export class PEModel {
       this.buildForcing();
     }
     this.p = 0;            // który bufor S jest bieżący
-    this.time = 0;
+    this.time = 0;         // początek bieżącego terminu
+    this.sub = 0;          // kroki 450 s zrobione w bieżącym terminie (advance)
     this.hslot = 0; this.nhist = 0;
     this.center = null;    // ostatni odczyt wektora środka
     this.map = null;       // ostatni odczyt pól mapy
@@ -570,22 +572,28 @@ export class PEModel {
     // (ściana otwarta nad wyższym z dwóch sąsiednich gruntów, jak w domenie); AC – M / masa słupa nad gruntem oczka: napięcie
     // wstępne rzutu Δ⁻¹(r/A) – nad płaskim terenem dokładne, test na kanale z płaskowyżem (A 0.47): reszta 9% / 0.8% po 1 / 2
     // iteracjach (stała masa M̄ = (A_min + M)/2: 36% / 13%)
+    // (teren nie zależy od daty: liczony raz na model i dzielony z kopiami – wcześniej co dobę modelu w każdej z trzech kopii, ~13 ms procesora)
     {
-      const M = ZC.reduce((s, z, k) => s + v[off.RC + k] * v[off.DZ + k], 0);
-      const colA = (h) => ZC.reduce((s, z, k) => s + v[off.RC + k] * v[off.DZ + k] * Math.min(1, Math.max(0, (ZW[k + 1] - h) / (ZW[k + 1] - ZW[k]))), 0);
-      let aMin = M;
-      for (let j = 0; j < NYP; j++) for (let i = 0; i < NXP; i++) {
-        const c = j * NXP + i, h = this.hgt[c];
-        v[off.HGT + c] = h;
-        v[off.AU + c] = colA(Math.max(h, this.hgt[j * NXP + ((i + NXP - 1) % NXP)]));
-        v[off.AV + c] = j > 0 ? colA(Math.max(h, this.hgt[(j - 1) * NXP + i])) : 0;
-        v[off.AC + c] = M / colA(h);
-        aMin = Math.min(aMin, v[off.AU + c], j > 0 ? v[off.AV + c] : M);
+      let tr = this.terr;
+      if (!tr || tr.hgt !== this.hgt || tr.n !== N2) {
+        const M = ZC.reduce((s, z, k) => s + v[off.RC + k] * v[off.DZ + k], 0);
+        const colA = (h) => ZC.reduce((s, z, k) => s + v[off.RC + k] * v[off.DZ + k] * Math.min(1, Math.max(0, (ZW[k + 1] - h) / (ZW[k + 1] - ZW[k]))), 0);
+        const AU = new Float32Array(N2), AV = new Float32Array(N2), AC = new Float32Array(N2);
+        let aMin = M;
+        for (let j = 0; j < NYP; j++) for (let i = 0; i < NXP; i++) {
+          const c = j * NXP + i, h = this.hgt[c];
+          AU[c] = colA(Math.max(h, this.hgt[j * NXP + ((i + NXP - 1) % NXP)]));
+          AV[c] = j > 0 ? colA(Math.max(h, this.hgt[(j - 1) * NXP + i])) : 0;
+          AC[c] = M / colA(h);
+          aMin = Math.min(aMin, AU[c], j > 0 ? AV[c] : M);
+        }
+        tr = this.terr = { hgt: this.hgt, n: N2, AU, AV, AC, warm: aMin < 0.999 * M };
       }
+      v.set(this.hgt, off.HGT); v.set(tr.AU, off.AU); v.set(tr.AV, off.AV); v.set(tr.AC, off.AC);
       v[off.MB] = 1;
       // płaski kanał: rzut dokładny w jednej iteracji; z górami 2 iteracje od ciśnienia poprzedniego etapu (?pit= – liczba
       // iteracji, test). Masa słupa nad Tybetem ~0.47 pełnej.
-      this.warm = aMin < 0.999 * M;
+      this.warm = tr.warm;
       v[off.MB + 1] = this.warm ? 1 : 0;
       this.nIter = +(QP.get('pit') || 0) || (this.warm ? 2 : 1);
     }
@@ -804,8 +812,11 @@ export class PEModel {
   // zapis dyspozycji n kroków do przebiegu obliczeń
   encodeSteps(pass, n) {
     const P = this.sh.pipes;
+    // (grupa wiązań ustawiana tylko przy zmianie – w etapie RK kilkanaście jąder ma tę samą; mniej poleceń do zakodowania, ta sama praca GPU)
+    let bg0 = null, sl0 = -1;
     const d1 = (name, total, bg, slot) => {
-      pass.setPipeline(P[name]); pass.setBindGroup(0, bg, [slot * USLOT]);
+      pass.setPipeline(P[name]);
+      if (bg !== bg0 || slot !== sl0) { pass.setBindGroup(0, bg, [slot * USLOT]); bg0 = bg; sl0 = slot; }
       pass.dispatchWorkgroups(Math.ceil(total / 64));
     };
     for (let s = 0; s < n; s++) {
@@ -838,7 +849,7 @@ export class PEModel {
       this.p = 1 - this.p;
       // cyklony tropikalne: podtrzymanie i pogłębianie co krok (7.5 min) małymi porcjami – porcje co termin wysyłały fale grawitacyjne (kręgi)
       if (TCG > 0 || this.forced.length) {
-        pass.setBindGroup(0, this.bgs[this.p][3], [3 * USLOT]);
+        pass.setBindGroup(0, this.bgs[this.p][3], [3 * USLOT]); bg0 = this.bgs[this.p][3]; sl0 = 3;
         pass.setPipeline(P.pe_tccen); pass.dispatchWorkgroups(Math.ceil(N2 / 64));
         if (this.forced.length) { pass.setPipeline(P.pe_tcforce); pass.dispatchWorkgroups(1); }
         pass.setPipeline(P.pe_tcamp); pass.dispatchWorkgroups(Math.ceil(N3 / 64));
@@ -846,16 +857,47 @@ export class PEModel {
     }
   }
 
-  // jeden termin (30 min); co 3 h zapis wiatru do historii trajektorii
-  step() {
-    // pory roku: raz na dobę modelu nowe wymuszenia (temperatura równowagi, ląd, morze)
-    const dNow = this.doyAt(this.time);
-    if (Math.floor(dNow) !== this.forcDay || (this.sstAt && Math.abs(this.sstAt(this.time - this.tRef) - (this.forcS ?? 0)) > 0.1)) { this.doy = dNow; this.buildForcing(); this.writeUniforms(); }
-    this.writeUniforms();
-    this.tcPlan();
+  // Termin (30 min) liczony częściami: advance(k) robi do k kroków 450 s, najwyżej do końca bieżącego terminu (this.sub – kroki już
+  // zrobione w terminie). Praca rozkłada się na klatki (main.js: model główny liczy następny termin po kawałku, kopie w tle – w budżecie
+  // klatki), a wynik nie zależy od podziału: początek terminu (wymuszenia, stałe, cyklony kliknięciem), kroki i koniec terminu (czas,
+  // historia trajektorii, geneza cyklonów) zawsze w tej samej kolejności, co do bitu jak dawny step() całego terminu naraz.
+  // tm – pomiar czasu GPU (main.js): { wr – timestampWrites przebiegu, fin(enc) – odczyt zapytań }
+  advance(k, tm = null) {
+    const n = Math.min(k, SPI - this.sub);
+    if (n <= 0) return 0;
+    if (!this.sub) {
+      // pory roku: raz na dobę modelu nowe wymuszenia (temperatura równowagi, ląd, morze)
+      const dNow = this.doyAt(this.time);
+      if (Math.floor(dNow) !== this.forcDay || (this.sstAt && Math.abs(this.sstAt(this.time - this.tRef) - (this.forcS ?? 0)) > 0.1)) { this.doy = dNow; this.buildForcing(); }
+      this.termUniforms();
+      this.tcPlan();
+    }
     const enc = this.device.createCommandEncoder();
-    const pass = enc.beginComputePass();
-    this.encodeSteps(pass, SPI);
+    const pass = enc.beginComputePass(tm ? { timestampWrites: tm.wr } : undefined);
+    this.encodeSteps(pass, n);
+    this.sub += n;
+    if (this.sub === SPI) { this.sub = 0; this.endTerm(pass); }
+    pass.end();
+    if (tm) tm.fin(enc);
+    this.device.queue.submit([enc.finish()]);
+    return n;
+  }
+  // reszta bieżącego terminu (bez zaczętego – cały termin)
+  step(tm = null) {
+    do this.advance(SPI - this.sub, tm); while (this.sub);
+  }
+  // stałe na czas terminu. W terminie z zapisem historii trajektorii (co 3 h) – stałe z końca terminu (czas, slot historii): dawniej cały
+  // termin szedł jednym poleceniem, a zapis stałych z końca terminu trafiał do kolejki przed jego wysłaniem (dotyczy tylko położenia
+  // słońca – o 30 min później). Zostaje tak, żeby pogoda przy tym samym ziarnie była taka jak dawniej
+  termUniforms() {
+    if (Math.round((this.time + DTQ) / DTQ) % 6 !== 0) { this.writeUniforms(); return; }
+    const t0 = this.time, h0 = this.hslot, n0 = this.nhist;
+    this.time = t0 + DTQ; this.hslot = (h0 + 1) % 24; this.nhist = Math.min(24, n0 + 1);
+    this.writeUniforms();
+    this.time = t0; this.hslot = h0; this.nhist = n0;
+  }
+  // koniec terminu: czas, co 3 h zapis wiatru do historii trajektorii, co 6 h geneza cyklonów
+  endTerm(pass) {
     this.time += DTQ;
     const hist = Math.round(this.time / DTQ) % 6 === 0;
     if (hist) {
@@ -875,8 +917,6 @@ export class PEModel {
         pass.setPipeline(P.pe_tcins); pass.dispatchWorkgroups(Math.ceil(N3 / 64));
       }
     }
-    pass.end();
-    this.device.queue.submit([enc.finish()]);
   }
 
   // rozbieg: n dób (porcjami, z oddaniem sterowania przeglądarce)
@@ -981,8 +1021,8 @@ export class PEModel {
     enc.copyBufferToBuffer(this.dg, 0, m.dg, 0, (N3 + N2 * NW) * 4);
     enc.copyBufferToBuffer(this.tcb, 0, m.tcb, 0, 1280);
     this.device.queue.submit([enc.finish()]);
-    m.time = this.time; m.hslot = this.hslot; m.nhist = this.nhist; m.center = this.center; m.map = this.map;
-    m.writeUniforms();
+    m.time = this.time; m.sub = this.sub; m.hslot = this.hslot; m.nhist = this.nhist; m.center = this.center; m.map = this.map;
+    if (m.sub) m.termUniforms(); else m.writeUniforms();   // (w trakcie terminu – stałe tego terminu)
     return m;
   }
 

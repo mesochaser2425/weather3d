@@ -1146,6 +1146,8 @@ fn frT(X0: f32, Y0: f32) -> f32 {
   return airT(a, FR_ZR);
 }
 
+// kwadrat (pow(x, 2.0) dla ujemnego x jest w WGSL nieokreślony – na części kart NaN)
+fn sqr2(x: f32) -> f32 { return x * x; }
 // tanh bez przepełnienia dla dużych argumentów
 fn tnh(x: f32) -> f32 { return tanh(clamp(x, -10.0, 10.0)); }
 
@@ -1511,24 +1513,45 @@ fn tgt_build(@builtin(global_invocation_id) gid: vec3u) {
         let s = f32(q - FR_J) * ds;
         T[q] = frT(X + n.x * s / DX, Y + n.y * s / DY);
       }
-      // gradient wzdłuż n (dodatni w stronę zimna) i jego maksimum
+      // profil wygładzony w poprzek frontu (dwa razy filtr dwumianowy 1-4-6-4-1, σ ≈ 1.4 próbki ≥ 11 km): parametry są dwuliniowe między węzłami
+      // co GS oczek – gradient był schodkowy, a oś frontu szła schodami wzdłuż węzłów (użytkownik: front kanciasty)
+      for (var it = 0; it < 2; it++) {
+        var Ts = T;
+        for (var q = 2; q < 47; q++) { Ts[q] = (T[q - 2] + 4.0 * T[q - 1] + 6.0 * T[q] + 4.0 * T[q + 1] + T[q + 2]) / 16.0; }
+        T = Ts;
+      }
+      // ciągłość w czasie: oś z poprzedniego terminu (slot zbudowany przed tym) rzutowana na ten kierunek – gradient blisko niej (~50 km) lekko
+      // preferowany (× 0.6…1). Przy dwóch strefach gradientu o podobnej sile wykrywanie przerzucało oś między nimi co termin – front skakał (użytkownik);
+      // wyraźnie silniejsza nowa strefa dalej wygrywa
+      let pb = ((P.bslot + 2u) % 3u) * TG_SLOT + 4u * N + col;
+      let nP = vec2f(tgt[pb + 4u * NXY], tgt[pb + 5u * NXY]);
+      let cP = dot(nP, n) / max(length(nP), 1e-6);
+      let sP = tgt[pb + 6u * NXY] * cP;
+      let wP = smoothstep(0.05, 0.3, tgt[pb + 10u * NXY]) * smoothstep(0.7, 0.9, cP);
+      // gradient wzdłuż n (dodatni w stronę zimna): G – do siły frontu, Ge – z preferencją osi z poprzedniego terminu – do położenia
+      var G: array<f32, 49>;
+      var Ge: array<f32, 49>;
+      for (var q = 1; q < 48; q++) {
+        G[q] = (T[q - 1] - T[q + 1]) / (2.0 * ds);
+        Ge[q] = G[q] * mix(1.0, 0.6 + 0.4 * exp(-sqr2((f32(q - FR_J) * ds - sP) / 50000.0)), wP);
+      }
       var gmax = 0.0;
+      var gmE = 0.0;
       var qm = FR_J;
       for (var q = 2; q < 47; q++) {
-        let g = (T[q - 1] - T[q + 1]) / (2.0 * ds);
-        if (g > gmax) { gmax = g; qm = q; }
+        gmax = max(gmax, G[q]);
+        if (Ge[q] > gmE) { gmE = Ge[q]; qm = q; }
       }
-      // strefa, w której gradient przekracza połowę maksimum, i oś frontu w jej środku ciężkości (pola modelu synoptycznego są
-      // liniowe między jego oczkami 75 km – gradient ma „płaskowyże”, a samo maksimum przeskakiwało między ich końcami:
-      // schodki na linii frontu)
+      // strefa, w której gradient przekracza połowę maksimum, i oś frontu w jej środku ciężkości (samo maksimum przeskakiwało między końcami
+      // „płaskowyżów” pól liniowych między oczkami 75 km – schodki na linii frontu)
       var ql = qm;
-      loop { if (ql <= 1 || (T[ql - 1] - T[ql + 1]) / (2.0 * ds) < 0.5 * gmax) { break; } ql -= 1; }
+      loop { if (ql <= 1 || Ge[ql] < 0.5 * gmE) { break; } ql -= 1; }
       var qr = qm;
-      loop { if (qr >= 47 || (T[qr - 1] - T[qr + 1]) / (2.0 * ds) < 0.5 * gmax) { break; } qr += 1; }
+      loop { if (qr >= 47 || Ge[qr] < 0.5 * gmE) { break; } qr += 1; }
       var sw = 0.0;
       var sx = 0.0;
       for (var q = ql; q <= qr; q++) {
-        let wq = max((T[q - 1] - T[q + 1]) / (2.0 * ds) - 0.5 * gmax, 0.0);
+        let wq = max(Ge[q] - 0.5 * gmE, 0.0);
         sw += wq;
         sx += wq * f32(q - FR_J);
       }
@@ -5347,7 +5370,7 @@ fn lite_col(@builtin(global_invocation_id) gid: vec3u) {
       let c0 = 1.3 * max(r, 2.0 * DX) + 0.55 * ws;
       let nS = stNz(al / max(0.9 * r, 2.0 * DX) + 0.3 * db / r, db / max(0.8 * r, 2.0 * DX), sd + 9u, age);
       let eS = smoothstep(0.05, 0.4, fl);
-      strat = 0.11 * eS * exp(-pow((db + c0) / (0.5 * ws * clamp(1.0 + 0.3 * nS, 0.6, 1.4)), 2.0)) * (1.0 - smoothstep(0.6, 1.2, abs(ua)))
+      strat = 0.11 * eS * exp(-sqr2((db + c0) / (0.5 * ws * clamp(1.0 + 0.3 * nS, 0.6, 1.4)))) * (1.0 - smoothstep(0.6, 1.2, abs(ua)))
               * clamp(0.75 + 0.45 * nS, 0.2, 1.4);
       let ex = max(abs(al) - 1.05 * Lc, 0.0);
       let ey = max(max(db - 0.8 * r, -(db + c0 + 0.6 * ws)), 0.0);
@@ -5367,7 +5390,7 @@ fn lite_col(@builtin(global_invocation_id) gid: vec3u) {
       let q2 = mat2x2f(0.809, 0.588, -0.588, 0.809) * q1 * 1.8;
       let cl = clamp(0.8 + 0.25 * stNz(q1.x, q1.y, sd + 2u, age) + 0.12 * stNz(q2.x, q2.y, sd + 3u, age), 0.35, 1.3);
       core = e * exp(-2.6 * rho * rho) * (1.0 - smoothstep(0.85, 1.25, rho)) * cl;
-      strat = 0.09 * smoothstep(0.2, 0.5, fl) * exp(-pow(rr / (1.7 * rf), 2.0)) * clamp(0.8 + 0.3 * stNz(q1.x * 0.5, q1.y * 0.5, sd + 4u, age), 0.4, 1.3);
+      strat = 0.09 * smoothstep(0.2, 0.5, fl) * exp(-sqr2(rr / (1.7 * rf))) * clamp(0.8 + 0.3 * stNz(q1.x * 0.5, q1.y * 0.5, sd + 4u, age), 0.4, 1.3);
       dAn = rr / ((2.6 + 0.6 * lob) * max(r, 2.2 * DX));
     }
     // (część warstwowa nie tu, tylko w polu opadu LPR – po wygaśnięciu burzy zostaje i zanika ~1.5 h)

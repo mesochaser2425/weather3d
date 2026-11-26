@@ -21,8 +21,9 @@ const MID = [15.5, 45, 74.5, 105, 135.5, 166, 196.5, 227.5, 258, 288.5, 319, 349
 export function zonWave(lat, z, doy, vr, out) {
   const t = tab || (tab = new Int8Array(bytes(B64)));
   const d = ((doy % 365) + 365) % 365;
-  let m1 = MID.findIndex((x) => x > d);
-  if (m1 < 0) m1 = 0;
+  let m1 = 0;
+  while (m1 < 12 && !(MID[m1] > d)) m1++;
+  if (m1 >= 12) m1 = 0;
   const m0 = (m1 + 11) % 12;
   const d0 = MID[m0] > d ? MID[m0] - 365 : MID[m0], d1 = MID[m1] < d ? MID[m1] + 365 : MID[m1];
   const wm = (d - d0) / (d1 - d0);
@@ -31,11 +32,16 @@ export function zonWave(lat, z, doy, vr, out) {
   while (k0 < NZ - 2 && ZWV_Z[k0 + 1] <= z) k0++;
   const wz = Math.min(1, Math.max(0, (z - ZWV_Z[k0]) / (ZWV_Z[k0 + 1] - ZWV_Z[k0])));
   const L = 2 * NMW;
-  const at = (m, j, k, n) => t[(((m * NY + j) * NZ + k) * 3 + vr) * L + n];
+  // te same działania w tej samej kolejności co dawniej (wynik co do bitu), ale bez funkcji tworzonych w pętli: ~3500 wywołań na dobę
+  // modelu w każdej z trzech kopii zabierało ~19 ms procesora (zacięcia obrazu w trybie lekkim)
+  const b = (m, j, k) => (((m * NY + j) * NZ + k) * 3 + vr) * L;
+  const a00 = b(m0, j0, k0), a01 = b(m0, j0, k0 + 1), a10 = b(m0, j0 + 1, k0), a11 = b(m0, j0 + 1, k0 + 1);
+  const c00 = b(m1, j0, k0), c01 = b(m1, j0, k0 + 1), c10 = b(m1, j0 + 1, k0), c11 = b(m1, j0 + 1, k0 + 1);
   for (let n = 0; n < L; n++) {
-    const az = (m, j) => at(m, j, k0, n) + wz * (at(m, j, k0 + 1, n) - at(m, j, k0, n));
-    const ay = (m) => az(m, j0) + wy * (az(m, j0 + 1) - az(m, j0));
-    out[n] = 0.25 * (ay(m0) + wm * (ay(m1) - ay(m0)));
+    const p0 = t[a00 + n] + wz * (t[a01 + n] - t[a00 + n]), p1 = t[a10 + n] + wz * (t[a11 + n] - t[a10 + n]);
+    const q0 = t[c00 + n] + wz * (t[c01 + n] - t[c00 + n]), q1 = t[c10 + n] + wz * (t[c11 + n] - t[c10 + n]);
+    const y0 = p0 + wy * (p1 - p0), y1 = q0 + wy * (q1 - q0);
+    out[n] = 0.25 * (y0 + wm * (y1 - y0));
   }
   return out;
 }

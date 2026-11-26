@@ -4,7 +4,7 @@ import { LANDUSE, makeLand } from './land.js';
 import { LOCATIONS, CLIM, climate, biome, VEG, VEG_NAMES } from './climate.js';
 import { baseClim } from './climbase.js';
 import { fetchTerrain, fetchTerrainHi, peakFine, fetchLandCover, fetchCities, cachedClimate, cachedNormals, climateOf, MONTH_DAYS, fetchNormals, worldDem, worldElev, regionDem, demColor, lonLatToTile, tileToLonLat } from './geo.js';
-import { PEModel, DTQ, NXP, NYP, DXP, LXP, LYP, classifyCenter, nestNodes, sstClim } from './pe.js';
+import { PEModel, DTQ, PE_DT, PE_SPI, NXP, NYP, DXP, LXP, LYP, classifyCenter, nestNodes, sstClim } from './pe.js';
 import { parVec, paramGrid, paramAt, airTz, embed } from './nesting.js';
 import { sunVector, dayOfYear, dateFromDoy, moonSky } from './sun.js';
 import { FIELDS, FIELDS_3D, FIELDS_MAP, LAYER_GROUPS, rangeFor, legendCss, RADAR_STEPS, ACC_STEPS, ACC_WGSL, legendTicks, niceStep } from './fields.js';
@@ -365,6 +365,34 @@ async function init() {
       pending: false,
     };
   }
+  // Budżet klatki: ~FRAME_MS ms pracy GPU symulacji na klatkę – kroki domeny razem z krokami modelu synoptycznego (model główny i kopie w tle)
+  // i terminami pól docelowych. Koszty z pomiaru (zapytania o znaczniki czasu; na start oszacowanie). Wcześniej budżet trybu MAX liczył tylko
+  // kroki domeny, a tempa stałe nie miały górnej granicy: w trybie lekkim (krok ~0.2 ms, termin modelu ~6 ms × 3 modele na RTX 5060 Ti)
+  // MAX robił 128 kroków = ~21 terminów w jednej klatce (kilka klatek na sekundę, zacięcia), a na słabszej karcie (RX 5500) już 20 000×
+  // zapychało kartę i strona przestawała reagować
+  const FRAME_MS = 28, CPU_MS = 40;     // ms GPU symulacji na klatkę; ms procesora (kodowanie poleceń) – tylko zabezpieczenie
+  const cost = { pe: 1.5, term: 2, rend: 2 };   // ms GPU: krok 450 s modelu synoptycznego, termin pól docelowych (buildSlot), obraz mapy
+  const fb = { used: 0, t0: 0, k: { main: 0, cc: 0, fc: 0 } };   // bieżąca klatka: zaplanowana praca GPU [ms], początek (procesor), kroki 450 s modeli
+  const mkTimer = (k) => (hasTS ? { qs: device.createQuerySet({ type: 'timestamp', count: 2 }), resolve: buf(16, U.QUERY_RESOLVE | U.COPY_SRC, `ts_${k}`),
+    read: buf(16, U.MAP_READ | U.COPY_DST, `ts_${k}R`), pending: false, k } : null);
+  const tmPe = mkTimer('pe'), tmTerm = mkTimer('term'), tmRend = mkTimer('rend');
+  let rendTm = null;
+  // pomiar jednego przebiegu, gdy licznik wolny: { wr – timestampWrites, fin(enc) – rozwiązanie zapytań } (null – bez pomiaru)
+  const tmOf = (t) => (t && !t.pending ? { t, wr: { querySet: t.qs, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 },
+    fin: (enc) => { enc.resolveQuerySet(t.qs, 0, 2, t.resolve, 0); enc.copyBufferToBuffer(t.resolve, 0, t.read, 0, 16); } } : null);
+  // po wysłaniu: odczyt, średnia krocząca kosztu na jednostkę (n jednostek w przebiegu)
+  function tmRead(tm, n) {
+    if (!tm || !n) return;
+    const t = tm.t;
+    t.pending = true;
+    t.read.mapAsync(GPUMapMode.READ).then(() => {
+      const a = new BigUint64Array(t.read.getMappedRange()), ms = Number(a[1] - a[0]) / 1e6 / n;
+      t.read.unmap(); t.pending = false;
+      if (ms > 0 && ms < 500) cost[t.k] = 0.8 * cost[t.k] + 0.2 * ms;
+    }, () => { t.pending = false; });
+  }
+  // (bez hamulca „klatki w kolejce karty” przez onSubmittedWorkDone: Chrome zgłasza koniec pracy karty z opóźnieniem kilku klatek, więc
+  // hamulec przy ≥ 3 zatrzymywał symulację w ~80% klatek – MAX 20–30 tys.× z szarpaniem; kolejkę ogranicza sama przeglądarka, jak dawniej)
 
   // --- Stan symulacji ---
   const sim = {
@@ -591,21 +619,44 @@ async function init() {
   // zapis wprost do bufora vg) albo ze stałej masy powietrza (pg z CPU)
   function buildSlot(slot, pg = null) {
     // (stała masa powietrza: bez cyklonów tropikalnych z modelu synoptycznego w celu – lista pusta)
-    if (pg) { device.queue.writeBuffer(vgBuf, grid.off.PGRID * 4, pg); device.queue.writeBuffer(vgBuf, grid.off.TCL * 4, new Float32Array(8 * 16)); }
+    if (pg) { device.queue.writeBuffer(vgBuf, grid.off.PGRID * 4, pg); device.queue.writeBuffer(vgBuf, grid.off.TCL * 4, new Float32Array(8 * 24)); }
     const ab = new ArrayBuffer(PARAM_BYTES);
     new Uint32Array(ab)[22] = slot;
     new Float32Array(ab)[31] = mAt('T', sim.time);     // manipulacja atmosfery: anomalia temperatury, mnożnik opadu
     new Float32Array(ab)[33] = mAt('R', sim.time);
     device.queue.writeBuffer(paramBuf, 0, ab);
-    const enc = device.createCommandEncoder();
-    const pass = enc.beginComputePass();
+    const enc = device.createCommandEncoder(), tm = tmOf(tmTerm);
+    const pass = enc.beginComputePass(tm ? { timestampWrites: tm.wr } : undefined);
     if (!pg) { drv.model.encodeParams(pass); drv.model.encodeTC(pass); }
     pass.setPipeline(tgtBuild.p);
     pass.setBindGroup(0, simBG, [0]);
     pass.dispatchWorkgroups(tgtBuild.g[0], tgtBuild.g[1]);
     for (const k of tgtProj) { pass.setPipeline(k.p); pass.setBindGroup(0, simBG, [0]); pass.dispatchWorkgroups(k.g[0], k.g[1]); }
     pass.end();
+    if (tm) tm.fin(enc);
     device.queue.submit([enc.finish()]);
+    tmRead(tm, 1);
+    fb.used += cost.term;
+  }
+  // chwila modelu synoptycznego w czasie symulacji (z częścią bieżącego terminu policzoną krokami 450 s)
+  const peAt = (m) => m.time + m.sub * PE_DT - drv.start.time;
+  // k kroków 450 s modelu (najwyżej do końca terminu) z pomiarem czasu GPU i w budżecie klatki
+  function peAdv(m, k) {
+    const tm = tmOf(tmPe), n = m.advance(k, tm);
+    tmRead(tm, n);
+    fb.used += n * cost.pe;
+    fb.k[m === drv.model ? 'main' : m === drv.ccModel ? 'cc' : 'fc'] += n;
+    return n;
+  }
+  // Model główny liczy następny termin po kawałku, w miarę jak domena przechodzi przez bieżący (krok 450 s co ćwierć terminu domeny); w chwili
+  // terminu zostaje reszta i pola docelowe. Wcześniej cały termin (4 kroki) szedł naraz w klatce, w której domena go przekraczała – przy
+  // stałym tempie co kilka klatek skok czasu klatki (w trybie lekkim termin to ~30× tyle co krok domeny). Wynik bez zmian: model główny nie
+  // dostaje nic od domeny w trakcie terminu, a pola docelowe są budowane dopiero z pełnego terminu (advanceDriver)
+  function peLead() {
+    const m = drv.model;
+    if (drv.mode !== 'syn' || !m || peAt(m) >= drv.tA + 2 * DTQ - 1) return;
+    const want = Math.min(PE_SPI - 1, Math.floor((sim.time - drv.tA) / DTQ * PE_SPI + 1e-6));
+    if (m.sub < want) peAdv(m, want - m.sub);
   }
   // odczyt siatki parametrów z GPU (do inicjalizacji powierzchni)
   async function readPGrid() {
@@ -1188,8 +1239,12 @@ async function init() {
     // północ: zapis licznika opadu (stan na granicy terminu, przed dalszymi krokami)
     if (Math.abs(((sim.startHour * 3600 + sim.time) % 86400 + 86400) % 86400) < 1) accSnapshot();
     // nowy termin do najstarszego slotu (poprzedni względem A) – staje się terminem B, dawny B – terminem A
-    if (drv.mode === 'syn') { drv.model.step(); buildSlot((drv.slot + 2) % 3); refreshCenter(); }
-    else buildSlot((drv.slot + 2) % 3, paramGrid(sampler()));
+    // (model główny: reszta terminu – część policzona już po drodze, peLead)
+    if (drv.mode === 'syn') {
+      const m = drv.model;
+      while (peAt(m) < drv.tA + 2 * DTQ - 1) peAdv(m, PE_SPI - m.sub);
+      buildSlot((drv.slot + 2) % 3); refreshCenter();
+    } else buildSlot((drv.slot + 2) % 3, paramGrid(sampler()));
     drv.slot = (drv.slot + 1) % 3;
     drv.tA += DTQ;
   }
@@ -1231,7 +1286,7 @@ async function init() {
     ccUpdate(0);
     drv.start = m; drv.key = key;
     drv.ccModel = mc; drv.ccBusy = false;
-    drv.fcModel = m.clone(); drv.fc = []; drv.fcBusy = false;
+    drv.fcModel = m.clone(); drv.fc = []; drv.fcBusy = false; drv.fcStale = false; drv.ccAcc = 0;
   }
 
   // Restart: stan bazowy z masy powietrza nad środkiem domeny, pola docelowe w dwóch terminach,
@@ -1248,6 +1303,9 @@ async function init() {
       if (drv.mode !== 'syn') return;
       if (drv.model) drv.model.destroy();
       drv.model = drv.start.clone();
+      // prognoza od nowa z modelu głównego (przy restarcie w tym samym miejscu kopia zostawała przy dawnym przebiegu – bez prognozy)
+      if (drv.fcModel && drv.fcModel !== drv.start) drv.fcModel.destroy();
+      drv.fcModel = drv.model.clone(); drv.fc = []; drv.fcBusy = false; drv.fcStale = false;
       const c = await drv.model.readCenter();
       for (const k of AIR_KEYS) $(k).value = c.air[k];
       sim.air = airParams();                      // edytor pokazuje bieżącą masę powietrza
@@ -1410,10 +1468,12 @@ async function init() {
     pass.end();
   }
 
-  // n kroków; przy przejściu przez termin pól docelowych – nowy termin z modelu synoptycznego
-  function runSteps(n, measure) {
+  // n kroków; przy przejściu przez termin pól docelowych – nowy termin z modelu synoptycznego. cpuEnd – chwila (performance.now), po której
+  // klatka przestaje dokładać kroki (kodowanie poleceń na wolniejszym procesorze); zwraca liczbę zrobionych kroków
+  function runSteps(n, measure, cpuEnd = Infinity) {
     let done = 0, first = true;
     while (done < n) {
+      if (!first && performance.now() > cpuEnd) break;
       if (sim.time + DT > drv.tA + DTQ + 1e-6) { advanceDriver(); continue; }
       const m = Math.max(1, Math.min(n - done, MAX_STEPS, Math.floor((drv.tA + DTQ - sim.time) / DT + 1e-6)));
       writeParams(m);
@@ -1442,7 +1502,10 @@ async function init() {
         });
       }
       advanceTime(m); done += m; first = false;
+      fb.used += m * (sim.msPerStep || 1);
+      peLead();
     }
+    return done;
   }
 
   // Diagnostyka: statystyki, średnie poziome i pola przy gruncie → jeden bufor do odczytu
@@ -1484,10 +1547,16 @@ async function init() {
     sim.stReqEnc = req;
   }
 
+  // dwie stałe tablice na zmianę (wcześniej co 0.4 s nowa kopia wszystkich pól przy gruncie – przy 160 × 160 oczkach ~14 MB do sprzątania);
+  // poprzedni odczyt zostaje ważny do następnego
+  const diagHost = [null, null];
+  let diagFlip = 0;
   function readDiag() {
     sim.statsPending = true;
     return diagRead.mapAsync(GPUMapMode.READ).then(() => {
-      const raw = diagRead.getMappedRange().slice(0);
+      diagFlip ^= 1;
+      const raw = diagHost[diagFlip] || (diagHost[diagFlip] = new ArrayBuffer(diagRead.size));
+      new Uint8Array(raw).set(new Uint8Array(diagRead.getMappedRange()));
       diagRead.unmap();
       const st = Array.from(new Float32Array(raw, 0, 16));
       const keys = new Uint32Array(raw, 0, 16), tu = new Uint32Array(1), tf = new Float32Array(tu.buffer);
@@ -1590,13 +1659,17 @@ async function init() {
       f[25] = psumF(r.id);                                    // skala sumy opadu wg okresu (albo miesiąca)
       f[26] = Math.min(4500, Math.max(3000, 2 * CFG.DX));     // bok siatki kłębów na satelicie [m] – tylko obraz, model tego nie czyta (przy skali z widoku 3D kłęby miały rozmiar komórek burzowych); widok 3D ma własny bok
       device.queue.writeBuffer(v.ubuf, 0, ab);
+      const tm = v.mode === 0 ? tmOf(tmRend) : null;   // (czas GPU obrazu mapy – panel diagnostyki)
+      if (tm) rendTm = tm;
       const pass = enc.beginRenderPass({
         colorAttachments: [{ view: v.ctx.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] }],
+        ...(tm ? { timestampWrites: tm.wr } : {}),
       });
       pass.setPipeline(renderPipe);
       pass.setBindGroup(0, v.bg);
       pass.draw(3);
       pass.end();
+      if (tm) tm.fin(enc);
     }
   }
 
@@ -2324,9 +2397,12 @@ async function init() {
       await drv.ccWait;
       const syn = drv.mode === 'syn' && drv.model, m = drv.model, c = drv.ccModel;
       const enc = device.createCommandEncoder();
-      const want = (name, b) => { const rb = buf(b.size, U.MAP_READ | U.COPY_DST, 'runRead'); enc.copyBufferToBuffer(b, 0, rb, 0, b.size); reads.push({ name, rb }); };
+      const want = (name, b, off = 0, size = b.size) => { const rb = buf(size, U.MAP_READ | U.COPY_DST, 'runRead'); enc.copyBufferToBuffer(b, off, rb, 0, size); reads.push({ name, rb }); };
       for (const [n, b] of [['state', stateBuf], ['tmp', tmpBuf], ['work', workBuf], ['sfc', sfcBuf], ['tgt', tgtBuf], ['acc', accBuf]]) want(n, b);
       if (syn) for (const [p, x] of [['pe', m], ['cc', c]]) if (x) { want(`${p}.S`, x.S[x.p]); want(`${p}.wk`, x.wk); want(`${p}.dg`, x.dg); }
+      // siatka parametrów i lista cyklonów w buforze vg (domena czyta je co krok): model główny może być w trakcie terminu (peLead), więc
+      // po wczytaniu nie da się ich odtworzyć z modelu
+      if (syn) { want('vg.par', vgBuf, grid.off.PGRID * 4, 4 * NPAR_G * (CFG.NX / CFG.GS) * (CFG.NY / CFG.GS)); want('vg.tcl', vgBuf, grid.off.TCL * 4, 4 * 8 * 24); }
       device.queue.submit([enc.finish()]);
       Object.assign(meta, { date: runDate(), time: sim.time });
       const keepFrom = sim.time - CC_WIN - 86400;      // próbki korekty klimatu poza oknem nie są już potrzebne
@@ -2440,12 +2516,16 @@ async function init() {
         drv.ccModel = js.pe.cc ? await mk('cc', js.pe.cc) : null;
         drv.start = { time: js.drv.startTime, halfDiur: js.drv.startHalfDiur, destroy() {} };   // chwila startu przebiegu; restart liczy nowy rozbieg (drv.key pusty)
         drv.key = '';
-        drv.fcModel = drv.model.clone(); drv.fc = []; drv.fcBusy = false; drv.ccBusy = false;
+        drv.fcModel = drv.model.clone(); drv.fc = []; drv.fcBusy = false; drv.ccBusy = false; drv.fcStale = false; drv.ccAcc = 0;
         const enc = device.createCommandEncoder(), pass = enc.beginComputePass();
         drv.model.encodeParams(pass);
         drv.model.encodeTC(pass);
         pass.end();
         device.queue.submit([enc.finish()]);
+        // (zapis z chwili w trakcie terminu modelu głównego – siatka parametrów i lista cyklonów z pliku, nie z modelu)
+        const vp = await read('vg.par'), vt = await read('vg.tcl');
+        if (vp && vp.length === NPAR_G * (CFG.NX / CFG.GS) * (CFG.NY / CFG.GS)) device.queue.writeBuffer(vgBuf, grid.off.PGRID * 4, vp);
+        if (vt && vt.length === 8 * 24) device.queue.writeBuffer(vgBuf, grid.off.TCL * 4, vt);
         refreshCenter();
       } else device.queue.writeBuffer(vgBuf, grid.off.PGRID * 4, paramGrid(sampler()));
       // bufory GPU
@@ -4083,6 +4163,8 @@ async function init() {
     async roll(seed) { drv.seed = seed; drv.mode = 'syn'; $('wxMode').value = 'syn'; await reset(); },
     set(id, value) { $(id).value = value; $(id).dispatchEvent(new Event('change')); labels(); },
     stop() { sim.halted = true; },
+    // pomiar pętli klatek: zapis każdej klatki (kroki, budżet, koszty, kolejka GPU, czas procesora); perfLog(false) – koniec, zwraca zapis
+    perfLog(on = true) { const L = sim.plog; sim.plog = on ? [] : null; return L; },
     // czas symulacji i chwila ostatniej kopii pól (testy w pętli klatek, np. MAX)
     t() { return { simHours: sim.time / 3600, sfcHours: (sim.sfcT ?? 0) / 3600 }; },
     // pełny zapis przebiegu: stan gotowy, plik, sumy kontrolne buforów (testy)
@@ -4361,6 +4443,11 @@ async function init() {
     const ctx = cv.getContext('2d');
     synClamp();
     const span = syn.span, o = syn.o, v = SYN_VIEWS[$('synLevel').value] || SYN_VIEWS.sfc;
+    // te same pola, widok i rozmiar – obraz zostaje (rysowanie po pikselach na procesorze to kilkadziesiąt ms; wcześniej co 0.7 s, bo każdy
+    // termin modelu oznaczał mapę do odświeżenia, choć pola mapy przychodzą co 1.5 s)
+    const key = `${W}|${H}|${span}|${syn.x}|${syn.y}|${$('synLevel').value}|${o.iso}${o.wind}${o.rain}${o.fronts}${o.hl}|${isImp()}`;
+    if (mp === syn.lastMp && key === syn.lastKey) return;
+    syn.lastMp = mp; syn.lastKey = key;
     const bil = (f, X, Y) => {
       const xf = Math.floor(X), fx = X - xf, Yc = Math.min(NYP - 1.001, Math.max(0, Y)), yf = Math.floor(Yc), fy = Yc - yf;
       const i0 = ((xf % NXP) + NXP) % NXP, i1 = (i0 + 1) % NXP;
@@ -4552,7 +4639,8 @@ async function init() {
     const fcWait = () => {
       const ahead = drv.fcModel ? Math.max(0, (drv.fcModel.time - drv.start.time - sim.time) / 86400) : 0;
       ctx.font = `${Math.round(12 * dpr)}px system-ui`; ctx.fillStyle = '#a2a7c0'; ctx.textAlign = 'center';
-      ctx.fillText(drv.mode === 'syn' ? `Forecast is being computed… ${Math.min(ahead, 7).toFixed(1)} of 7 days ready` : 'Forecast only with the synoptic model', W / 2, H / 2);
+      ctx.fillText(drv.mode !== 'syn' ? 'Forecast only with the synoptic model' : drv.fcStale ? 'Forecast paused at this speed – slow down to compute it'
+        : `Forecast is being computed… ${Math.min(ahead, 7).toFixed(1)} of 7 days ready`, W / 2, H / 2);
     };
     if (drv.mode !== 'syn' || !drv.fc.length) { fcWait(); return; }
     fcClamp();
@@ -4629,57 +4717,104 @@ async function init() {
     ctx.fillText(`${tmin.toFixed(0)}`, W - 2 * dpr, H - B - 14 * dpr);
   }
 
-  // co klatkę: prognoza w tle (kopia modelu synoptycznego 7 dób przed symulacją), odświeżenie mapy
-  // Kopie modelu synoptycznego w tle: prognoza (7 dób przed symulacją, zapis co 3 h) i korekta klimatu (CC_WIN dób przed symulacją,
-  // próbka co 12 h) – po jednym terminie, nie paczkami. Termin to ~6 ms GPU: paczki po 6 terminów na klatkę zabierały na starcie 40%
-  // mocy (domena 500 km, 5 km: 5300 → 3000× przez ~40 s, zanim kopia nadrobiła 45 dób), a potem co 3 h symulacji przycinały obraz.
-  // Budżet: tyle terminów, ile przybyło w symulacji (na kopię), plus BG_CATCHUP na sekundę na nadrabianie; prognoza ma pierwszeństwo.
-  const BG_CATCHUP = 6;
-  function bgFc(fm) {
-    fm.step();
+  // Kopie modelu synoptycznego w tle: korekta klimatu (CC_WIN dób przed symulacją, próbka co 12 h) i prognoza (7 dób, zapis co 3 h) – krokami
+  // 450 s w budżecie klatki (bgTick). Korekta klimatu ma pierwszeństwo: co klatkę tyle, ile przybyło w symulacji (ten koszt jest w stepCost),
+  // potem prognoza, na końcu nadrabianie korekty; gdy korekta jest < 30 dób przed symulacją, symulacja czeka (bgLag). Prognoza liczy się
+  // z tego, co zostało w klatce – gdy nie nadąża (tempo za duże dla karty, np. tryb lekki na MAX), zostaje wstrzymana i liczy się od nowa
+  // (klon modelu głównego), gdy klatki znów mają zapas. Wcześniej po całym terminie (4 kroki) z osobnym budżetem: prognoza miała
+  // pierwszeństwo i wstrzymywała symulację, gdy była < 1 doby przed nią, a w trybie lekkim na MAX kopie nie nadążały (symulacja na przemian
+  // pędziła i czekała – zacięcia)
+  function bgFc(fm, k = PE_SPI) {
+    const n = peAdv(fm, k);
+    if (fm.sub) return n;
     const t = fm.time - drv.start.time;
-    if (Math.round(t / DTQ) % 6) return;
+    if (Math.round(t / DTQ) % 6) return n;
     drv.fcBusy = true;
     fm.readCenter().then((c) => {
       if (fm !== drv.fcModel) return;
       drv.fc.push({ t, p: c.psl, T: c.tDay, pr: c.pr, key: classifyCenter(c).key });
       drv.synDirty = true;
     }).finally(() => { if (fm === drv.fcModel) drv.fcBusy = false; });
+    return n;
   }
-  function bgCc(cm) {
-    cm.step();
+  function bgCc(cm, k = PE_SPI) {
+    const n = peAdv(cm, k);
+    if (cm.sub) return n;
     const t = cm.time - drv.start.time, sm = cc.nodes[0].smp, last = sm.length ? sm[sm.length - 1].t : -Infinity;
-    if (t < last + 12 * 3600 - 1) return;
+    if (t < last + 12 * 3600 - 1) return n;
     drv.ccBusy = true;
     drv.ccWait = pgOfLive(cm).then((pg) => {
       if (cm !== drv.ccModel) return;
       ccSample(t, pg, 0.4 * (cm.halfDiur ?? drv.start.halfDiur)); ccUpdate(sim.time);
     }).finally(() => { if (cm === drv.ccModel) drv.ccBusy = false; });
+    return n;
   }
-  // kopie w tle za blisko symulacji: korekta klimatu < 30 dób przed nią albo prognoza < 1 doby. W trybie lekkim na MAX (100–200 tys.×) symulacja
-  // przesuwała się o kilkanaście terminów na klatkę, a kopie najwyżej o 4 razem (nadwyżka budżetu przepadała) – kopia korekty po kilku miesiącach
-  // była > 90 dób w tyle, w oknie korekty brakowało próbek i mnożnik opadu wracał do 1 (surowy opad modelu, jesienią i zimą ~2× za dużo)
+  // kopia korekty klimatu < 30 dób przed symulacją – symulacja czeka (w oknie korekty brakowałoby próbek: w trybie lekkim na MAX kopia była
+  // po kilku miesiącach > 90 dób w tyle, a mnożnik opadu wracał do 1 – surowy opad modelu)
   function bgLag() {
-    const fm = drv.fcModel, cm = drv.ccModel;
-    if (drv.mode !== 'syn' || !fm) return false;
-    const ahead = (m) => (m ? m.time - drv.start.time - sim.time : Infinity);
-    return ahead(cm) < 30 * 86400 || ahead(fm) < 86400;
+    const cm = drv.ccModel;
+    return drv.mode === 'syn' && !!cm && !!drv.start && peAt(cm) < sim.time + 30 * 86400;
   }
-  function bgTick() {
-    const fm = drv.fcModel, cm = drv.ccModel, w = performance.now();
-    const dw = Math.min((w - (drv.bgW ?? w)) / 1000, 0.25), ds = Math.max(sim.time - (drv.bgS ?? sim.time), 0);
-    drv.bgW = w; drv.bgS = sim.time;
-    if (drv.mode !== 'syn' || !fm) return;
-    const behind = (m, h) => m && m.time - drv.start.time < sim.time + h;
-    const lag = bgLag();
-    drv.bgB = (drv.bgB || 0) + dw * BG_CATCHUP + 2 * ds / DTQ + (lag ? 8 : 0);
-    for (let n = 0; n < (lag ? 8 : 4) && drv.bgB >= 1; n++) {
-      if (!drv.fcBusy && behind(fm, 7 * 86400)) bgFc(fm);
-      else if (!drv.ccBusy && behind(cm, CC_WIN)) bgCc(cm);
-      else break;
-      drv.bgB--;
+  // kopia korekty klimatu nadrabia do CC_WIN dób (dostaje wtedy ćwierć budżetu klatki także na MAX)
+  function ccBehind() {
+    const cm = drv.ccModel;
+    return drv.mode === 'syn' && !!cm && !!drv.start && peAt(cm) < sim.time + CC_WIN - 86400;
+  }
+  // prognoza w koszcie kroku (stepCost), gdy jej część to ≤ 15% (zwykły tryb – krok domeny drogi); w trybie lekkim (krok ~0.2 ms) tylko z reszty budżetu
+  function fcCheap() {
+    const dom = sim.msPerStep > 0 ? sim.msPerStep : 1, f = DT / DTQ * PE_SPI * cost.pe;
+    return f <= 0.15 * (dom + 2 * f + DT / DTQ * cost.term);
+  }
+  // koszt GPU kroku domeny [ms] razem z przypadającą na niego częścią modelu synoptycznego (termin = PE_SPI kroków 450 s co DTQ: model główny,
+  // kopia korekty klimatu, prognoza – gdy tania) i terminu pól docelowych
+  function stepCost() {
+    const dom = sim.msPerStep > 0 ? sim.msPerStep : 1, f = DT / DTQ * PE_SPI * cost.pe, tq = DT / DTQ * cost.term;
+    if (drv.mode !== 'syn' || !drv.model) return dom + tq;
+    return dom + tq + f * (1 + (drv.ccModel ? 1 : 0) + (fcCheap() ? 1 : 0));
+  }
+  function bgTick(go = true) {
+    const fm = drv.fcModel, cm = drv.ccModel, ds = Math.max(sim.time - (drv.bgS ?? sim.time), 0);
+    drv.bgS = sim.time;
+    if (drv.mode !== 'syn' || !drv.model || !drv.start || !go) return;
+    const cpuEnd = fb.t0 + CPU_MS;
+    // kroki 450 s, które jeszcze mieszczą się w budżecie klatki (podczas pauzy połowa – kopie nadrabiają, a obraz zostaje płynny)
+    let nb = Math.floor(((sim.paused ? 0.5 : 1) * FRAME_MS - fb.used) / cost.pe);
+    const need = (m, lead) => Math.ceil((sim.time + lead - peAt(m)) / PE_DT - 1e-6);
+    // do k kroków kopii (bgCc / bgFc), dopóki nie czeka na odczyt i starcza czasu procesora; zwraca liczbę zrobionych
+    const run = (f, k) => {
+      let d = 0;
+      while (d < k) {
+        const isCc = f === bgCc, m = isCc ? drv.ccModel : drv.fcModel;
+        if (!m || (isCc ? drv.ccBusy : drv.fcBusy)) break;
+        d += f(m, k - d);
+        if (performance.now() > cpuEnd) break;
+      }
+      nb -= d;
+      return d;
+    };
+    if (cm) {
+      // 1. korekta klimatu: < 30 dób przed symulacją (ta czeka) – cały budżet; zawsze tyle kroków, ile przybyło w symulacji
+      if (bgLag()) run(bgCc, Math.min(nb, need(cm, CC_WIN)));
+      const nc = need(cm, CC_WIN);
+      drv.ccAcc = nc > 0 ? Math.min((drv.ccAcc || 0) + ds / PE_DT, 4 * PE_SPI) : 0;
+      drv.ccAcc -= run(bgCc, Math.min(Math.floor(drv.ccAcc), nc));
     }
-    drv.bgB = Math.min(drv.bgB, lag ? 8 : 1);
+    // 2. prognoza z reszty klatki; za symulacją (nie nadążyła) – wstrzymana, od nowa po ~1 s klatek z zapasem: reszta budżetu ≥ 2× tyle, ile
+    // prognoza potrzebuje przy tym tempie, + 2 kroki na nadrabianie (inaczej zaraz znowu zostałaby w tyle)
+    drv.dsAvg = 0.9 * (drv.dsAvg || 0) + 0.1 * ds;
+    if (fm) {
+      if (!drv.fcStale && peAt(fm) < sim.time - PE_DT) { drv.fcStale = true; drv.fc = []; drv.fcSpare = 0; drv.synDirty = true; }
+      if (drv.fcStale) {
+        drv.fcSpare = nb >= 2 * drv.dsAvg / PE_DT + 2 ? (drv.fcSpare || 0) + 1 : 0;
+        if (drv.fcSpare >= 30 && !drv.fcBusy) {
+          fm.destroy();
+          drv.fcModel = drv.model.clone(); drv.fc = []; drv.fcStale = false; drv.fcSpare = 0; drv.synDirty = true;
+        }
+      } else if (nb > 0) run(bgFc, Math.min(nb, need(fm, 7 * 86400)));
+    }
+    // 3. korekta klimatu nadrabia do CC_WIN – przy stałym tempie do ~60% budżetu klatki (obraz ma zapas; w MAX nadrabianiu zostaje ćwierć budżetu)
+    if (cm && !sim.paused && $('speed').value !== 'max') nb = Math.min(nb, Math.floor((0.6 * FRAME_MS - fb.used) / cost.pe));
+    if (cm && nb > 0 && performance.now() < cpuEnd) run(bgCc, Math.min(nb, need(cm, CC_WIN)));
   }
   // API run (testy bez pętli klatek): kopia korekty klimatu nadąża za symulacją – CC_START dób przed nią
   async function bgSync() {
@@ -4694,11 +4829,13 @@ async function init() {
     if (sim.busy || sim.saving) return;
     bgTick();
     const now = performance.now();
-    // mapa synoptyczna: odczyt pól z GPU, gdy zakładka jest widoczna
+    // mapa synoptyczna: odczyt pól z GPU, gdy zakładka jest widoczna i model poszedł dalej (podczas pauzy bez odczytów i rysowania od nowa)
     const wxOpen = document.body.classList.contains('drawer') && curTab() === 'wx';
-    if (drv.mode === 'syn' && drv.model && wxOpen && !drv.mapBusy && now - (drv.mapT || 0) > 1500) {
+    if (drv.mode === 'syn' && drv.model && wxOpen && !drv.mapBusy && now - (drv.mapT || 0) > 1500
+      && (drv.model !== drv.mapM || drv.model.time + drv.model.sub * PE_DT !== drv.mapAt)) {
       drv.mapBusy = true; drv.mapT = now;
       const m = drv.model;
+      drv.mapM = m; drv.mapAt = m.time + m.sub * PE_DT;
       m.readMap().then(() => { if (m === drv.model) drv.synDirty = true; }).finally(() => { drv.mapBusy = false; });
     }
     if (full || (now - drv.lastDraw > 700 && (drv.synDirty || now - drv.lastDraw > 5000))) {
@@ -5046,28 +5183,32 @@ async function init() {
       $('hillsV').textContent = fmH(sim.hmax);
     }
 
+    // ile kroków w tej klatce: tempo × czas klatki, najwyżej tyle, ile mieści budżet klatki (koszt kroku razem z modelem synoptycznym
+    // i kopią korekty klimatu – stepCost); MAX – cały budżet. Gdy kopia korekty klimatu nadrabia, ćwierć budżetu zostaje dla niej
+    fb.used = 0; fb.t0 = performance.now(); fb.k.main = fb.k.cc = fb.k.fc = 0;
+    const lag0 = bgLag();
     let n = 0;
+    const simMs = ccBehind() ? 0.75 * FRAME_MS : FRAME_MS, cap = Math.max(1, Math.floor(simMs / stepCost()));
     if (!sim.paused) {
       const mode = $('speed').value;
-      if (mode === 'max') {
-        // ~28 ms obliczeń na klatkę (~30 kl./s – widok płynny, karta prawie w pełni dla symulacji); co najmniej 1 krok
-        n = sim.msPerStep > 0 ? Math.max(1, Math.floor(28 / sim.msPerStep)) : 2;
-      } else {
+      if (mode === 'max') n = cap;
+      else {
         sim.debt += realDt * Number(mode) / DT;
-        n = Math.floor(sim.debt);
+        n = Math.min(Math.floor(sim.debt), cap);
         sim.debt -= n;
-        if (sim.debt > 1) sim.debt = 0;
+        if (sim.debt > 1) sim.debt = 0;      // (karta nie nadąża za wybranym tempem – tempo spada, bez zaległości)
       }
       n = Math.max(0, Math.min(MAX_STEPS, n));
     }
 
     if (sim.busy || sim.saving) n = 0;
-    if (bgLag()) n = 0;     // (symulacja czeka, aż kopie w tle – korekta klimatu, prognoza – nadrobią: bgTick dostaje wtedy większy budżet)
+    if (bgLag()) n = 0;     // (symulacja czeka, aż kopia korekty klimatu nadrobi – bgTick dostaje wtedy cały budżet)
     if (n > 0) {
-      runSteps(n, true);
+      n = runSteps(n, true, fb.t0 + CPU_MS);
       speedHist.push({ t: now, sim: n * DT });
     }
     cuTick(n * DT, realDt);
+    const used1 = fb.used;
     const enc = device.createCommandEncoder();
     let wantDiag = false;
     if (!sim.busy && !sim.statsPending && now - sim.lastStats > 400) {
@@ -5078,10 +5219,14 @@ async function init() {
     }
     encodeRender(enc);
     device.queue.submit([enc.finish()]);
+    tmRead(rendTm, 1); rendTm = null;
     ts3Map();
     if (wantDiag) readDiag();
     if (sim.snapReq) { sim.snapReq = false; snapshot(); }
     weatherTick();
+    // zapis klatki do pomiaru (testy: __sim.perfLog)
+    if (sim.plog) sim.plog.push({ t: now, n, cap, u1: used1, u2: fb.used, lag: lag0, cpu: performance.now() - fb.t0, main: fb.k.main, cc: fb.k.cc, fc: fb.k.fc,
+      pe: cost.pe, term: cost.term, rend: cost.rend, dom: sim.msPerStep, cs: stepCost(), cb: ccBehind(), st: !!drv.fcStale });
 
     while (speedHist.length && now - speedHist[0].t > 2000) speedHist.shift();
     if (now - lastUi > 250) { lastUi = now; updateUi(now); }
@@ -5155,6 +5300,7 @@ async function init() {
       $('perf').textContent = [
         `speed            ${simPerReal.toFixed(0)}×, one day = ${isFinite(dayMin) ? dayMin.toFixed(1) + ' min' : '—'}`,
         `GPU per step     ${sim.msPerStep ? sim.msPerStep.toFixed(2) + ' ms' : '—'}${ts ? '' : ' (est.)'}${sim.flat ? '' : ' (terrain)'}`,
+        drv.mode === 'syn' ? `synoptic model   ${cost.pe.toFixed(2)} ms per 450 s step, targets ${cost.term.toFixed(2)} ms per term; with them ${stepCost().toFixed(2)} ms per step${drv.fcStale ? ' (forecast paused)' : ''}` : '',
         v3.on && ts3 ? `3D view          ${(ts3.tex + ts3.img).toFixed(2)} ms per frame (textures ${ts3.tex.toFixed(2)}, image ${ts3.img.toFixed(2)}; ${v3.newView ? 'new' : 'old'})` : '',
         `grid             ${NXD}×${NYD}×${NZ}${CFG.NE ? ` (+2×${MG} margin, +${CFG.NE} boundary zone)` : ' periodic'}, spacing ${CFG.DX} m, Δt ${DT} s`,
         `schemes          boundary layer ${(100 * CFG.W_PBL).toFixed(0)}%, deep convection ${(100 * CFG.W_CU).toFixed(0)}%, shallow ${(100 * CFG.W_SH).toFixed(0)}%`,
