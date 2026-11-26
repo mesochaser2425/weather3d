@@ -103,7 +103,7 @@ The user interface is in English; comments in the source code are in Polish.
 |---|---|---|
 | [ESA WorldCover 2021 v200](https://esa-worldcover.org), read from [Microsoft Planetary Computer](https://planetarycomputer.microsoft.com/dataset/esa-worldcover) | Land cover; telling land below sea level from the sea | CC BY 4.0. © ESA WorldCover project 2021 / Contains modified Copernicus Sentinel data (2021) processed by ESA WorldCover consortium. Zanaga et al. (2022), [doi:10.5281/zenodo.7254221](https://doi.org/10.5281/zenodo.7254221) |
 | [Terrain Tiles on AWS](https://registry.opendata.aws/terrain-tiles/) | Terrain and the land–sea map | See the credits below |
-| [GeoNames](https://www.geonames.org) | Place names in `public/cities`, selected and with Polish names | CC BY 4.0 |
+| [GeoNames](https://www.geonames.org) | Place names in `public/cities` (selected places, main GeoNames names) | CC BY 4.0 |
 | [Open-Meteo](https://open-meteo.com/) | ERA5 normals near the ground, downloaded in the background | CC BY 4.0, weather data by Open-Meteo.com. ERA5: Copernicus Climate Change Service |
 | [NOAA PSL](https://psl.noaa.gov): NCEP/NCAR Reanalysis 1, GHCN_CAMS, GPCC, GPCP | Built-in climatologies | NCEP/NCAR Reanalysis, GHCN_CAMS, GPCC and GPCP data provided by the NOAA PSL, Boulder, Colorado, USA, from their website at https://psl.noaa.gov. Fan and van den Dool (2008), Schneider et al. (2011) |
 
