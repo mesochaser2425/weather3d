@@ -3097,7 +3097,10 @@ fn micro(@builtin(global_invocation_id) gid: vec3u) {
     vn[k] = select(0.0, mix(vnr, vs, cold[k]), qrc[k] > 1e-9);
     cmax = max(cmax, vt[k] * dt / vg[VG_DZC + k]);
   }
-  let nsub = max(1u, u32(ceil(cmax / 0.8)));
+  // liczba podkroków z twardym limitem i osłoną przed NaN: u32(NaN) albo u32(+∞) daje w WebGPU 4 294 967 295, a pętla po podkrokach
+  // (× warstwy) zawieszała wtedy kartę – Windows resetował sterownik (DXGI_ERROR_DEVICE_HUNG, zgłoszenie z Radeona RX 7900 GRE).
+  // Normalnie 1–30 podkroków (prędkość ≤ 9.1 m/s, krok ≤ 90 s, warstwa ≥ ~25 m)
+  let nsub = clamp(u32(ceil(select(0.0, cmax, cmax == cmax) / 0.8)), 1u, 64u);
   let dts = dt / f32(nsub);
   var acc = 0.0;
   for (var s = 0u; s < nsub; s++) {
@@ -3128,7 +3131,7 @@ fn micro(@builtin(global_invocation_id) gid: vec3u) {
   var acci = 0.0;
   var cmi = 0.0;
   for (var k = kb; k < NZ; k++) { cmi = max(cmi, VFI * sqrt(rho0 / vg[VG_RC + k]) * dt / vg[VG_DZC + k]); }
-  let nsi = max(1u, u32(ceil(cmi / 0.8)));
+  let nsi = clamp(u32(ceil(select(0.0, cmi, cmi == cmi) / 0.8)), 1u, 64u);   // (limit jak wyżej)
   let dti = dt / f32(nsi);
   for (var s = 0u; s < nsi; s++) {
     var fin = 0.0;
