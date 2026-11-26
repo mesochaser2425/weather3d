@@ -10,22 +10,38 @@ Now you can check out the simulation for yourself. It's still in its early form,
 
 You need a current Chrome or Edge on a computer with a WebGPU graphics card; it will not work on phones. All the computing happens on your PC, so the simulation speed will depend on your card. On my RTX 5060 Ti, a simulated day on a 500 × 500 km map takes about 20 s at maximum speed. Starting takes a minute or so.
 
+If the simulation runs too slowly on your card, choose **Light mode** on the start page. Only the synoptic model runs and its weather is downscaled to your map, so a simulated year takes minutes. Storms come as whole systems instead of single cells, and hurricanes can form on their own or be spawned with a click.
+
 <table>
   <tr>
-    <td width="50%"><img src="docs/satellite.png" alt="Simulated clouds over Poland, seen as a satellite image"></td>
-    <td width="50%"><img src="docs/temperature.png" alt="Map of the air temperature near the ground over Poland, with isotherms"></td>
+    <td width="50%"><img src="docs/satellite.png" alt="Simulated cumulus fields and a frontal cloud band over Poland, seen as a satellite image"></td>
+    <td width="50%"><img src="docs/hurricane-satellite.png" alt="Simulated hurricane with a clear eye near Cuba, seen as a satellite image"></td>
   </tr>
   <tr>
     <td>Satellite view</td>
+    <td>A hurricane on the satellite view</td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/hurricane-radar.png" alt="Radar image of a hurricane: the eye, the eyewall and spiral rain bands"></td>
+    <td width="50%"><img src="docs/temperature.png" alt="Map of the air temperature near the ground with isotherms, cooler over the mountains"></td>
+  </tr>
+  <tr>
+    <td>A hurricane on the radar</td>
     <td>Temperature near the ground</td>
   </tr>
   <tr>
-    <td width="50%"><img src="docs/surface.png" alt="Map of the surface type over Poland: fields, forests, towns and the Baltic Sea"></td>
-    <td width="50%"><img src="docs/view3d.png" alt="3D view of the sky above a hazy landscape with cloud shadows on the ground"></td>
+    <td width="50%"><img src="docs/surface.png" alt="Map of the surface type over Poland: fields, forests, towns, lakes and the Baltic Sea"></td>
+    <td width="50%"><img src="docs/snowfall.png" alt="Map of the total snowfall from a long run"></td>
   </tr>
   <tr>
     <td>Surface type</td>
-    <td>3D view</td>
+    <td>Snowfall total</td>
+  </tr>
+  <tr>
+    <td colspan="2"><img src="docs/sounding.png" alt="Skew-T sounding near Cuba with a hodograph, CAPE, wind shear and other storm indices"></td>
+  </tr>
+  <tr>
+    <td colspan="2">Sounding with a hodograph and storm indices (Atmosphere tab)</td>
   </tr>
 </table>
 
