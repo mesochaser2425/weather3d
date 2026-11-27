@@ -92,10 +92,3 @@ export function embed(v, cfg = CFG, nearest = false) {
   return out;
 }
 
-// Widoczna część pełnego pola
-export function visible(full, cfg = CFG) {
-  const { NX, NXV, NYV } = cfg;
-  const out = new Float32Array(NXV * NYV);
-  for (let j = 0; j < NYV; j++) for (let i = 0; i < NXV; i++) out[j * NXV + i] = full[j * NX + i];
-  return out;
-}

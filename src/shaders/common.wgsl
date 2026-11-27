@@ -1,4 +1,5 @@
-// Wspólne funkcje: indeksowanie periodyczne, siatka pionowa, interpolacja trójliniowa.
+// Wspólne funkcje: indeksowanie periodyczne, opis chmury (cloudAt, convFlag), kolor drzew, wzór pojedynczych cumulusów,
+// siatka pionowa, interpolacja trójliniowa, nasycenie i punkt rosy.
 // Moduł, który to dołącza, musi zdefiniować: fn ldb(b: u32, i: u32) -> f32
 
 fn wrapi(i: i32, n: u32) -> u32 {
@@ -6,30 +7,19 @@ fn wrapi(i: i32, n: u32) -> u32 {
   return u32(((i % ni) + ni) % ni);
 }
 
-// Zachmurzenie częściowe w oczku z wody chmurowej kolumny cw [g/m²] i strumienia ciepła z gruntu hs [W/m²]:
-// na siatkach LES chmura wypełnia oczko; na grubych (W_PBL) chmury konwekcyjnej warstwy granicznej (za dnia
-// nad nagrzanym gruntem) pokrywają tylko część oczka (pola cumulusów, porwane Sc), a chmury warstwowe
-// w stałej stratyfikacji (noc, zima, mgła, stratus) – całe oczko
-fn cloudFrac(cw: f32, hs: f32) -> f32 {
-  return mix(1.0, 1.0 - exp(-cw / 25.0), W_PBL * smoothstep(0.0, 60.0, hs));
-}
-
 // ---- Opis chmury w punkcie siatki: JEDEN dla widoku 3D, obrazu satelitarnego, przekroju i promieniowania ----
 // Wynik: x – ekstynkcja wewnątrz chmury [1/m], y – część oczka zajęta przez chmurę (0…1), z – udział lodu,
 // w – rodzaj chmury (0 warstwowa … 1 kłębiasta). Składniki:
 //  • woda i lód liczone wprost (q_c, q_i; opad q_r słabiej): na drobnych siatkach chmura wypełnia oczko, na grubych
 //    chmura kłębiasta zajmuje jego część (pole cumulusów) – tym większą, im więcej wody;
-//  • chmura podsiatkowa z wilgotności (Sundqvist): RH > RHc, RHc 98% (≤ ~1 km) … 85% (≥ ~8 km) – chmury mniejsze
-//    od oczka, których model nie widzi jako nasycenia;
 //  • chmura konwekcji parametryzowanej (CUL [g/m²] między podstawą cub i wierzchołkiem cut), kowadło lodowe u góry.
-// rho – gęstość [kg/m³], rhw / rhi – wilgotność względna wobec wody / lodu, t [K], z – wysokość n.p.m. [m],
-// conv0 – kłębiastość chmury liczonej wprost (prąd wstępujący, konwekcyjna warstwa graniczna)
-fn cloudAt(rho: f32, qc: f32, qi: f32, qr: f32, rhw: f32, rhi: f32, t: f32, z: f32, conv0: f32,
+// Chmur z samej wilgotności (podsiatkowych, bez nasycenia) nie ma – dawały mleczną mgiełkę na obrazie (CLAUDE.md, sekcja 16).
+// rho – gęstość [kg/m³], t [K], z – wysokość n.p.m. [m], conv0 – kłębiastość chmury liczonej wprost (prąd wstępujący,
+// konwekcyjna warstwa graniczna)
+fn cloudAt(rho: f32, qc: f32, qi: f32, qr: f32, t: f32, z: f32, conv0: f32,
            cul: f32, cub: f32, cut: f32) -> vec4f {
-  // wagi skali: zachmurzenie częściowe chmur kłębiastych liczonych wprost od ~1 km, chmury podsiatkowe z wilgotności
-  // od kilku km (na drobniejszych siatkach chmura to nasycenie widoczne w modelu)
+  // waga skali: zachmurzenie częściowe chmur kłębiastych liczonych wprost od ~1 km
   let gcv = smoothstep(500.0, 2500.0, DX);
-  let gs = smoothstep(2000.0, 10000.0, DX);
   let ql = max(qc, 0.0) + max(qi, 0.0);
   // woda liczona wprost (opad: duże krople – słaba ekstynkcja)
   let eW = 150.0 * rho * max(qc, 0.0);
@@ -45,13 +35,6 @@ fn cloudAt(rho: f32, qc: f32, qi: f32, qr: f32, rhw: f32, rhi: f32, t: f32, z: f
   // narasta płynnie zamiast zapalać się całym oczkiem; chmury warstwowe (As, St, Ns) pokrywają całe oczko
   var fr = mix(smoothstep(1e-7, 2e-5, ql), sqrt(clamp(ql / 1e-4, 0.0, 1.0)), gcv * cr) * mix(1.0, 0.25 + 0.75 * (1.0 - exp(-ql / 3e-4)), gcv * cr);
   fr = max(fr, 0.5 * smoothstep(1e-6, 1e-4, max(qr, 0.0)));
-  // podsiatkowa z wilgotności (w zimnych warstwach wobec lodu)
-  let cold = t < 253.15;
-  let rh = select(rhw, rhi, cold);
-  let rhc = select(mix(0.99, 0.85, gs), mix(1.05, 0.92, gs), cold);
-  // (chmury z samej wilgotności wyłączone – chmura tylko przy nasyceniu: woda/lód w oczku albo konwekcja schematu)
-  let fs = 0.0 * clamp(1.0 - sqrt(max(1.0 - rh, 0.0) / (1.0 - min(rhc, 0.995))), 0.0, 1.0) * select(1.0, smoothstep(rhc - 0.02, rhc + 0.03, rh), cold);
-  let eS = fs * select(150.0 * rho * 1e-4, 50.0 * rho * 2e-5, cold);
   // konwekcja parametryzowana: wieża (pokrycie wg wody) i kowadło (górne 20% chmury głębokiej)
   var fcv = 0.0;
   var eC = 0.0;
@@ -71,16 +54,12 @@ fn cloudAt(rho: f32, qc: f32, qi: f32, qr: f32, rhw: f32, rhi: f32, t: f32, z: f
     eC = fcv * select(150.0 * rho * mix(3e-4, 6e-4, deep), 50.0 * rho * 3e-4, anvil);
     iC = select(0.0, eC, anvil);
   }
-  let f = max(max(fr, fs), fcv);
-  let em = eW + eI + eR + eS + eC;
-  let ice = clamp((eI + select(0.0, eS, cold) + iC) / max(em, 1e-9), 0.0, 1.0);
+  let f = max(fr, fcv);
+  let em = eW + eI + eR + eC;
+  let ice = clamp((eI + iC) / max(em, 1e-9), 0.0, 1.0);
   let cv = max(cr * step(1e-7, ql), select(0.0, 1.0, fcv > 0.0 && iC <= 0.0));
   return vec4f(em / max(f, 1e-3), f, ice, cv);
 }
-// kłębiastość chmury liczonej wprost: konwekcyjna warstwa graniczna za dnia (hs – ciepło z gruntu [W/m²], zagl – wysokość
-// nad gruntem, pblh – wysokość warstwy granicznej) albo chwiejna kolumna (mu – MUCAPE [J/kg], muel – wierzchołek dodatniej
-// wyporności tej cząstki nad gruntem): także nocą – konwekcja podniesiona, nad ciepłą wodą, w chłodnym napływie za frontem
-// (wcześniej tylko ciepło z gruntu – po zachodzie wszystkie chmury siatki stawały się warstwowe)
 // Kolor drzew liściastych z zieleni g (fenologia). Ujemna wartość – jesień (main.js leafAut, tekstura gruntu w widoku 3D). Jesienią zieleń → złoto → rdza → gołe gałęzie,
 // wiosną gołe gałęzie → jasna, świeża zieleń → pełna zieleń lata; wcześniej jedna prosta między brązem a zielenią dawała przez cały październik burą oliwkę.
 fn leafCol(g0: f32) -> vec3f {
@@ -97,6 +76,10 @@ fn leafCol(g0: f32) -> vec3f {
   if (g > 0.25) { return mix(rust, gold, (g - 0.25) / 0.3); }
   return mix(bare, rust, g / 0.25);
 }
+// Kłębiastość chmury liczonej wprost: konwekcyjna warstwa graniczna za dnia (hs – ciepło z gruntu [W/m²], zagl – wysokość
+// nad gruntem, pblh – wysokość warstwy granicznej) albo chwiejna kolumna (mu – MUCAPE [J/kg], muel – wierzchołek dodatniej
+// wyporności tej cząstki nad gruntem): także nocą – konwekcja podniesiona, nad ciepłą wodą, w chłodnym napływie za frontem
+// (wcześniej tylko ciepło z gruntu – po zachodzie wszystkie chmury siatki stawały się warstwowe)
 fn convFlag(w: f32, hs: f32, zagl: f32, pblh: f32, mu: f32, muel: f32) -> f32 {
   // (bez lokalnego w: prąd pionowy oscyluje między wierszami siatki i rodzaj chmury zmieniał się co wiersz – paski)
   let heat = select(0.0, smoothstep(30.0, 80.0, hs), zagl < pblh + 1500.0);
@@ -124,7 +107,7 @@ fn cuFbm(p: vec2f) -> f32 { return 0.55 * cuVal(p) + 0.3 * cuVal(p * 2.03 + vec2
 // Kształt cumulusów: q0 – położenie w bokach siatki kłębów (już z przesuwem z wiatrem), fc – część powierzchni z chmurą.
 // Punkty na siatce o boku 1, losowo przesunięte; siatka wykrzywiona gładkim szumem (nieregularne odstępy, skupiska), rozmiar
 // losowy 0.55–1.45; przy małym pokryciu mniej chmur o promieniu ≥ 0.3 boku (część punktów aktywna), a nie coraz cieńsze;
-// brzeg płatowaty (szum w dwóch skalach). Średnie pokrycie = fc (sprawdzone numerycznie, scratchpad cushape.mjs: ±4%).
+// brzeg płatowaty (szum w dwóch skalach). Średnie pokrycie = fc (sprawdzone numerycznie: ±4%).
 // Życie chmur (tau – faza pokolenia 0..1, cuGen): każda chmura rodzi się w losowej chwili w pierwszej połowie życia pokolenia,
 // żyje pół okresu, promień rośnie i maleje jak √sin (pole ∝ sin); suma pokryć dwóch pokoleń jest wtedy stała w czasie
 // (2/π·π/2 = 1), a chmury nie bledną wszystkie naraz (wcześniej waga całego pokolenia – co 15 min wszystkie na połowie gęstości:

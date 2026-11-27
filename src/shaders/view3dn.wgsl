@@ -18,7 +18,7 @@ struct V3 {
   fwd: vec3f, time: f32,
   sun: vec3f, sunUp: f32,     // światło rzucające cienie (słońce albo księżyc) w układzie domeny – jak w vol_light
   size: vec2f, zTop: f32, blobS: f32,         // blobS – odstęp kłębów chmur kłębiastych [m]
-  windDir: vec2f, frame: f32, shadowM: f32,   // shadowM: 1 – cienie rzuca księżyc
+  windDir: vec2f, frame: f32, shadowM: f32,   // windDir – nieużywane (miejsce w układzie); shadowM: 1 – cienie rzuca księżyc
   flags: u32, cutY: f32, cuPh: f32, cuNx: f32,   // bit 0: powierzchnia 0 °C, bit 1: przekrój tnący (y = cutY [m]); cuPh – faza pokoleń cumulusów
   cuNy: f32, mDisc: f32, pix: f32, _p0: f32,     // mDisc – jasność tarczy księżyca w pełni (0 – pod horyzontem); pix – rozmiar piksela [rad]
   nofs: vec4f,                                  // ciągłe przesunięcie szumu brzegów chmur [m]: xy – warstwa cumulusów, zw – średni wiatr 0–6 km

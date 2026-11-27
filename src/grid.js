@@ -50,9 +50,13 @@ const clamp01 = (x) => Math.min(1, Math.max(0, x));
 // zapytań Open-Meteo – 30 lat danych dobowych; większe mapy mają rzadsze węzły)
 export const ccN = (L) => Math.max(1, Math.min(4, Math.ceil(L / 600e3 - 1e-6)));
 
+const NX0 = GR.nx + 2 * MG0 + NE0, NY0 = GR.ny + 2 * MG0 + NE0;
+// liczba warstw pionowych (?nz=, domyślnie 50; koszt prawie liniowy – patrz CLAUDE.md), najwyżej tyle, by siatka mieściła się w jednym wymiarze
+// dyspozycji: jądra z jednym wątkiem na punkt (gid.x – rzut ciśnienia, korekta masy) ≤ 65535 grup po 256, linie FFT (NY·NZ, NX·NZ) ≤ 65535 grup.
+// Przy siatce 512 komórek i ?nz > 50 górne warstwy wypadały z części jąder solvera (φ bez poprawki), a dyspozycja FFT przekraczała limit
+const NZ_MAX = Math.min(120, Math.floor(65535 * 256 / (NX0 * NY0)), Math.floor(65535 / Math.max(NX0, NY0)));
 export const CFG = {
-  // liczba warstw pionowych (?nz=, domyślnie 50; koszt prawie liniowy – patrz CLAUDE.md)
-  NX: GR.nx + 2 * MG0 + NE0, NY: GR.ny + 2 * MG0 + NE0, NZ: Math.max(30, Math.min(120, Math.round(Number(typeof location !== 'undefined' ? new URLSearchParams(location.search).get('nz') : 0) || 50))),
+  NX: NX0, NY: NY0, NZ: Math.max(Math.min(30, NZ_MAX), Math.min(NZ_MAX, Math.round(Number(urlQ.get('nz')) || 50))),
   NXV: GR.nx + 2 * MG0, NYV: GR.ny + 2 * MG0,   // domena liczona wprost (widoczna + margines MG)
   NXD: GR.nx, NYD: GR.ny,  // widoczna część (wyświetlana)
   MG: MG0,                 // niewidoczny margines wokół widocznej części [oczka]
@@ -82,7 +86,7 @@ export const SFC = ['TS', 'TD', 'W', 'H', 'LE', 'CDU', 'T2', 'TD2', 'PR', 'PACC'
   'PBLH', 'WS', 'CUTOP', 'SWE', 'PSN', 'GRN', 'PSL', 'ICE', 'PBASE', 'PRCU', 'CUBASE', 'CLL', 'CLM', 'CLH', 'LINV', 'CUL', 'DBZ', 'TBWV', 'VIS', 'PHEN', 'CAPE', 'FLASH', 'HAIL', 'RUN', 'QOUT', 'U10', 'GUST', 'SUNH', 'TMAX', 'TMIN', 'SNAGE', 'DBZC', 'SHU', 'SHV', 'SHR01', 'SRH03', 'SRH01', 'ORG', 'ORGB', 'MUCAPE', 'T1', 'COVER', 'UA', 'VA', 'PACCC', 'LWPC', 'COVC', 'COVS', 'PRCUS', 'CULS', 'CUBS', 'CUTS', 'SM1', 'SM2', 'SM3', 'W1', 'WMES', 'LIFT', 'MWU', 'MWV', 'SMODE', 'CUM', 'WKSRC', 'EVR', 'CWU', 'CWV', 'MUEL', 'SHACT',
   // fenologia: średnia krocząca T 2 m (dwa stopnie po ~3.75 doby ≈ średnia z ~15 dób) i temperatura fenologiczna z pamięcią [°C]
   'TPHA', 'TPH', 'TPHN',
-  // front przy gruncie (mapa „Fronty”): > 0 chłodny (1 łagodny … 2 ostry), < 0 ciepły, × bliskość osi
+  // front przy gruncie (mapa „Fronty”): rodzaj (> 0 chłodny: 1 łagodny … 2 ostry, 0 stacjonarny, < 0 ciepły) × siła (FRI, na końcu listy)
   'FRT',
   // woda równoważna chmur warstwowych lodowych poniżej −20 °C (kowadła, cirrusy) – satelita rysuje je nad kłębami
   'LWPA',
@@ -108,24 +112,30 @@ export const SFC = ['TS', 'TD', 'W', 'H', 'LE', 'CDU', 'T2', 'TD2', 'PR', 'PACC'
   'PRCG',
   // promieniowanie długofalowe netto przy gruncie [W/m², ujemne – grunt traci] (diagnostyka i mapa)
   'LWN',
-  // tryb lekki: odchyłka θ i q_v warstwy granicznej od celu (cykl dobowy z bilansu ciepła przy gruncie) i średnie kroczące tempa ich zmian (≈ doba)
+  // tryb lekki: odchyłka θ i q_v warstwy granicznej od celu (cykl dobowy z bilansu ciepła przy gruncie), średnie kroczące tempa ich zmian (≈ doba)
+  // i drugi bufor odchyłki (LBT2, LBQ2 – przenoszenie z wiatrem, bufory na zmianę wg parzystości kroku)
   'LBT', 'LBQ', 'LBH', 'LBE', 'LBT2', 'LBQ2',
   // tryb lekki: opad modelu synoptycznego płynący z wiatrem (dwa bufory) [mm/h]
   'LPR', 'LPR2',
   // tryb lekki – liczniki diagnostyczne [mm]: opad modelu synoptycznego z korektą klimatu i opad rdzeni burz
   'LPB', 'LPS',
-  // tryb lekki: średni opad bez skalowania z ~30 dób [mm/h] (dwa bufory) – skalowanie opadu do normy
+  // tryb lekki: średni opad dużej skali × mnożnik LKP z ~20 dób [mm/h] (dwa bufory, mieszany z sąsiadami) – regulator opadu do normy
   'LRM', 'LRM2',
   // tryb lekki: średnia różnica T 2 m − powietrze 1. warstwy z ~2 dób [K] (cel przy gruncie podniesiony o nią – średnia T 2 m w normie)
   'LT21',
   // tryb lekki: mnożnik opadu do normy (regulator całkujący) i średnie zachmurzenie z ~doby (zakres dobowy)
-  'LKP', 'LCV'];   // (LBT2, LBQ2 – drugi bufor odchyłki: przenoszenie z wiatrem)
+  'LKP', 'LCV',
+  // siła frontu przy gruncie (waga × bliskość osi, 0…1) – mapa „Fronty” rozdziela nią rodzaj i siłę z FRT
+  'FRI',
+  // CAPE i MUCAPE do wyświetlania – wygładzone w czasie (τ 15 min); chwilowe zmieniają się co krok z termikami i schematem (mapa migotała)
+  'CAPES', 'MUCAPES'];
 
-// Parametry sondażu w węzłach siatki parametrów (co GS oczek): T przy morzu [K], gradient [K/m],
-// tropopauza [m], podstawa i siła inwersji [m, K], RH dołem i górą, wiatr przy gruncie i ścinanie
-// (u0, v0 [m/s], du, dv [1/s]), ruch pionowy w* [m/s], ciśnienie na poziomie morza [hPa]
-// + opad modelu synoptycznego [mm/h] i udział konwekcji (napływ chmur i opadu przez brzegi domeny)
-export const NPAR = 25;   // 20–23: wilgotność z modelu synoptycznego na 3 / 1.5 / 5 / 6.5 km (względem nasycenia woda → lód), 24: gradient 3–5.6 km
+// Parametry sondażu w węzłach siatki parametrów (co GS oczek): 0 T przy gruncie na poziomie morza [K], 1 gradient 1.5–3 km [K/m],
+// 2 tropopauza [m], 3–4 podstawa i siła inwersji [m, K], 5–6 RH dołem i górą, 7–10 wiatr przy gruncie i ścinanie (u0, v0 [m/s],
+// du, dv [1/s]), 11 ruch pionowy ~3 km [m/s], 12 ciśnienie na poziomie morza [hPa], 13 opad modelu synoptycznego [mm/h], 14 udział
+// konwekcji (napływ chmur i opadu przez brzegi domeny), 15 gradient górnej troposfery, 16–19 krzywizna hodografu, 20–23 wilgotność
+// z modelu synoptycznego na 3 / 1.5 / 5 / 6.5 km (względem nasycenia woda → lód), 24 gradient 3–5.6 km (CLAUDE.md, sekcja 9)
+export const NPAR = 25;
 
 export function zOfS(S, c = CFG) {
   const s = S / c.NZ;
@@ -179,7 +189,8 @@ export function makeSounding(p, c = CFG) {
   // tworzyły przy nim sztuczną ciepłą warstwę): spadek γ przechodzi w wzrost 1 K/km
   const wt = 350;
   const soft = (x) => (x > 30 ? x : Math.log1p(Math.exp(x)));
-  // drugi gradient od ~5.5 km (górna troposfera; p.lapse2 z modelu synoptycznego, domyślnie = lapse)
+  // drugi gradient od ~5.5 km (górna troposfera; p.lapse2 z modelu synoptycznego, domyślnie = lapse). Bez osobnego gradientu 3–5.6 km
+  // celu (airT w sim.wgsl, airTz w nesting.js) – stan bazowy jest tylko odniesieniem, różnicę niesie θ' (cel wypełnia ją w stanie początkowym)
   const g2 = Math.min(p.lapse2 || p.lapse, 9.5) / 1000, w2 = 600;
   const T = (z) => T0 - gam * z - (g2 - gam) * w2 * soft((z - 5500) / w2) + (g2 + 0.001) * wt * soft((z - zt) / wt) + inv(z);
   const hn = 350, tn = p.tnight || 0;
@@ -240,7 +251,7 @@ export function buildGrid(c, snd) {
     ['ZONE', NXY],                 // waga relaksacji brzegowej (0 – wnętrze, 1 – strefa wyrównania)
     ['RCV', NXY],                  // odbiornik spływu (D8: sąsiad o największym spadku, −1 – bezodpływ)
     ['PGRID', NPAR * (c.NX / c.GS) * (c.NY / c.GS)],   // siatka parametrów sondażu (model synoptyczny)
-    ['CCG', 8 * 36],               // korekta klimatu w węzłach (≤ 6 × 6): 4 temperatury [K], mnożniki wilgotności – grunt, 850, 700 hPa – i opadu (main.js ccUpload)
+    ['CCG', 8 * 36],               // korekta klimatu w węzłach (miejsce na 6 × 6, ccN daje ≤ 4 × 4): 4 temperatury [K], wykładnik wilgotności przy gruncie, mnożniki 850 i 700 hPa, mnożnik opadu (tryb lekki: norma opadu; main.js ccUpload)
     ['CCE', 36],                   // wysokość danych normy klimatu w węzłach korekty [m] (tryb lekki: opad z wysokością)
     ['TCL', 8 * 24],               // cyklony tropikalne z modelu synoptycznego dla drobnego jądra w celu (pe_tcdom → tgt_build): 8 × 24
   ];
@@ -344,11 +355,11 @@ export function wgslHeader(c, grid) {
     `const MG: u32 = ${c.MG}u;`, `const NXD: u32 = ${c.NXD}u;`, `const NYD: u32 = ${c.NYD}u;`,
     `const GS: u32 = ${c.GS}u;`, `const NGX: u32 = ${c.NX / c.GS}u;`, `const NGY: u32 = ${c.NY / c.GS}u;`,
     `const NPAR: u32 = ${NPAR}u;`, `const MEB: u32 = ${c.MEB}u;`,
-    // pola docelowe (2 terminy z modelu synoptycznego): θ', q_v, u, v (3D), przy gruncie u_g, v_g, p, w, geometria frontu (8 pól)
-    // i diagnostyka wykrywania (gradient, skupienie, kontrast)
+    // pola docelowe (jeden z 3 slotów terminów z modelu synoptycznego): θ', q_v, u, v (3D), przy gruncie u_g, v_g, p, w, geometria
+    // frontu (8 pól) i diagnostyka wykrywania (gradient, skupienie, kontrast)
     `const TG_SLOT: u32 = 4u * N + 15u * NXY;`,
     // wyostrzenie frontów Φ (θ', q_v, u, v) na poziomach poniżej ~7 km (KFR): dwa bufory na zmianę (krok parzysty / nieparzysty)
-    // za dwoma terminami w buforze tgt
+    // za trzema slotami terminów w buforze tgt
     `const KFR: u32 = ${kfrOf(grid)}u;`, `const NF: u32 = KFR * NXY;`, `const FPH_OFF: u32 = 3u * TG_SLOT;`,
     `const TW_CX: u32 = ${grid.off.TWD}u;`, `const TW_SX: u32 = ${grid.off.TWD + c.NX}u;`,
     `const TW_CY: u32 = ${grid.off.TWD + 2 * c.NX}u;`, `const TW_SY: u32 = ${grid.off.TWD + 2 * c.NX + c.NY}u;`,
@@ -357,7 +368,7 @@ export function wgslHeader(c, grid) {
     `const W_PHI: u32 = 0u;`, `const W_R: u32 = N;`, `const W_Z: u32 = 2u * N;`, `const W_P: u32 = 3u * N;`,
     `const W_AP: u32 = 4u * N;`, `const W_PART: u32 = 5u * N;`, `const W_SC: u32 = 5u * N + NPART;`,
     `const W_MEAN: u32 = 5u * N + NPART + 8u;`,
-    // korekta masy wilgoci: sumy częściowe (6 × NPART) i współczynniki (3)
+    // korekta masy wilgoci: sumy częściowe (8 × NPART: q_v, q_c, q_i, q_r po i przed adwekcją) i współczynniki (4)
     `const W_MPART: u32 = W_MEAN + 4u * NZ;`, `const W_MSC: u32 = W_MPART + 8u * NPART;`,
     // średnia odchyłka warstwy granicznej od pola docelowego (4 pola × MEB poziomów nad gruntem)
     `const W_EB: u32 = W_MSC + 4u;`,
@@ -385,8 +396,9 @@ export function wgslHeader(c, grid) {
   lines.push(`const FRON: f32 = ${typeof location !== 'undefined' && new URLSearchParams(location.search).get('fr') === '0' ? '0.0' : '1.0'};`);
   // zaburzenia napływu na siatkach LES (?cpm=0 – wyłączone, do porównań A/B)
   lines.push(`const CPM: f32 = ${typeof location !== 'undefined' && new URLSearchParams(location.search).get('cpm') === '0' ? '0.0' : '1.0'};`);
-  // stochastyczne zaburzenia warstwy granicznej w szarej strefie (?psp=0 – wyłączone, do porównań A/B)
+  // rozdział deszcz / śnieg z temperatury ~30 m nad prawdziwym gruntem (?phs=0 – dawny, z temperatury komórki kb; sim.wgsl tPhase)
   lines.push(`const PHS: f32 = ${typeof location !== 'undefined' && new URLSearchParams(location.search).get('phs') === '0' ? '0.0' : '1.0'};`);
+  // stochastyczne zaburzenia warstwy granicznej w szarej strefie (?psp=0 – wyłączone, do porównań A/B)
   lines.push(`const PSP: f32 = ${typeof location !== 'undefined' && new URLSearchParams(location.search).get('psp') === '0' ? '0.0' : '1.0'};`);
   // napływ z wariancją wilgotności i wilgocią wznoszenia (?bcq=0 – wyłączone): duże domeny, płynnie 150–400 km krótszego boku
   const bcqT = Math.min(1, Math.max(0, (Math.min(c.NXD, c.NYD) * c.DX - 150e3) / 250e3));
@@ -394,7 +406,6 @@ export function wgslHeader(c, grid) {
   // drenaż na spodzie gleby jako część swobodnego (?drn=1 – dawny swobodny) i część średniego strumienia ciepła z gruntu zdejmowana z warstwy granicznej (?hff=0 – bez)
   const qnum = (k, d) => { const v = typeof location !== 'undefined' ? new URLSearchParams(location.search).get(k) : null; const n = v === null ? NaN : Number(v); return Number.isFinite(n) && n >= 0 ? n : d; };
   lines.push(`const SM_DRN: f32 = ${f(qnum('drn', 0.15))};`, `const HFF: f32 = ${f(qnum('hff', 0.8))};`);
-  // cienka komórka przy gruncie łączona mieszaniem z warstwą wyżej (?tlk=1 – włączone; domyślnie wyłączone: odwracała artefakt – cienkie oczka nocą cieplejsze od sąsiadów), wychładzanie mgły na ~300 m (?fsp=0), mgła na stacji i mapie z wody na 2 m (?fgd=0), ograniczenie bardzo dużego CAPE (?cul= próg [J/kg], 0 – bez)
   // próg lodowego wierzchołka cumulusa płytkiego nad lądem przy ciepłej podstawie o GLI [K] chłodniej (?gli=0 – dawniej wszędzie −5…−15 °C)
   lines.push(`const GLI: f32 = ${f(qnum('gli', 10))};`);
   // deficyt wilgotności w oporze szparkowym: hs [(kg/kg)⁻¹] (?vpd=0 – dawniej)
@@ -422,7 +433,9 @@ export function wgslHeader(c, grid) {
   // ciśnienie na mapie z zaburzeniem od domeny (?psd=0 – tylko duża skala; sim.wgsl lbc_apply)
   lines.push(`const PSD: f32 = ${f(qnum('psd', 1))};`);
   // słaby opad schematu konwekcji (średnia z oczka poniżej ~RMN mm/h) paruje pod podstawą chmury (?rmn=0 – dawniej; sim.wgsl cu_spread)
-  lines.push(`const RMN: f32 = ${f(qnum('rmn', 0.3))};`);
+  lines.push(`const RMN: f32 = ${f(qnum('rmn', 1.5))};`);
+  lines.push(`const MBL: f32 = ${f(qnum('mbl', 1))};`);
+  lines.push(`const MRN: f32 = ${f(qnum('mrn', 1))};`);   // konwekcja podniesiona bez opadu przy ciepłej podstawie na siatkach ≤ 10 km (0 – dawniej)   // konwekcja podniesiona słabnie, gdzie cząstka przy gruncie ma swobodne CAPE (0 – dawniej)
   // cyklony tropikalne – drobne jądro w celu (sim.wgsl tgt_build): kształt profilu Hollanda B = TCB0 + 0.009·Δp [hPa], mnożnik wiatru wiru, ?tcj=0 – bez jądra (wir modelu synoptycznego)
   lines.push(`const TCB0: f32 = ${f(qnum('tcb', 1.4))};`, `const TCV: f32 = ${f(qnum('tcvw', 1))};`, `const TCSZ: f32 = ${f(qnum('tcsz', 0))};`, `const TCJ: f32 = ${f(qnum('tcj', 1))};`,
     `const TCN: f32 = ${f(qnum('tcn', 0.3))};`);
@@ -434,6 +447,10 @@ export function wgslHeader(c, grid) {
   lines.push(`const CCL: f32 = ${f(qnum('ccl', 3000))};`, `const CCT: f32 = ${f(qnum('cct', 1200))};`, `const CCR: f32 = ${f(qnum('ccr', 600))};`);
   // satelita VIS, tylko obraz: wielkość kłębów z siły wznoszenia (?csz=0 – bez), ulice chmur przy silnym wietrze (?cst=0 – bez), łączenie kłębów z pokładami (?cmx=0 – bez)
   lines.push(`const CSZ: f32 = ${f(qnum('csz', 1))};`, `const CST: f32 = ${f(qnum('cst', 1))};`, `const CMX: f32 = ${f(qnum('cmx', 1))};`);
+  // cienka komórka przy gruncie łączona mieszaniem z warstwą wyżej (?tlk=1 – włączone; domyślnie wyłączone: odwracała artefakt – cienkie oczka nocą
+  // cieplejsze od sąsiadów), wychładzanie mgły na ~300 m (?fsp=0), mgła na stacji i mapie z wody na 2 m (?fgd=0), ograniczenie bardzo dużego CAPE
+  // (?cul= próg [J/kg], 0 – bez), para z warstwy przy gruncie nad podstawę chmury przy dużym CAPE (?cuq=0 – bez), ciepły opad cumulusów płytkich
+  // nad lądem × SHL (?shl=1 – dawniej)
   lines.push(`const TLK: f32 = ${f(qnum('tlk', 0))};`, `const FSP: f32 = ${f(qnum('fsp', 1))};`, `const FGD: f32 = ${f(qnum('fgd', 1))};`, `const CUL: f32 = ${f(qnum('cul', 2000))};`, `const CUQ: f32 = ${f(qnum('cuq', 1))};`, `const SHL: f32 = ${f(qnum('shl', 0.1))};`);
   // narodziny chmur schematu w płynących skupiskach zamiast kropek po całej mapie (?clu=0 – wyłączone)
   lines.push(`const CLU: f32 = ${typeof location !== 'undefined' && new URLSearchParams(location.search).get('clu') === '0' ? '0.0' : '1.0'};`);

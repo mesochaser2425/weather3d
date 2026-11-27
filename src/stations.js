@@ -8,14 +8,15 @@
 // w przeglądarce i w zapisanym scenariuszu; historia liczy się od startu symulacji (restart ją czyści).
 // Wysokość stacji (zs) z prawdziwego terenu (gęstszy DEM, jak wysokość pod kursorem); model liczy na średniej z oczka.
 // Stacja wyżej niż grunt modelu (szczyt) mierzy powietrze modelu na swojej wysokości, niżej (dno doliny) – temperaturę
-// i punkt rosy przeliczone gradientem 6.5 K/km; przycisk „Szczyt” stawia stację w najwyższym punkcie w pobliżu kliknięcia.
+// i punkt rosy przeliczone gradientem (za dnia 6.5 K/km, przy nocnej inwersji do −10 K/km); przycisk „Szczyt” stawia stację
+// w najwyższym punkcie w pobliżu kliknięcia.
 
 import { toD, unitD, nD, fm, fT, fmH, fmVis, isImp, onUnits } from './units.js';
 import { drawMeteogram, newView, viewRange, viewStep, attachView, MET_L, MET_R } from './profile.js';
 
 const DIRS = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE', 'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW'];
-const dirName = (u, v) => DIRS[Math.round(((Math.atan2(-u, -v) * 180 / Math.PI + 360) % 360) / 22.5) % 16];
-const rhOf = (t, td) => { const es = (x) => 6.112 * Math.exp(17.67 * x / (x + 243.5)); return Math.min(100, 100 * es(td) / es(t)); };
+export const dirName = (u, v) => DIRS[Math.round(((Math.atan2(-u, -v) * 180 / Math.PI + 360) % 360) / 22.5) % 16];
+export const rhOf = (t, td) => { const es = (x) => 6.112 * Math.exp(17.67 * x / (x + 243.5)); return Math.min(100, 100 * es(td) / es(t)); };
 const H10_MAX = 432, H1_MAX = 24 * 120, D_MAX = 36500;
 
 // sumator okresu (godzina, doba): średnie, sumy i ekstrema z próbek co 10 min
@@ -43,7 +44,7 @@ export function createStations(ctx) {
   let sel = -1;
   let addMode = false;      // false | 'point' | 'peak'
   let lastTable = 0;
-  let cities = [];          // miejscowości z OpenStreetMap: { name, xkm, ykm, pop, cls 0/1/2 }
+  let cities = [];          // miejscowości (GeoNames, geo.js fetchCities): { name, xkm, ykm, pop }
 
   const colOf = (st) => {
     const i = Math.min(NXD - 1, Math.max(0, Math.floor(st.xkm * 1000 / DX)));

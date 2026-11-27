@@ -1,7 +1,9 @@
 // Dane geograficzne z otwartych źródeł – przeglądarka pobiera je wprost od dostawców, więc strona działa bez własnego serwera (GitHub Pages):
 //  – wysokość terenu i dna morza: AWS Terrain Tiles (format Terrarium: SRTM, GMTED, ETOPO1);
-//  – klimat: reanaliza ERA5 przez Open-Meteo (średnie dobowe temperatury i sumy opadu 2015–2020, pamięć podręczna)
-//    → normy miesięczne, klasa Köppena i parametry klimatu modelu (kontynentalizm, wilgotność);
+//  – klimat: normy 1991–2020 z reanalizy ERA5 przez Open-Meteo (T, punkt rosy, opad; tylko w tle, pamięć podręczna; starsze wpisy
+//    2015–2020 – tylko odczyt) → normy miesięczne, klasa Köppena i parametry klimatu modelu (kontynentalizm, wilgotność);
+//    bez sieci i przed nadejściem danych – klimatologia wbudowana (climbase.js);
+//  – miejscowości: GeoNames w projekcie (public/cities);
 //  – pokrycie terenu: ESA WorldCover 2021 (10 m, GeoTIFF/COG 3° × 3°) z Microsoft Planetary Computer.
 import { fromUrl } from 'geotiff';
 

@@ -1,5 +1,5 @@
 // Podgląd: przekrój pionowy (x–z), przekrój poziomy (x–y na zadanej wysokości) albo mapa przy gruncie.
-// Numeracja pól jak w interfejsie: 0–11 pola 3D, 20–30 mapy.
+// Numeracja pól jak w fields.js: < 20 pola 3D, od 20 mapy przy gruncie (V.field ≥ 20).
 
 struct View {
   size: vec2f,
@@ -94,26 +94,6 @@ fn ramp(t: f32, a: vec3f, b: vec3f, c: vec3f, d: vec3f, e: vec3f) -> vec3f {
 }
 
 // Te same skale są w src/fields.js (legendy)
-// Klasyczna skala temperatury map pogodowych, stała od −50 do +50 °C (punkty co 10 °C):
-// fiolet – granat – niebieski – błękit (0 °C) – zieleń – żółty – pomarańcz – czerwień – bordo
-fn tempClassic(t: f32) -> vec3f {
-  var c = array<vec3f, 11>(
-    vec3f(0.95, 0.85, 1.00),
-    vec3f(0.70, 0.45, 0.85),
-    vec3f(0.45, 0.20, 0.70),
-    vec3f(0.15, 0.20, 0.75),
-    vec3f(0.15, 0.50, 0.95),
-    vec3f(0.55, 0.85, 1.00),
-    vec3f(0.35, 0.80, 0.35),
-    vec3f(1.00, 0.90, 0.20),
-    vec3f(1.00, 0.45, 0.05),
-    vec3f(0.80, 0.05, 0.05),
-    vec3f(0.50, 0.00, 0.25));
-  let s = clamp(t, 0.0, 1.0) * 10.0;
-  let i = min(u32(s), 9u);
-  return mix(c[i], c[i + 1u], s - f32(i));
-}
-
 fn cmap(id: u32, t: f32) -> vec3f {
   switch id {
     case 0u: { return turbo(t); }
@@ -124,8 +104,6 @@ fn cmap(id: u32, t: f32) -> vec3f {
     case 5u: { return ramp(t, vec3f(0.97, 0.97, 0.97), vec3f(0.55, 0.85, 0.55), vec3f(0.15, 0.65, 0.25), vec3f(0.98, 0.85, 0.15), vec3f(0.90, 0.15, 0.10)); }
     case 7u: { return ramp(t, vec3f(0.97, 0.97, 0.97), vec3f(0.65, 0.85, 0.95), vec3f(0.30, 0.55, 0.90), vec3f(0.35, 0.25, 0.75), vec3f(0.55, 0.10, 0.55)); }
     case 8u: { return ramp(t, vec3f(0.05, 0.03, 0.10), vec3f(0.45, 0.08, 0.30), vec3f(0.85, 0.30, 0.10), vec3f(0.98, 0.70, 0.15), vec3f(1.0, 0.98, 0.80)); }
-    case 11u: { return tempClassic(t); }
-    case 13u: { return ramp(t, vec3f(0.55, 0.62, 0.90), vec3f(0.78, 0.84, 0.97), vec3f(0.97, 0.97, 0.95), vec3f(0.98, 0.86, 0.72), vec3f(0.92, 0.62, 0.50)); }
     default: { return vec3f(t); }
   }
 }
@@ -164,6 +142,8 @@ fn cmapOf(f: u32) -> u32 {
     case 53u, 54u: { return 21u; }
     case 55u: { return 27u; }
     case 56u, 66u: { return 8u; }
+    case 69u, 70u: { return 25u; }
+    case 71u: { return 32u; }
     case 30u: { return 10u; }
     case 79u: { return 31u; }
     default: { return 1u; }
@@ -171,11 +151,10 @@ fn cmapOf(f: u32) -> u32 {
 }
 
 // Odbiciowość radarowa [dBZ] w klasach co 5 dBZ (paleta jak w serwisach radarowych)
-fn dbzColor(z: f32) -> vec3f {
-  let C = array<vec3f, 14>(vec3f(0.55, 0.85, 0.95), vec3f(0.25, 0.65, 0.95), vec3f(0.10, 0.35, 0.90), vec3f(0.10, 0.85, 0.25),
-    vec3f(0.05, 0.65, 0.12), vec3f(0.02, 0.45, 0.05), vec3f(0.98, 0.95, 0.10), vec3f(0.90, 0.74, 0.00), vec3f(1.00, 0.55, 0.00),
-    vec3f(1.00, 0.05, 0.05), vec3f(0.80, 0.00, 0.00), vec3f(0.62, 0.00, 0.10), vec3f(0.98, 0.05, 0.98), vec3f(0.60, 0.33, 0.78));
-  return C[u32(clamp(floor((z - 5.0) / 5.0), 0.0, 13.0))];
+// Radar: skala z obrazka użytkownika (wxscales.js, −2.5…67.5 dBZ, ciągła). Początek paska w obrazku to przezroczystość na białym tle –
+// tu echo od 5 dBZ (jak dawniej), najsłabsze kolorem ~5 dBZ z kryciem rosnącym od 3 do 7 dBZ (biel na szarej mapie wyglądałaby jak mgła)
+fn radarCol(bg: vec3f, z: f32) -> vec3f {
+  return mix(bg, wxPal(WX_RADAR, max(z, 5.0)), smoothstep(3.0, 7.0, z));
 }
 
 // Satelita WV: ciepło (sucho) ciemnobrązowo, zimno (wilgotno) biało-niebiesko
@@ -184,25 +163,6 @@ fn wvColor(t: f32) -> vec3f {
   if (t > -40.0) { return mix(vec3f(0.55, 0.55, 0.58), vec3f(0.30, 0.20, 0.12), (t + 40.0) / 15.0); }
   if (t > -55.0) { return mix(vec3f(0.92, 0.94, 0.97), vec3f(0.55, 0.55, 0.58), (t + 55.0) / 15.0); }
   return mix(vec3f(0.30, 0.55, 0.95), vec3f(0.92, 0.94, 0.97), clamp((t + 70.0) / 15.0, 0.0, 1.0));
-}
-
-// Skala radarowa opadu [mm/h], progi jak na mapach radarowych
-fn radar(r: f32) -> vec3f {
-  if (r < 0.5) { return vec3f(0.62, 0.90, 1.00); }
-  if (r < 1.0) { return vec3f(0.30, 0.70, 1.00); }
-  if (r < 2.0) { return vec3f(0.15, 0.80, 0.35); }
-  if (r < 5.0) { return vec3f(0.05, 0.58, 0.12); }
-  if (r < 10.0) { return vec3f(1.00, 0.90, 0.10); }
-  if (r < 20.0) { return vec3f(1.00, 0.58, 0.00); }
-  if (r < 50.0) { return vec3f(0.92, 0.10, 0.10); }
-  return vec3f(0.82, 0.10, 0.82);
-}
-
-// suma opadu [mm]: klasy ACC_T (0.5 … 2000 mm) i kolory ACC_C z fields.js
-fn accum(r: f32) -> vec3f {
-  var n = 0u;
-  for (var k = 1u; k < ACC_N; k++) { if (r >= ACC_T[k]) { n = k; } }
-  return ACC_C[n];
 }
 
 // ---------- próbkowanie ----------
@@ -243,26 +203,12 @@ fn field3(f: u32, X: f32, Y: f32, S: f32) -> f32 {
 
 fn sfcAt(s: u32, col: u32) -> f32 { return sfc[s * NXY + col]; }
 
-// szum wartości 2D (chmury porwane na mapie satelitarnej), wynik ~równomierny w 0..1
+// szum wartości 2D (losowanie pikseli, zniekształcenie faktury satelity), wynik ~równomierny w 0..1
 fn hash2(p: vec2i) -> f32 {
   var h = u32(p.x) * 374761393u + u32(p.y) * 668265263u;
   h = (h ^ (h >> 13u)) * 1274126177u;
   h = h ^ (h >> 16u);
   return f32(h) / 4294967295.0;
-}
-// szum komórkowy 2D (Worley): 1 w punktach losowych (jeden na komórkę siatki szumu), maleje z odległością
-fn worley2(p: vec2f) -> f32 {
-  let i = vec2i(floor(p));
-  let f = fract(p);
-  var d = 9.0;
-  for (var b = -1; b <= 1; b++) {
-    for (var a = -1; a <= 1; a++) {
-      let o = vec2i(a, b);
-      let pt = vec2f(o) + vec2f(hash2(i + o), hash2(i + o + vec2i(4517, 9811)));
-      d = min(d, length(pt - f));
-    }
-  }
-  return clamp(1.0 - d, 0.0, 1.0);
 }
 fn vnoise(p: vec2f) -> f32 {
   let i = vec2i(floor(p));
@@ -270,11 +216,16 @@ fn vnoise(p: vec2f) -> f32 {
   let u = f * f * (3.0 - 2.0 * f);
   return mix(mix(hash2(i), hash2(i + vec2i(1, 0)), u.x), mix(hash2(i + vec2i(0, 1)), hash2(i + vec2i(1, 1)), u.x), u.y);
 }
-fn cloudNoise(xm: f32, ym: f32) -> f32 {
-  let p = vec2f(xm, ym);
-  let L = max(3000.0, 1.2 * DX);           // skala płatów chmur rośnie z oczkiem
-  let n = 0.6 * vnoise(p / L + 3.1) + 0.3 * vnoise(p / (0.4 * L) + 17.3) + 0.1 * vnoise(p / (0.15 * L) + 41.7);
-  return clamp((n - 0.5) * 1.7 + 0.5, 0.0, 1.0);
+
+// Radar jak kompozyt radarowy (użytkownik: pikseloza prawdziwego radaru, bez szumu): to samo gładkie pole co dawniej, czytane w środkach
+// pikseli na stałej siatce: 10 km (użytkownik: większe piksele, „nawet 10 km”), w małych domenach 1/24 krótszego boku, nie mniej niż 1 km;
+// przy oddaleniu, gdy piksel ekranu jest większy, × 2, 4…
+fn radarAt(f: u32, X: f32, Y: f32) -> f32 {
+  let mpp = max(fwidth(X) * DX, fwidth(Y) * DY);                      // metrów na piksel ekranu
+  let rp0 = clamp(min(f32(NXV) * DX, f32(NYV) * DY) / 24.0, 1000.0, 10000.0);
+  let rpm = rp0 * exp2(ceil(log2(max(mpp / rp0, 1.0))));              // bok piksela radaru [m]
+  let cpx = (floor(vec2f(X * DX, Y * DY) / rpm) + 0.5) * rpm;         // środek piksela [m]
+  return mapAt(f, cpx.x / DX, cpx.y / DY);
 }
 
 fn mapCol(f: u32, col: u32) -> f32 {
@@ -305,18 +256,18 @@ fn mapCol(f: u32, col: u32) -> f32 {
     case 28u: { return 100.0 * sfcAt(S_W, col); }
     case 29u: { return 1000.0 * sfcAt(S_LWP, col); }
     case 58u: { return 100.0 * sfcAt(S_COVER, col); }
-    case 59u: { return 100.0 * sfcAt(S_COVC, col); }
-    case 60u: { return 100.0 * sfcAt(S_COVS, col); }
-    case 61u: { return 1000.0 * sfcAt(S_LWPC, col); }
     case 62u: { return 100.0 * 0.45 * sfcAt(S_SM1, col); }
     case 63u: { return 100.0 * 0.45 * sfcAt(S_SM2, col); }
     case 64u: { return 100.0 * 0.45 * sfcAt(S_SM3, col); }
     case 65u: { return sfcAt(S_LIFT, col); }
+    case 69u: { return sfcAt(S_PRCG, col); }
+    case 70u: { return max(sfcAt(S_PR, col) - sfcAt(S_PRCG, col), 0.0); }
+    case 71u: { return sfcAt(S_PRCG, col); }
     case 66u: { return sfcAt(S_SMODE, col); }
     case 67u: { return max(sfcAt(S_ORG, col), sfcAt(S_ORGB, col)); }
     case 68u: { return sfcAt(S_FRT, col); }
+    case 168u: { return sfcAt(S_FRI, col); }                // (tylko do mapy „Fronty”: siła frontu)
     case 79u: { return vg[VG_VEG + col]; }
-    case 69u: { return 1000.0 * sfcAt(S_LWPA, col); }
     case 37u: { return sfcAt(S_CLL, col) + sfcAt(S_CLM, col) + sfcAt(S_CLH, col); }
     case 31u: { return sfcAt(S_TB, col); }
     case 38u: { return sfcAt(S_DBZ, col); }
@@ -340,98 +291,91 @@ fn mapCol(f: u32, col: u32) -> f32 {
       let ci = i32(col % NX);
       let cj = i32(col / NX);
       var a = 0.0;
-      for (var dj = -1; dj <= 1; dj++) { for (var di = -1; di <= 1; di++) { a += sfcAt(S_CAPE, wrapi(cj + dj, NY) * NX + wrapi(ci + di, NX)); } }
+      for (var dj = -1; dj <= 1; dj++) { for (var di = -1; di <= 1; di++) { a += sfcAt(S_CAPES, wrapi(cj + dj, NY) * NX + wrapi(ci + di, NX)); } }
       return a / 9.0;
     }
     case 57u: {
       let ci = i32(col % NX);
       let cj = i32(col / NX);
       var a = 0.0;
-      for (var dj = -1; dj <= 1; dj++) { for (var di = -1; di <= 1; di++) { a += sfcAt(S_MUCAPE, wrapi(cj + dj, NY) * NX + wrapi(ci + di, NX)); } }
+      for (var dj = -1; dj <= 1; dj++) { for (var di = -1; di <= 1; di++) { a += sfcAt(S_MUCAPES, wrapi(cj + dj, NY) * NX + wrapi(ci + di, NX)); } }
       return a / 9.0;
     }
     case 56u: {
       // wskaźnik superkomórkowy SCP = (CAPE/1000)·(SRH 0–3/50)·(ścinanie 0–6/20; 0 poniżej 10 m/s, maks. 1.5)
       let sh = length(vec2f(sfcAt(S_SHU, col), sfcAt(S_SHV, col)));
       let fs = select(clamp(sh / 20.0, 0.0, 1.5), 0.0, sh < 10.0);
-      return max(sfcAt(S_CAPE, col) / 1000.0 * sfcAt(S_SRH03, col) / 50.0 * fs, 0.0);
+      return max(sfcAt(S_CAPES, col) / 1000.0 * sfcAt(S_SRH03, col) / 50.0 * fs, 0.0);
     }
     case 32u: { return 100.0 * sfcAt(S_SND, col); }
     case 33u: { return sfcAt(S_GRN, col); }
     case 34u: { return sfcAt(S_PSL, col); }
-    case 35u: { return sfcAt(S_CUTOP, col); }                // wierzchołek chmury konwekcji parametryzowanej
-    case 36u: { return sfcAt(S_CUBASE, col); }               // … i jej podstawa
     default: { return vg[VG_HGT + col]; }
   }
 }
 
-// Wagi interpolacji sześciennej Catmulla-Roma (gładkie izolinie zamiast kanciastych)
-fn crw(t: f32) -> vec4f {
+// Monotoniczna interpolacja sześcienna Hermite'a między p1 i p2 (Fritsch–Butland): nachylenie w węźle – średnia harmoniczna sąsiednich
+// różnic, 0 przy ekstremum. Bez przestrzeleń (nie trzeba obcinać – np. ujemnego opadu), a wartość i nachylenie w węźle są te same po obu
+// stronach – pole ciągłe i gładkie. Wcześniej Catmull-Rom obcięty do zakresu 4 najbliższych wartości: ten zakres zmienia się skokowo na linii
+// przez środek oczka, więc przy stromym brzegu (krawędź komórki opadu) wychodziły proste uskoki wzdłuż oczek i prostokątne płaty
+// (użytkownik: nagłe spadki opadu na skraju komórek, komórki „przeskakują” między oczkami)
+// (wektorowo: 4 wiersze naraz; odczyty pola w mapAt / field3s w jednej pętli – jedno miejsce wywołania mapCol / field3: kompilator wkleja
+// tę dużą funkcję przy każdym wywołaniu, a 4 wywołania na wiersz wydłużały start strony o ~14 s – kompilacja shadera mapy)
+fn hmono(p0: vec4f, p1: vec4f, p2: vec4f, p3: vec4f, t: f32) -> vec4f {
+  let sa = p1 - p0;
+  let sb = p2 - p1;
+  let sc = p3 - p2;
+  let m1 = select(vec4f(0.0), 2.0 * sa * sb / (sa + sb), sa * sb > vec4f(0.0));
+  let m2 = select(vec4f(0.0), 2.0 * sb * sc / (sb + sc), sb * sc > vec4f(0.0));
   let t2 = t * t;
   let t3 = t2 * t;
-  return vec4f(-0.5 * t3 + t2 - 0.5 * t, 1.5 * t3 - 2.5 * t2 + 1.0, -1.5 * t3 + 2.0 * t2 + 0.5 * t, 0.5 * t3 - 0.5 * t2);
+  return (2.0 * t3 - 3.0 * t2 + 1.0) * p1 + (t3 - 2.0 * t2 + t) * m1 + (3.0 * t2 - 2.0 * t3) * p2 + (t3 - t2) * m2;
+}
+// 4 × 4 wartości (wiersze po 4, v[4·b + a]) → wartość w (tx, ty): najpierw w x (4 wiersze naraz), potem w y
+fn hmono2(v: array<f32, 16>, tx: f32, ty: f32) -> f32 {
+  let r = hmono(vec4f(v[0], v[4], v[8], v[12]), vec4f(v[1], v[5], v[9], v[13]), vec4f(v[2], v[6], v[10], v[14]), vec4f(v[3], v[7], v[11], v[15]), tx);
+  return hmono(vec4f(r.x), vec4f(r.y), vec4f(r.z), vec4f(r.w), ty).x;
 }
 // indeks kolumny: przy brzegach otwartych bez wchodzenia w niewidoczną strefę wyrównania
 fn colI(i: i32, n: u32, nv: u32) -> u32 { return select(wrapi(i, n), u32(clamp(i, 0, i32(nv) - 1)), NE > 0u); }
 
-// Interpolacja dwusześcienna mapy (wartości w środkach kolumn), ograniczona do zakresu
-// 4 najbliższych wartości (bez przestrzeleń, np. ujemnego opadu)
 // pole wygładzone w skali oczka (obraz satelitarny: chmury mniejsze niż ~2 oczka nie są rozdzielone przez model –
 // bez tego szum „piksel po pikselu” przy chmurach niskich)
 fn mapBlur(f: u32, X: f32, Y: f32) -> f32 {
   let r = 0.75;
   return 0.36 * mapAt(f, X, Y) + 0.16 * (mapAt(f, X + r, Y + r) + mapAt(f, X - r, Y + r) + mapAt(f, X + r, Y - r) + mapAt(f, X - r, Y - r));
 }
+// Interpolacja mapy (wartości w środkach kolumn): monotoniczna sześcienna (hmono) w x, potem w y
 fn mapAt(f: u32, X0: f32, Y0: f32) -> f32 {
   let X = select(X0, clamp(X0, 0.5, f32(NXV) - 0.5), NE > 0u);
   let Y = select(Y0, clamp(Y0, 0.5, f32(NYV) - 0.5), NE > 0u);
   let xf = floor(X - 0.5);
   let yf = floor(Y - 0.5);
-  let wx = crw(X - 0.5 - xf);
-  let wy = crw(Y - 0.5 - yf);
-  var acc = 0.0;
-  var lo = 1e30;
-  var hi = -1e30;
+  var v: array<f32, 16>;
   for (var b = 0; b < 4; b++) {
     let j = colI(i32(yf) + b - 1, NY, NYV);
-    var row = 0.0;
-    for (var a = 0; a < 4; a++) {
-      let v = mapCol(f, j * NX + colI(i32(xf) + a - 1, NX, NXV));
-      row += wx[a] * v;
-      if ((a == 1 || a == 2) && (b == 1 || b == 2)) { lo = min(lo, v); hi = max(hi, v); }
-    }
-    acc += wy[b] * row;
+    for (var a = 0; a < 4; a++) { v[4 * b + a] = mapCol(f, j * NX + colI(i32(xf) + a - 1, NX, NXV)); }
   }
-  return clamp(acc, lo, hi);
+  return hmono2(v, X - 0.5 - xf, Y - 0.5 - yf);
 }
 
-// Przekroje pól 3D: interpolacja sześcienna w poziomie (środki komórek), w pionie liniowa
+// Przekroje pól 3D: monotoniczna interpolacja sześcienna w poziomie (środki komórek, hmono – jak mapAt), w pionie liniowa
 fn field3s(f: u32, X0: f32, Y0: f32, S: f32, horiz: bool) -> f32 {
   let X = select(X0, clamp(X0, 0.5, f32(NXV) - 0.5), NE > 0u);
   let Y = select(Y0, clamp(Y0, 0.5, f32(NYV) - 0.5), NE > 0u);
   let xf = floor(X - 0.5);
   let yf = floor(Y - 0.5);
-  let wx = crw(X - 0.5 - xf);
-  let wy = crw(Y - 0.5 - yf);
-  var acc = 0.0;
-  var lo = 1e30;
-  var hi = -1e30;
+  var v: array<f32, 16>;
   let nb = select(1, 4, horiz);
   for (var b = 0; b < nb; b++) {
     let Yc = select(Y, f32(colI(i32(yf) + b - 1, NY, NYV)) + 0.5, horiz);
-    var row = 0.0;
-    for (var a = 0; a < 4; a++) {
-      let v = field3(f, f32(colI(i32(xf) + a - 1, NX, NXV)) + 0.5, Yc, S);
-      row += wx[a] * v;
-      if ((a == 1 || a == 2) && (!horiz || b == 1 || b == 2)) { lo = min(lo, v); hi = max(hi, v); }
-    }
-    acc += select(1.0, wy[b], horiz) * row;
+    for (var a = 0; a < 4; a++) { v[4 * b + a] = field3(f, f32(colI(i32(xf) + a - 1, NX, NXV)) + 0.5, Yc, S); }
   }
-  return clamp(acc, lo, hi);
+  // (przekrój pionowy: tylko wiersz 0 – w x)
+  return select(hmono(vec4f(v[0]), vec4f(v[1]), vec4f(v[2]), vec4f(v[3]), X - 0.5 - xf).x, hmono2(v, X - 0.5 - xf, Y - 0.5 - yf), horiz);
 }
 
-// Pojedyncze cumulusy zajmujące część fc powierzchni – kształt z cuShape (common.wgsl), ten sam bok siatki i przesuw z wiatrem
-// ~1.5 km co w widoku 3D; brzeg miękki, środek gęstszy niż brzegi
+// pole przy gruncie dwuliniowo (X, Y w oczkach siatki obliczeniowej, wartości w środkach)
 fn sfcBil(sx: u32, X: f32, Y: f32) -> f32 {
   let x = clamp(X - 0.5, 0.0, f32(NX) - 1.001);
   let y = clamp(Y - 0.5, 0.0, f32(NY) - 1.001);
@@ -455,7 +399,7 @@ fn cuDisp(xy: vec2f) -> vec4f {
   let b = mix(V.cuD[u32(ty.y) * n + u32(tx.x)], V.cuD[u32(ty.y) * n + u32(tx.y)], tx.z);
   return mix(a, b, ty.z);
 }
-// X, Y – położenie w oczkach siatki obliczeniowej (z marginesem); wzór w metrach widocznej domeny, jak w widoku 3D
+// to samo dla wzoru piętra średniego (altocumulus, cuD2)
 fn cuDisp2(xy: vec2f) -> vec4f {
   let tx = cuTile(xy.x, f32(NXD) * DX, V.cuNx);
   let ty = cuTile(xy.y, f32(NYD) * DY, V.cuNy);
@@ -464,6 +408,8 @@ fn cuDisp2(xy: vec2f) -> vec4f {
   let b = mix(V.cuD2[u32(ty.y) * n + u32(tx.x)], V.cuD2[u32(ty.y) * n + u32(tx.y)], tx.z);
   return mix(a, b, ty.z);
 }
+// Pojedyncze cumulusy zajmujące część fc powierzchni – kształt z cuShape (common.wgsl), ten sam przesuw z wiatrem co w widoku 3D;
+// brzeg miękki, środek gęstszy niż brzegi. X, Y – położenie w oczkach siatki obliczeniowej (z marginesem); wzór w metrach widocznej domeny.
 // wm – udział chmur piętra średniego: dwa osobne wzory (niskie płyną z wiatrem warstwy cumulusów, średnie z wiatrem średnim 0–6 km)
 // o częściach powierzchni fc·(1 − wm) i fc·wm. Wcześniej jeden wzór z przesunięciem mieszanym wg wm: przesunięcia wzorów różnią się
 // o dziesiątki km (różnica wiatrów × okres pokolenia, w MAX ~4 h), a wm zmienia się na 1–2 oczkach, więc wzór ściskał się w poprzek
@@ -726,7 +672,7 @@ fn groundHi(X: f32, Y: f32) -> GroundHi {
   return GroundHi(c, vegHiCode(ni, nj), vegHiCell(ni, nj), fw);
 }
 
-// gładka wysokość terenu (dwuliniowo, bez zawijania przy brzegach otwartych)
+// gładka wysokość terenu (dwusześciennie jak mapAt, bez zawijania przy brzegach otwartych)
 fn hgtAt(X: f32, Y: f32) -> f32 { return mapAt(30u, X, Y); }
 
 // teren do obrazu na mapach: gęstszy DEM (dwuliniowo), gdy wczytany – inaczej siatka modelu. Model liczy na średniej z oczka
@@ -758,7 +704,7 @@ fn reliefShade(X: f32, Y: f32) -> f32 {
   return dot(n, l) / l.z;
 }
 
-// nachylenie dz/dx, dz/dy (dwuliniowo z mapy wysokości – gładsze niż z kolumn)
+// nachylenie dz/dx, dz/dy (z gładkiej mapy wysokości – gładsze niż z kolumn)
 fn mapSlope(X: f32, Y: f32) -> vec2f {
   let e = 0.5;
   let gx = (hgtAt(X + e, Y) - hgtAt(X - e, Y)) / (2.0 * e * DX);
@@ -789,7 +735,8 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
   let isMap = f >= 20u;
 
   var val: f32;
-  if (isMap) { val = mapAt(f, X, Y); } else { val = field3s(f, X, Y, S, V.mode == 0u); }
+  // dni upalne i noce tropikalne: liczby całkowite w oczku – bez wygładzenia tarasy i kanciaste plamy
+  if (isMap) { if (f == 89u || f == 90u) { val = mapBlur(f, X, Y); } else if (f == 38u || f == 42u) { val = radarAt(f, X, Y); } else { val = mapAt(f, X, Y); } } else { val = field3s(f, X, Y, S, V.mode == 0u); }
   let fw = max(fwidth(val), 1e-6);
   let t = (val - V.lo) / (V.hi - V.lo);
   let cm = cmapOf(f);
@@ -811,27 +758,10 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
       let cq = wrapi(i32(floor(Y)), NY) * NX + wrapi(i32(floor(X)), NX);
       if (sfcAt(S_PSN, cq) > 0.5 * max(sfcAt(S_PR, cq), 1e-4)) { col = wxPal(6u, 10.0 * v); }
     }
-  } else if (cm == 6u) {
-    // opad: radar na tle cieniowanego terenu
-    col = vec3f(0.80) * (0.55 + 0.45 * hillshade(X, Y, nw));
-    if (val >= 0.1) {
-      col = radar(val);
-      // śnieg (> połowa opadu) w biało-fioletowej skali, jak na mapach radarowych z typem opadu
-      let cq = wrapi(i32(floor(Y)), NY) * NX + wrapi(i32(floor(X)), NX);
-      if (sfcAt(S_PSN, cq) > 0.5 * max(sfcAt(S_PR, cq), 1e-4)) {
-        let s = clamp(log(val / 0.1) / log(100.0), 0.0, 1.0);
-        col = mix(mix(vec3f(0.92, 0.95, 1.0), vec3f(0.55, 0.62, 1.0), smoothstep(0.0, 0.5, s)), vec3f(0.62, 0.20, 0.85), smoothstep(0.5, 1.0, s));
-      }
-    }
-  } else if (cm == 14u) {
-    // suma opadu na tle cieniowanego terenu
-    col = vec3f(0.80) * (0.55 + 0.45 * hillshade(X, Y, nw));
-    if (val >= 0.5) { col = accum(val); }
   } else if (cm == 15u) {
-    col = vec3f(0.80) * (0.55 + 0.45 * hillshade(X, Y, nw));
-    if (val >= 5.0) { col = dbzColor(val); }
+    col = radarCol(vec3f(0.80) * (0.55 + 0.45 * hillshade(X, Y, nw)), val);
     if (f == 42u) {
-      // wyładowania: migające punkty, gęstość ∝ częstość błyskawic w oczku (sprawdzane 4 sąsiednie)
+      // wyładowania: migające punkty, gęstość ∝ częstość błyskawic w oczku
       let fl = sfcAt(S_FLASH, wrapi(i32(floor(Y)), NY) * NX + wrapi(i32(floor(X)), NX));
       // pola 10 × 10 px: w każdym co ~1/6 s losowo błysk (prawdopodobieństwo rośnie z częstością)
       let cell = vec2i(floor(pos.xy / 10.0));
@@ -854,6 +784,14 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
     let Yt = Y + (0.9 * (vnoise(qt + vec2f(21.7, 3.4)) - 0.5) + 0.45 * (vnoise(qt * 2.7 + vec2f(6.6, 19.5)) - 0.5)) * jT;
     let gt = select(vegColor(wrapi(i32(floor(Y)), NY) * NX + wrapi(i32(floor(X)), NX)), groundHiA(Xt, Yt, fpT).c, V.vhF > 1.5);
     col = gt * (0.55 + 0.45 * hillshade(X, Y, nw));
+  } else if (cm == 32u) {
+    // diagnostyka: droga schematu, która dała opad (PRK z oczka, bez interpolacji – kategorie), tam, gdzie opad schematu przy gruncie ≥ 0.05 mm/h
+    col = vec3f(0.80) * (0.55 + 0.45 * hillshade(X, Y, nw));
+    let cq = wrapi(i32(floor(Y)), NY) * NX + wrapi(i32(floor(X)), NX);
+    if (val >= 0.05) {
+      let k = u32(sfcAt(S_PRK, cq) + 0.5);
+      col = select(select(select(vec3f(0.45), vec3f(0.85, 0.15, 0.15), k == 1u), vec3f(0.60, 0.30, 0.85), k == 2u), vec3f(0.10, 0.70, 0.70), k == 3u);
+    }
   } else if (cm == 19u) {
     // grad: małe (< 2 cm) żółte, duże (2–5 cm) pomarańczowe, bardzo duże (> 5 cm) fioletowe
     col = vec3f(0.70) * (0.55 + 0.45 * hillshade(X, Y, nw));
@@ -880,11 +818,19 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
     }
   } else if (cm == 30u) {
     // fronty (oś przy gruncie, wyostrzenie z modelu synoptycznego): tło – przygaszona temperatura 2 m, linie: chłodny ostry
-    // granatowy, chłodny łagodny błękitny, ciepły czerwony, stacjonarny (słaby sygnał) – ledwo widoczny
+    // granatowy, chłodny łagodny błękitny, ciepły czerwony, stacjonarny fioletowy; przejścia między rodzajami – mieszane barwy.
+    // Rodzaj = FRT / FRI (siła – osobne pole), krycie z siły: dawniej z samego FRT (rodzaj × siła) brzegi linii frontu stacjonarnego
+    // (−2 × słabnąca siła) wypadały w zakresie frontu ciepłego – czerwone obrzeża fioletowej linii
     col = mix(vec3f(0.86), wxPal(0u, mapAt(20u, X, Y)), 0.5) * (0.6 + 0.4 * hillshade(X, Y, nw));
-    if (val > 0.05) { col = mix(col, mix(vec3f(0.35, 0.68, 1.0), vec3f(0.04, 0.12, 0.70), clamp(val - 1.0, 0.0, 1.0)), clamp(1.4 * val, 0.0, 1.0)); }
-    if (val < -0.05 && val > -1.25) { col = mix(col, vec3f(0.88, 0.10, 0.08), clamp(-1.4 * val, 0.0, 1.0)); }
-    if (val <= -1.25) { col = mix(col, vec3f(0.55, 0.15, 0.70), clamp(1.4 * (-val - 1.0), 0.0, 1.0)); }   // stacjonarny – fioletowy
+    let fi = mapAt(168u, X, Y);
+    if (fi > 0.05) {
+      let ty = clamp(val / fi, -1.0, 2.0);
+      let cCold = mix(vec3f(0.35, 0.68, 1.0), vec3f(0.04, 0.12, 0.70), clamp(ty - 1.0, 0.0, 1.0));
+      let wC = clamp(ty, 0.0, 1.0);
+      let wW = clamp(-ty, 0.0, 1.0);
+      let cF = wC * cCold + wW * vec3f(0.88, 0.10, 0.08) + (1.0 - wC - wW) * vec3f(0.55, 0.15, 0.70);
+      col = mix(col, cF, clamp(1.4 * fi * max(ty, 1.0), 0.0, 1.0));
+    }
   } else if (cm == 16u) {
     col = wvColor(val);
   } else if (cm == 17u) {
@@ -1204,17 +1150,39 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
     }
   } else if (cm == 10u) {
     col = hypso(select(val, demAt(X, Y), V.mode == 0u)) * (0.55 + 0.45 * hillshade(X, Y, nw));
-    let lc = u32(vg[VG_LAND + wrapi(i32(floor(Y)), NY) * NX + wrapi(i32(floor(X)), NX)] + 0.5);
-    if (lc == 3u) { col = vec3f(0.20, 0.40, 0.70); }
-    if (lc == 1u) { col *= vec3f(0.75, 0.9, 0.75); }
-    if (lc == 2u) { col = mix(col, vec3f(0.6), 0.6); }
+    // las, zabudowa, woda: z gęstszej mapy pokrycia, gdy jest (mieszanka czterech najbliższych punktów, jak na satelicie);
+    // wcześniej zawsze z klasy oczka – na mapie wysokości widać było mozaikę oczek zamiast prawdziwych lasów i jezior
+    var fF = 0.0;
+    var fU = 0.0;
+    var fW = 0.0;
+    if (V.vhF > 1.5 && X >= f32(MG) && Y >= f32(MG) && X < f32(MG + NXD) && Y < f32(MG + NYD)) {
+      let u = (X - f32(MG)) * V.vhF - 0.5;
+      let v = (Y - f32(MG)) * V.vhF - 0.5;
+      let fx = u - floor(u);
+      let fy = v - floor(v);
+      for (var q = 0; q < 4; q++) {
+        let w = select(1.0 - fx, fx, (q & 1) == 1) * select(1.0 - fy, fy, (q >> 1) == 1);
+        let vq = vegHiCode(i32(floor(u)) + (q & 1), i32(floor(v)) + (q >> 1));
+        fF += w * select(0.0, 1.0, vq == 1u || vq == 2u || vq == 5u || vq == 11u);
+        fU += w * select(0.0, 1.0, vq == 9u);
+        fW += w * select(0.0, 1.0, vq == 10u);
+      }
+    } else {
+      let lc = u32(vg[VG_LAND + wrapi(i32(floor(Y)), NY) * NX + wrapi(i32(floor(X)), NX)] + 0.5);
+      fF = select(0.0, 1.0, lc == 1u);
+      fU = select(0.0, 1.0, lc == 2u);
+      fW = select(0.0, 1.0, lc == 3u);
+    }
+    col *= mix(vec3f(1.0), vec3f(0.75, 0.9, 0.75), fF);
+    col = mix(col, vec3f(0.6), 0.6 * fU);
+    col = mix(col, vec3f(0.20, 0.40, 0.70), fW);
   }
 
   // rzeźba terenu na mapach i przekrojach poziomych: cieniowanie stoków i poziomice
   if (V.mode == 0u && V.hmax > 1.0) {
     let ht = demAt(X, Y);
     let hm = max(V.hmax, V.hmaxD);
-    if ((V.relief & 1u) != 0u && cm != 9u && cm != 10u && cm != 6u && cm != 24u && cm != 25u && cm != 26u) {
+    if ((V.relief & 1u) != 0u && cm != 9u && cm != 10u && cm != 24u && cm != 25u && cm != 26u) {
       col *= clamp(1.0 + 0.85 * (reliefShade(X, Y) - 1.0), 0.4, 1.45);
     }
     if ((V.relief & 2u) != 0u) {
@@ -1234,7 +1202,8 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
 
   // izolinie (izotermy itp.); izoterma 0 °C wyróżniona
   if (V.iso > 0.0) {
-    let isT = f == 0u || f == 20u || f == 21u || f == 24u || f == 46u || f == 47u || (f >= 80u && f <= 82u);
+    // pola temperatury [°C] (także analizy okresów: średnie 80–82, ekstrema bezwzględne 86–87)
+    let isT = f == 0u || f == 20u || f == 21u || f == 24u || f == 46u || f == 47u || (f >= 80u && f <= 82u) || f == 86u || f == 87u;
     if (isT && V.iso <= 1.0) {
       // izotermy w stałym układzie: co 5 °C grube, co 2 °C cienkie ciągłe, co 1 °C kreskowane; odległość od linii
       // w pikselach (fwidth) – grubość niezależna od gradientu; najgęstsze linie wygaszane płynnie dopiero, gdy
@@ -1253,7 +1222,7 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
       let d = abs(fract(val / V.iso + 0.5) - 0.5) * V.iso / fw;
       col = mix(col, vec3f(0.0), 0.8 * (1.0 - smoothstep(0.4, 0.9, d)));
     }
-    if ((f == 0u || f == 20u || f == 21u || f == 24u || (f >= 80u && f <= 82u)) && abs(val) / fw < 1.3) { col = vec3f(1.0); }
+    if (isT && abs(val) / fw < 1.3) { col = vec3f(1.0); }
   }
 
   // mapa „Parametry burzowe” (55): na tle CAPE izolinie SRH 0–3 km co 100 m²/s² (pogrubiona 200)
@@ -1304,28 +1273,20 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
   // chmury i deszcz na przekrojach 3D
   if (!isMap && V.overlay == 1u && f != 5u && f != 6u) {
     // chmury z jednego opisu (cloudAt – jak widok 3D i obraz satelitarny): krycie z grubości optycznej ~300 m
-    // drogi w chmurze, przerwy szumem wg części oczka zajętej przez chmurę, kłębiaste jaśniejsze u góry
+    // drogi w chmurze × część oczka zajęta przez chmurę (gładko, bez wycinania kształtów szumem), kłębiaste ciemniejsze u podstawy
     let qcR = trilin(0u, QC_OFF, NZ, X - 0.5, Y - 0.5, S - 0.5);
     let qiR = trilin(0u, QI_OFF, NZ, X - 0.5, Y - 0.5, S - 0.5);
     let qrR = trilin(0u, QR_OFF, NZ, X - 0.5, Y - 0.5, S - 0.5);
-    let qvR = trilin(0u, QV_OFF, NZ, X - 0.5, Y - 0.5, S - 0.5);
     let thR = trilin(0u, T_OFF, NZ, X - 0.5, Y - 0.5, S - 0.5);
     let kq = u32(clamp(S - 0.5, 0.0, f32(NZ - 1u)));
     let tR = (vg[VG_TC + kq] + thR) * vg[VG_EXC + kq];
-    let pR = vg[VG_PRS + kq];
     let wR = trilin(0u, W_OFF, NZ + 1u, X - 0.5, Y - 0.5, S);
     let cq = wrapi(i32(floor(Y)), NY) * NX + wrapi(i32(floor(X)), NX);
     let kbq = u32(vg[VG_KB + cq]);
-    let cl = cloudAt(vg[VG_RC + kq], qcR, qiR, qrR, qvR / qsat(tR, pR), qvR / qsat_ice(tR, pR), tR, z,
+    let cl = cloudAt(vg[VG_RC + kq], qcR, qiR, qrR, tR, z,
                      convFlag(wR, sfcAt(S_H, cq), z - vg[VG_ZW + kbq], sfcAt(S_PBLH, cq), sfcAt(S_MUCAPE, cq), sfcAt(S_MUEL, cq)),
                      sfcAt(S_CULS, cq), sfcAt(S_CUBS, cq), sfcAt(S_CUTS, cq));
-    // przerwy jak w widoku 3D: kłęby wokół punktów szumu komórkowego (odstęp ~2.5–4 km), warstwowe – łagodny szum
-    let nzc = vnoise(vec2f(X * DX / 1200.0, z / 400.0)) * 0.65 + 0.35 * vnoise(vec2f(X * DX / 450.0 + 7.1, z / 160.0));
-    let cuS = max(2500.0, 1.2 * DX);
-    let wl = worley2(vec2f(X * DX / cuS, z / (1.6 * cuS) + Y * 0.37));
-    let rr = clamp(sqrt(cl.y / 3.0), 0.12, 0.85);
-    let covCu = smoothstep(1.0 - rr - 0.1, 1.0 - rr + 0.06, wl + 0.3 * (nzc - 0.5));
-    let cov = smoothstep(0.0, 0.7, cl.y);              // gładko, bez wycinania kształtów szumem
+    let cov = smoothstep(0.0, 0.7, cl.y);
     let a = select(0.0, (1.0 - exp(-cl.x * 300.0)) * cov, cl.y > 0.005);
     let fq = max(fwidth(a), 1e-3);
     let shade = mix(mix(vec3f(0.97), vec3f(0.84, 0.91, 1.0), cl.z), vec3f(0.70, 0.72, 0.76), 0.35 * cl.w * (1.0 - smoothstep(0.0, 3000.0, z - sfcAt(S_CUBS, cq))));

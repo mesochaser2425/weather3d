@@ -60,6 +60,13 @@ export const WXS = [
     t: [900, 920, 940, 950, 960, 970, 980, 985, 990, 995, 1000, 1005, 1010, 1015, 1020, 1025, 1030, 1035, 1040, 1050],
     c: ['#2a0a3c', '#4b1464', '#6e2896', '#8c3cbe', '#6450d2', '#3c6edc', '#3c96eb', '#46b4f0', '#5ac8e6', '#64d2be', '#6edc96',
       '#96e173', '#c3e65f', '#f0eb50', '#f5d241', '#f5af37', '#f08c2d', '#e65f28', '#d23228', '#aa1e3c'] },
+  // odbiciowość radaru [dBZ] – skala z obrazka użytkownika (XI 2026, ciągła, bez podpisów): kolory odczytane z pikseli co 2.5 dBZ, liniowo;
+  // przejście od bieli do żółtego to 30–35 dBZ (użytkownik), więc początek paska (w obrazku przezroczysty) −2.5, koniec 67.5 dBZ:
+  // granat ~20, błękit ~25 (deszcz warstwowy ~1–3 mm/h), żółty ~35, pomarańcz ~40, czerwień ~45–50, fiolet ~55+ (grad)
+  { key: 'radar', unit: 'dBZ', tk: [0, 10, 20, 30, 40, 50, 60],
+    t: [-2.5, 0, 2.5, 5, 7.5, 10, 12.5, 15, 17.5, 20, 22.5, 25, 27.5, 30, 32.5, 35, 37.5, 40, 42.5, 45, 47.5, 50, 52.5, 55, 57.5, 60, 62.5, 65, 67.5],
+    c: ['#ffffff', '#f3eaf8', '#e3d6ea', '#ccc3d5', '#b1b1bb', '#9095a8', '#6c739e', '#48529b', '#232f9f', '#0b47c9', '#0b81fc', '#449ae8',
+      '#7cb2d6', '#b4cbc3', '#ece3af', '#e8cb7c', '#e2b347', '#db971d', '#c8691d', '#b53a1e', '#b72428', '#d73643', '#ef3378', '#d21bd2', '#db48db', '#e475e4', '#eda2ed', '#f6d1f6', '#fffeff'] },
 ];
 for (const s of WXS) s.rgb = s.c.map(hex);
 export const WX_INDEX = Object.fromEntries(WXS.map((s, i) => [s.key, i]));
@@ -95,4 +102,6 @@ export const WX_WGSL = WXS.map((s, i) => `var<private> WXT${i}: array<f32, ${s.t
   + `fn wxPal(p: u32, v: f32) -> vec3f {\n  switch p {\n`
   + WXS.map((s, i) => `    case ${i}u: { var n = 0u; for (var k = 1u; k < ${s.t.length}u; k++) { if (v >= WXT${i}[k]) { n = k; } } let m = min(n + 1u, ${s.t.length - 1}u); return mix(WXC${i}[n], WXC${i}[m], clamp((v - WXT${i}[n]) / max(WXT${i}[m] - WXT${i}[n], 1e-6), 0.0, 1.0)); }\n`).join('')
   + `    default: { return vec3f(0.5); }\n  }\n}\n`
+  + `const WX_RADAR: u32 = ${WX_INDEX.radar}u;
+`
   + `fn wxMin(p: u32) -> f32 {\n  switch p {\n` + WXS.map((s, i) => `    case ${i}u: { return ${s.t[0].toFixed(2)}; }\n`).join('') + `    default: { return 0.0; }\n  }\n}\n`;

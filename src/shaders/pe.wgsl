@@ -50,7 +50,8 @@ struct PP {
 @group(0) @binding(6) var<storage, read_write> wk: array<f32>;    // robocze: rzut, opad, historia, środek
 @group(0) @binding(7) var<storage, read_write> nest: array<f32>;  // bufor vg domeny zagnieżdżonej
 @group(0) @binding(8) var<storage, read_write> tcb: array<f32>;   // cyklony wywołane kliknięciem (spawn): 8 slotów × 8 – czynny, x, y [oczka], głębokość
-                                                                  // docelowa teraz [hPa], zasiew w tym kroku, głębokość obecna [hPa]
+                                                                  // docelowa teraz [hPa], zasiew w tym kroku, głębokość obecna [hPa];
+                                                                  // od 64: ślady cyklonów dla domeny (pe_tcdom), 8 × 32
 
 const G: f32 = 9.81;
 const CP: f32 = 1004.0;
@@ -145,11 +146,10 @@ const BM_CAPE: f32 = 50.0;
 // lato o 2–3 K za zimne (teraz środek kanału: średnia dobowa 18.7–19.6, T850 9.6–11.2 °C)
 const CTAU_W: f32 = 1.5;
 const CTAU_MAX: f32 = 15.0;
-// strefa brzegowa przy ścianie N (~82°N) dla θ i q 10× słabsza niż S (τ 10 dób): profil klimatyczny Arktyki z formuły
-// jest zimą ~−38 °C przy gruncie, a model ~−16 – przyciąganie z τ 1 doby działało jak ogromny upust ciepła (~1000 W/m²
-// w pasie przy ścianie) i ochładzało cały kanał (zima 50°N −9 zamiast ~−1 °C; teraz −3.4)
-// XPS – siła strefy przy ścianie S (×2 ochładzało środek kanału o ~1.5 K, ×0.5 bez zmian); XPN – τ ~3 doby przy ścianie N
-// (cel: profil arktyczny z AFGL – patrz pe.js); obie stałe wstrzykiwane z pe.js (header)
+// strefa brzegowa przy ścianie N dla θ i q słabsza niż przy S (XPN = 0.33 – τ ~3 doby przy ścianie): dawniej cel Arktyki z formuły
+// (zimą ~−38 °C przy gruncie przy ~−16 w modelu) i τ 1 doby działały jak ogromny upust ciepła (~1000 W/m² w pasie przy ścianie);
+// cel strefy – klimatologia średniej strefowej NCEP (zonclim.js; ?zct=0 – dawny profil AFGL). XPS – siła strefy przy ścianie S (×2
+// ochładzało środek kanału o ~1.5 K, ×0.5 bez zmian); obie stałe wstrzykiwane z pe.js (header)
 
 fn ix(i: i32, j: i32, k: i32) -> u32 {
   let ii = u32(((i % i32(NXP)) + i32(NXP)) % i32(NXP));
@@ -265,7 +265,7 @@ fn vdiff(m: f32, c0: f32, p: f32, k: i32, c: u32, kb: i32, fb: f32) -> f32 {
 }
 
 // ---------------- promieniowanie i bilans energii powierzchni (raz na krok, stan z początku kroku) ----------------
-// Kolumna: zachmurzenie z wilgotności (Sundqvist, RHc 80%), krótkofalowe (nasłonecznienie dobowe, pochłanianie przez
+// Kolumna: zachmurzenie z wilgotności (Sundqvist, RHc 90%), krótkofalowe (nasłonecznienie dobowe, pochłanianie przez
 // parę – Lacis–Hansen, ozon 2.5% w górnej warstwie, rozpraszanie Rayleigha i aerozol, odbicie od chmur i podłoża
 // z wielokrotnymi odbiciami), długofalowe dwustrumieniowe w dwóch pasmach (nieprzezroczyste: para τ ∝ u^0.45
 // i CO₂; okno 8–12 µm: kontinuum pary ∝ e·u), chmury jako ciało szare o pokryciu cf. Słońce chwilowe (cykl
@@ -366,7 +366,7 @@ fn pe_rad(@builtin(global_invocation_id) gid: vec3u) {
   let mag = 35.0 / sqrt(1224.0 * mu * mu + 1.0);
   let o3 = 0.025 * S;
   // chmury: pokrycie słupa przy nakładaniu maksymalno-losowym (sąsiednie warstwy jedna nad drugą), grubość
-  // optyczna warstwy chmurowej: woda 2.5, lód 0.7 (ISCCP: chmury typowo 3–10 w słupie), słup ≤ 25; odbicie słupa R = τ/(τ + 10)
+  // optyczna warstwy chmurowej: woda CTAU_W (1.5), lód 0.5, słup ≤ CTAU_MAX (15); odbicie słupa R = τ/(τ + 10)
   // rozdzielone na warstwy wg ich udziału w τ (miejsce odbicia – dla pochłaniania przez parę nad chmurą)
   var clr = 1.0 - cf[0];
   var tsum = cf[0] * mix(0.5, CTAU_W, liq[0]);
@@ -1130,9 +1130,9 @@ fn pe_column(@builtin(global_invocation_id) gid: vec3u) {
   var pr = 0.0;
   var prk: array<f32, NZP>;
   for (var k = kb; k < NZP; k++) { satAdj(&th, &q, &qcl, k); }
-  // Konwekcja (Betts–Miller, uproszczona): cząstka z najniższej warstwy (~0–400 m) podnoszona sucho do
+  // Konwekcja (Betts–Miller, uproszczona): cząstka z najniższej warstwy nad gruntem (kb, ~0–400 m) podnoszona sucho do
   // nasycenia, potem wilgotnoadiabatycznie (θe stałe). Gdy jest chwiejna i chmura ma ≥ ~1 km grubości,
-  // temperatura w chmurze dąży do profilu cząstki, a wilgotność do 80% nasycenia (τ = 2 h); woda zabrana
+  // temperatura w chmurze dąży do profilu cząstki, a wilgotność do 80% nasycenia (τ = 3 h); woda zabrana
   // z kolumny ponad to, co poszło na ogrzanie, spada jako opad konwekcyjny (bilans energii: poprawka
   // jednakowa na wszystkich poziomach chmury). Przelotne opady i burze w chwiejnych masach, pasma opadów
   // nad ciepłą wodą przy napływie zimnego powietrza (podłoże ogrzewa i nawilża najniższą warstwę).
@@ -1572,8 +1572,8 @@ fn air(x: f32, y: f32) -> Air {
   A.p[4] = clamp(tA - tS, -8.0, 8.0);
   A.p[5] = rhl;
   // górna wilgotność dla domeny: pełna tylko przy wznoszeniu wielkoskalowym (fronty, opad); poza nim
-  // ~0.7× (0.5× – zimą za mało chmur i mrozy −30 °C) – oczko 75 km uśrednia suche i wilgotne pasma, a prawie nasycona troposfera dawała
-  // w domenie wszędzie grube chmury średnie i wysokie (ciepłe noce, słabe nagrzewanie za dnia)
+  // 0.9× (dawniej 0.5× – zimą za mało chmur i mrozy −30 °C; 0.7× – suszyło domenę) – oczko 75 km uśrednia suche i wilgotne pasma, a prawie
+  // nasycona troposfera dawała w domenie wszędzie grube chmury średnie i wysokie (ciepłe noce, słabe nagrzewanie za dnia)
   // „wilgotno” także tam, gdzie model pada (fronty z dala od niżu mają słabe wznoszenie na 3 km, ale opad)
   let wet = max(smoothstep(-0.005, 0.02, w3), smoothstep(0.0, 0.1 / 3600.0, smp2(WK_PR, x, y)));
   A.p[6] = rhh * mix(0.9, 1.0, wet);   // (było 0.7 – gdy PE był za wilgotny w górze; teraz suszyło domenę)
@@ -1598,7 +1598,7 @@ fn air(x: f32, y: f32) -> Air {
   let prT = smp2(WK_PR, x, y);
   A.p[13] = 3600.0 * prT;
   A.p[14] = select(0.0, clamp(smp2(WK_PRC, x, y) / prT, 0.0, 1.0), prT > 1e-8);
-  // drugi gradient: górna troposfera 5 km … min(9 km, tropopauza − 1 km) – w rzeczywistości ~7 K/km (500→300 hPa),
+  // drugi gradient (p[15], niżej): górna troposfera 5.6 km … min(9 km, tropopauza − 1 km), ≥ 6.5 km – w rzeczywistości ~7 K/km (500→300 hPa),
   // szybciej niż 1–5 km; jeden gradient do tropopauzy dawał za ciepłą górną troposferę celu (mniej CAPE, niższe burze)
   // Hodograf z krzywizną (superkomórki potrzebują skrętu wiatru z wysokością – SRH): (16, 17) wiatr geostroficzny
   // przy gruncie z gradientu ciśnienia modelu minus wiatr z ekstrapolacji liniowej 1.5 → 0 km (skręt w dolnych 1.5 km
@@ -1773,7 +1773,7 @@ fn pe_map(@builtin(global_invocation_id) gid: vec3u) {
 // potencjał genezy w każdym oczku (ciepłe morze ≥ 26.5 °C, 5–30° szerokości, słabe ścinanie 1.2–9 km, wilgotna środkowa troposfera,
 // cyklonalne zawirowanie przy gruncie – fala wschodnia, bez istniejącego silnego wiru w promieniu ~750 km); losowo (powtarzalnie: ziarno
 // pogody i czas) z prawdopodobieństwem rosnącym z sumą potencjału – jedno miejsce wybrane proporcjonalnie do potencjału; tam depresja
-// tropikalna (wir ~17 m/s w promieniu ~150 km, ciepły rdzeń, wilgotne wnętrze). Dalej niesie ją i rozwija sam model (parowanie z morza,
+// tropikalna (wir TC_VM ~22 m/s w promieniu TC_RM ~130 km, ciepły rdzeń, wilgotne wnętrze). Dalej niesie ją i rozwija sam model (parowanie z morza,
 // konwekcja); domena o drobnym oczku nad ciepłym morzem wzmacnia ją do siły huraganu. Wyniki w WK_LAP (wolne między krokami):
 // potencjał (N2), wybór (TC_O: flaga, i, j). TCG – mnożnik częstości (?tcg=0 – bez).
 const TC_O: u32 = WK_LAP + 24u * N2;
@@ -2091,13 +2091,13 @@ fn pe_tcforce() {
   }
 }
 // Cyklony tropikalne dla domeny (drobne jądro w celu – sim.wgsl tgt_build): raz na termin ośrodki cyklonów w pobliżu domeny → lista w buforze
-// vg domeny (P.tclOff, 8 × 16). Ośrodek: ośrodek wiru (mapa 26 – maksimum zawirowania ~1.2 km) oznaczony jako cyklon tropikalny (mapa 27: pe_tccen –
+// vg domeny (P.tclOff, 8 × 24). Ośrodek: ośrodek wiru (mapa 26 – maksimum zawirowania ~1.2 km) oznaczony jako cyklon tropikalny (mapa 27: pe_tccen –
 // intensywność potencjalna > 5 hPa i głębokość > 3 hPa, albo huragan wywołany kliknięciem) albo blisko śledzonego (nad lądem i chłodną wodą cyklon
 // dalej jest śledzony i słabnie sam). Położenie z minimum ciśnienia z dokładnością do części oczka (parabola przez 3 oczka), wygładzone filtrem α–β
 // (z prędkością ruchu – płynnie, bez skoków o oczko 75 km), głębokość i otoczenie wygładzone (τ 1.5 h). Otoczenie z okręgu 375 km (wir się znosi):
-// ciśnienie (średnia i gradient), wiatr ~1.5 i 6 km. Stan śladów w tcb od 64 (8 × 16): 0 waga 0…1, 1–2 x, y [m], 3–4 vx, vy [m/s], 5 głębokość [hPa],
+// ciśnienie (średnia i gradient), wiatr ~1.5 i 6 km. Stan śladów w tcb od 64 (8 × 32): 0 waga 0…1, 1–2 x, y [m], 3–4 vx, vy [m/s], 5 głębokość [hPa],
 // 6 ciśnienie otoczenia [hPa], 7–8 gradient ciśnienia [hPa/m], 9–12 wiatr otoczenia u, v na 1.5 i 6 km, 13 wiek [s], 14 |szerokość| [°], 15 półkula,
-// 16–22 parametry sondażu otoczenia (wygładzone τ 1.5 h), 23 kolejne terminy bez ośrodka, 24 wielkość cyklonu (8 × 32)
+// 16–22 parametry sondażu otoczenia (wygładzone τ 1.5 h), 23 kolejne terminy bez ośrodka, 24 wielkość cyklonu
 var<workgroup> tdN: atomic<u32>;
 var<workgroup> tdC: array<vec2i, 16>;
 @compute @workgroup_size(64)
@@ -2139,6 +2139,14 @@ fn pe_tcdom(@builtin(local_invocation_index) li: u32) {
   workgroupBarrier();
   if (li != 0u) { return; }
   let nc = min(atomicLoad(&tdN), 16u);
+  // kandydaci w stałej kolejności (wiersz, kolumna): kolejność z atomicAdd zależy od wątków, a od niej przypisanie do śladów (i kolejność
+  // nakładania cyklonów w celu) – przebieg i pełny zapis powtarzalne co do bitu
+  for (var s1 = 1u; s1 < nc; s1++) {
+    let v1 = tdC[s1];
+    var s2 = s1;
+    while (s2 > 0u && (tdC[s2 - 1u].y > v1.y || (tdC[s2 - 1u].y == v1.y && tdC[s2 - 1u].x > v1.x))) { tdC[s2] = tdC[s2 - 1u]; s2--; }
+    tdC[s2] = v1;
+  }
   let dt = P.tcDt;
   let a = 1.0 - exp(-dt / 5400.0);
   var hit = array<bool, 8>(false, false, false, false, false, false, false, false);

@@ -6,13 +6,13 @@
 //   vol_light    – grubość optyczna od każdego woksela w stronę słońca (cienie chmur i gór), prąd pionowy, zmętnienie
 //                  powietrza i grubość optyczna chmur nad wokselem (nowy widok 3D)
 // Współrzędne: x na wschód, y na północ, z w górę [m]; tekstury obejmują widoczną domenę
-// (NXV × NYV oczek) i poziomy modelu (współrzędna S, jak w symulacji).
+// (NXD × NYD oczek) i poziomy modelu (współrzędna S, jak w symulacji).
 
 struct VolP {
   sun: vec3f,       // kierunek do słońca
   sunUp: f32,       // > 0 w dzień
   zTop: f32,        // górna granica tekstury [m]
-  cloudScale: f32,  // przelicznik chmur podsiatkowych (0 na siatkach LES)
+  cloudScale: f32,  // (nieużywane – chmury podsiatkowe wyłączone; miejsce w układzie, main.js je wypełnia)
   blend: f32,      // wygładzenie w czasie tekstury chmur (część nowego stanu, ~Δt_sym / 10 min)
   leafAut: f32,    // 1 – jesień (kolory drzew: main.js leafAut)
 }
@@ -153,11 +153,9 @@ fn vol_build(@builtin(global_invocation_id) g: vec3u) {
   if (k < kb) { textureStore(densOut, g, vec4f(0.0)); return; }
   let rho = vg[VG_RC + k];
   let t = (vg[VG_TC + k] + state[T_OFF + c]) * vg[VG_EXC + k];
-  let p = vg[VG_PRS + k];
-  let qv = max(state[QV_OFF + c], 0.0);
   let z = vg[VG_ZC + k];
   let w = 0.5 * (state[W_OFF + c] + state[W_OFF + c + NXY]);
-  let cl = cloudAt(rho, state[QC_OFF + c], state[QI_OFF + c], state[QR_OFF + c], qv / qsat(t, p), qv / qsat_ice(t, p), t, z,
+  let cl = cloudAt(rho, state[QC_OFF + c], state[QI_OFF + c], state[QR_OFF + c], t, z,
                    convFlag(w, sfc[S_H * NXY + col], z - vg[VG_ZW + kb], sfc[S_PBLH * NXY + col], sfc[S_MUCAPE * NXY + col], sfc[S_MUEL * NXY + col]),
                    sfc[S_CULS * NXY + col], sfc[S_CUBS * NXY + col], sfc[S_CUTS * NXY + col]);
   // chmury kłębiaste zajmujące część oczka (w 3D rysowane jako kłęby): zaokrąglony wierzchołek – w górnych 60% chmury

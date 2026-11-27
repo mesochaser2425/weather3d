@@ -34,8 +34,6 @@ export const fdT = (k, d = 1, znak = false) => {
 export const fmH = (m) => (imp ? `${Math.round(m * 3.28084).toLocaleString('en-US')} ft` : `${Math.round(m)} m`);
 // wysokość z suwaka w km: metrycznie jak jest, imperialnie stopy co 100
 export const fmZ = (km) => (imp ? `${(Math.round(km * 32.8084) * 100).toLocaleString('en-US')} ft` : `${km} km`);
-// odległość w km do odczytu: metrycznie jak jest, imperialnie mile
-export const fmD = (km, d = 0) => (imp ? `${(km * 0.621371).toFixed(km < 10 ? 1 : d)} mi` : `${km} km`);
 // oczko siatki [m]
 export const fmDx = (m) => (imp ? (m < 1609 ? fmH(m) : `${+(m / 1609.34).toFixed(1)} mi`) : m < 1000 ? `${m} m` : `${m / 1000} km`);
 // widzialność [km]

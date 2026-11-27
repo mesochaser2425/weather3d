@@ -235,6 +235,7 @@
     #titleScr.lite .tt-side, #titleScr.lite .tt-map { box-shadow: inset 0 0 0 2px #2f6b45; }
     #ttLiteBox { display: none; }
     #titleScr.lite #ttLiteBox { display: block; }
+    #brand .lite[hidden] { display: none; }
     #brand .lite { display: block; font-size: 9px; color: #6fd08c; text-align: center; letter-spacing: .05em; }
     /* sondaż */
     #csnd { width: 100%; display: block; background: #fff; flex: none; }
@@ -283,7 +284,7 @@
     .stmark i { display: block; width: 10px; height: 10px; background: #ffd34d; border: 2px solid #1a1a1a; border-radius: 2px; box-shadow: 0 0 4px rgba(0,0,0,.7); }
     .stmark span { position: absolute; left: 13px; top: -4px; color: #fff; font-size: 11px; font-weight: 600; white-space: nowrap; text-shadow: 0 1px 2px #000, 0 0 3px #000; }
     .stmark.sel i { background: #ff7a3d; }
-    /* miejscowości (OpenStreetMap): kropka wg wielkości, nazwa dużych stale, pozostałych po najechaniu; klik – stacja */
+    /* miejscowości (GeoNames): kropka wg wielkości, nazwa dużych stale, pozostałych po najechaniu; klik – stacja */
     .city { position: absolute; pointer-events: none; }   /* bez z-index: kropki (2) pod stacjami (3), nazwy miast (4) na wierzchu */
     .city i { display: block; position: relative; z-index: 2; pointer-events: auto; cursor: copy; border-radius: 50%; background: #fff; border: 1.5px solid #111;
       box-shadow: 0 0 3px rgba(0,0,0,.8); }
@@ -321,7 +322,12 @@
     .apanel h3 { margin: 0; font-size: 13px; font-weight: 700; }
     .apanel .sub { color: var(--muted); font-size: 12px; }
     #cxz { height: auto; aspect-ratio: 1.6; }
-    #cprof { display: block; width: 100%; aspect-ratio: 1.3; background: var(--panel2); }
+    /* sonda: ramka z temperaturą, opadem i zachmurzeniem (sondaż – zakładka Atmosphere) */
+    #pbBox { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+    #pbBox .pbt { background: var(--panel2); padding: 8px 9px 9px; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+    #pbBox .pbl { color: var(--muted); font-size: 11px; letter-spacing: .04em; text-transform: uppercase; }
+    #pbBox .pbv { color: var(--text); font-size: 24px; font-weight: 700; line-height: 1.15; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    #pbBox .pbs { color: var(--muted); font-size: 11.5px; line-height: 1.4; }
     #profInfo { color: var(--muted); font-size: 12px; line-height: 1.55; }
     #profInfo b { color: var(--text); }
     #cmet, #cmetSt { display: block; width: 100%; aspect-ratio: 2.0; background: var(--panel2); }
@@ -419,7 +425,8 @@
       <div><kbd>F</kbd> full-screen map</div><div><kbd>P</kbd> save image (PNG)</div>
       <div><kbd>S</kbd> sounding: probe ↔ domain mean</div><div><kbd>W</kbd> wind arrows</div>
       <div><kbd>A</kbd> analysis panel</div><div><kbd>M</kbd> menu (last tab)</div>
-      <div><kbd>↑</kbd> <kbd>↓</kbd> height of the horizontal section</div><div><kbd>H</kbd> / <kbd>?</kbd> this help, <kbd>Esc</kbd> close</div>
+      <div><kbd>↑</kbd> <kbd>↓</kbd> height of the horizontal section</div><div><kbd>L</kbd> free flight in the 3D view (WASD, mouse)</div>
+      <div><kbd>H</kbd> / <kbd>?</kbd> this help, <kbd>Esc</kbd> close</div>
     </div>
     <div class="hint" style="margin-top:8px">Mouse on the map: wheel – zoom (up to 16×), drag – pan the zoomed map, double-click – whole map.
       The same on the synoptic map and on the maps in the place-selection window.</div>
@@ -830,12 +837,12 @@
       </div>
 
       <div class="apanel" data-ap="prof">
-        <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap">
-          <h3>Vertical profile</h3>
-          <div class="seg" id="profSeg"><button data-p="point" class="on">Probe</button><button data-p="mean">Mean</button></div>
+        <h3>Probe <span class="sub" id="profSub">click the map to place the probe</span></h3>
+        <div id="pbBox">
+          <div class="pbt"><span class="pbl">Temperature</span><span class="pbv" id="pbT">–</span><span class="pbs" id="pbTs"></span></div>
+          <div class="pbt"><span class="pbl">Precipitation</span><span class="pbv" id="pbP">–</span><span class="pbs" id="pbPs"></span></div>
+          <div class="pbt"><span class="pbl">Cloud cover</span><span class="pbv" id="pbC">–</span><span class="pbs" id="pbCs"></span></div>
         </div>
-        <span class="sub" id="profSub">probe at a point (click the map) · dots: parcel from the ground</span>
-        <canvas id="cprof"></canvas>
         <div id="profInfo"></div>
         <h3 class="mh">Probe meteogram <span class="sub">3 days · T, Td, clouds, precipitation, pressure, wind</span></h3>
         <canvas id="cmet"></canvas>

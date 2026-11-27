@@ -1,7 +1,7 @@
 // Widok 3D: śledzenie promieni przez chmury (rozpraszanie światła słońca z fazą Henyeya–Greensteina,
 // przybliżenie rozpraszania wielokrotnego, światło nieba), teren z roślinnością, śniegiem i cieniami
-// chmur, niebo i słońce zależne od jego wysokości. Rodzaj chmury (cumulus / warstwowa / cirrus)
-// wybiera detal z szumu: kalafiorowe kłęby, łagodne komórki albo włókna wzdłuż wiatru.
+// chmur, niebo i słońce zależne od jego wysokości. Chmury kłębiaste na części oczka jako pojedyncze kłęby (wzór cuShape,
+// jak na satelicie), warstwowe – gładko w całym oczku. Dawny widok (przełącznik „nowy” – view3dn.wgsl).
 
 struct V3 {
   camPos: vec3f, tanF: f32,
@@ -10,7 +10,7 @@ struct V3 {
   fwd: vec3f, time: f32,
   sun: vec3f, sunUp: f32,
   size: vec2f, zTop: f32, blobS: f32,         // blobS – odstęp kłębów chmur kłębiastych [m]
-  windDir: vec2f, frame: f32, fogL: f32,
+  windDir: vec2f, frame: f32, fogL: f32,       // windDir – nieużywane (miejsce w układzie)
   flags: u32, cutY: f32, cuPh: f32, cuNx: f32,   // bit 0: powierzchnia 0 °C, bit 1: przekrój tnący (y = cutY [m]); cuPh – faza pokoleń cumulusów
   cuNy: f32, _p0: f32, _p1: f32, _p2: f32,
   nofs: vec4f,                                  // ciągłe przesunięcie szumu brzegów chmur [m]: xy – warstwa cumulusów, zw – średni wiatr 0–6 km
@@ -129,9 +129,7 @@ fn vegCol(v: u32, g0: f32) -> vec3f {
 }
 
 // Gęstość (ekstynkcja [1/m]) w punkcie p z tekstury chmur (jeden opis – cloudAt): b.x średnia ekstynkcja oczka,
-// b.y część oczka z chmurą, b.z udział lodu, b.w rodzaj (kłębiasta / warstwowa). Szum wycina przerwy tak, żeby
-// chmura zajmowała właśnie tę część oczka, i dodaje detal wg rodzaju: kalafiorowe kłęby (cumulus), łagodne
-// komórki (stratus, stratocumulus), włókna wzdłuż wiatru (cirrus).
+// b.y część oczka z chmurą, b.z udział lodu, b.w rodzaj (kłębiasta / warstwowa).
 // Kłęby zajmujące część fc powierzchni: kształt z cuShape (common.wgsl – ten sam co na obrazie satelitarnym). Bok rośnie
 // z przewyższeniem (×0.5·przewyższenie, ≥ 1), żeby przy ×4 cumulus miał proporcje cumulusa, a nie ołówka. Brzeg kalafiorowy:
 // odległość zaburzona gładkim szumem komórkowym 3D w przestrzeni widoku (z × przewyższenie) – okrągłe guzy ~¼ boku, bez
@@ -377,7 +375,7 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
     // promień wyszedł dnem domeny (płaski teren na poziomie morza)
     if (!hit && T > 0.01) {
       let pe = ro + rd * tmax;
-      if (pe.z <= 0.0) { hit = true; tg = tmax - (pe.z + 20.0) / min(rd.z, -1e-6) * 0.0; tg = (0.0 - ro.z) / min(rd.z, -1e-6); }
+      if (pe.z <= 0.0) { hit = true; tg = -ro.z / min(rd.z, -1e-6); }
     }
     // światło chmur zebrane po drodze – mgiełka przed chmurami do ich średniej głębi (ważonej wkładem), osobno od tła za nimi
     // (jedna „głębia piksela” skakała na brzegach chmur z losowym przesunięciem startu promienia – ziarniste brzegi)

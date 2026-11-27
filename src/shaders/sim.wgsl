@@ -9,6 +9,7 @@
 //   → cg_init (r = D − Aφ) → prekondycjoner [fft_x → fft_y → tridiag → ifft_y → ifft_x] (z = M⁻¹ r) → cg_rz
 //   → płasko: phi_add (φ += z)   z terenem: iteracje CG
 //   → project (state w miejscu)
+// Tryb lekki (?lite=1): cumulus (tylko diagnostyka) → lite_storm → lite_col → surface → route
 // Duża skala (model synoptyczny albo stała masa powietrza) wchodzi przez pola docelowe (bufor tgt):
 //   advect dodaje zmianę pola docelowego wzdłuż trajektorii cząstki, lbc_apply przyciąga brzegi
 //   (strefa relaksacji Daviesa) i swobodną atmosferę do pola docelowego.
@@ -22,12 +23,12 @@ struct Params {
   noiseAmp: f32,     // amplituda szumu θ' w najniższej warstwie [K / krok]
   dampStart: f32,    // początek warstwy tłumiącej [m]
   dampTau: f32,      // skala czasowa tłumienia [s]
-  ugeo: f32,         // wiatr geostroficzny [m/s]
-  vgeo: f32,
-  fcor: f32,         // parametr Coriolisa f = 2Ω sin φ
-  sunX: f32,         // kierunek do słońca (x = wschód, y = północ, z = pion)
-  sunY: f32,
-  sunZ: f32,
+  ugeo: f32,         // (nieużywane – wiatr i Coriolis z pól docelowych i fcorAt; miejsce w układzie bufora, main.js je wypełnia)
+  vgeo: f32,         // (nieużywane)
+  fcor: f32,         // (nieużywane)
+  sunX: f32,         // (nieużywane – słońce w każdym oczku: sunAt)
+  sunY: f32,         // (nieużywane)
+  sunZ: f32,         // (nieużywane)
   s0: f32,           // stała słoneczna [W/m²]
   sliceZ: f32,       // wysokość przekroju poziomego [m] (statystyki do skali kolorów)
   viewTop: f32,      // górna granica przekroju pionowego [m]
@@ -73,13 +74,13 @@ fn fcorAt(j: i32) -> f32 { return 1.4584e-4 * sin(latAt(j)); }
 
 @group(0) @binding(0) var<uniform> P: Params;
 @group(0) @binding(1) var<storage, read> vg: array<f32>;            // profile bazowe, cos/sin, teren
-@group(0) @binding(2) var<storage, read_write> state: array<f32>;   // u, v, w, θ', q_v, q_c, q_r (stan n)
+@group(0) @binding(2) var<storage, read_write> state: array<f32>;   // u, v, w, θ', q_v, q_c, q_i, q_r, N_r (stan n)
 @group(0) @binding(3) var<storage, read_write> tmp: array<f32>;     // stan po adwekcji i wymuszeniach
 @group(0) @binding(4) var<storage, read_write> work: array<f32>;    // φ | r | z | p | Ap | sumy | skalary | średnie
 @group(0) @binding(5) var<storage, read_write> cx: array<vec2f>;    // [0,N): K lub widmo A, [N,2N): widmo B
 @group(0) @binding(6) var<storage, read_write> stats: array<atomic<u32>>;
 @group(0) @binding(7) var<storage, read_write> sfc: array<f32>;     // pola przy powierzchni (S_* · NXY + kolumna)
-@group(0) @binding(8) var<storage, read_write> tgt: array<f32>;     // pola docelowe: 2 terminy × (θ', q_v, u, v, u_g, v_g, p)
+@group(0) @binding(8) var<storage, read_write> tgt: array<f32>;     // pola docelowe: 3 terminy (sloty TG_SLOT: θ', q_v, u, v + pola przy gruncie) i za nimi Φ frontów
 
 fn ldb(b: u32, i: u32) -> f32 { return state[i]; }
 
@@ -165,7 +166,7 @@ fn tPhase(col: u32, kb: u32, th0: f32, th1: f32) -> f32 {
 
 // ======================= Powierzchnia =======================
 // Promieniowanie: krótkofalowe ze słońca (masa optyczna, nachylenie stoku, przepuszczalność chmur),
-// długofalowe z atmosfery (Brutsaert + chmury) i z gruntu. Wymiana gruntu z powietrzem: Louis (1979)
+// długofalowe z atmosfery (Prata + chmury) i z gruntu. Wymiana gruntu z powietrzem: Louis (1979)
 // z liczby Richardsona. Gleba: force-restore (Deardorff 1978) i "wiadro" wody.
 const SIGMA: f32 = 5.67e-8;
 const TAU1: f32 = 86400.0;
@@ -319,6 +320,7 @@ fn surface(@builtin(global_invocation_id) gid: vec3u) {
     var gr = 0.0;
     var mk = 0.0;
     var ub = 0.0;
+    var wgr = 0.0;
     let bw = array<f32, 5>(1.0, 4.0, 6.0, 4.0, 1.0);
     for (var dj = -2; dj <= 2; dj++) {
       for (var di = -2; di <= 2; di++) {
@@ -327,10 +329,13 @@ fn surface(@builtin(global_invocation_id) gid: vec3u) {
         let q = vegPar(vn, w, tdg, pd);
         let wt = bw[di + 2] * bw[dj + 2];
         ws += wt; aa += wt * q.alb; gc += wt / max(q.rs, 1.0); cc2 += wt * q.ct; lz += wt * q.lz0;
-        gr += wt * q.green; mk += wt * q.mask; ub += wt * q.urb;
+        mk += wt * q.mask; ub += wt * q.urb;
+        // zieleń bez zabudowy: jej stała zieleń 0.2 nie ma fenologii – w średniej obniżała zieleń lasów i pól obok miast,
+        // które jesienią żółkły przez to wcześniej niż reszta
+        if (vn != 9u) { gr += wt * q.green; wgr += wt; }
       }
     }
-    vp = VegP(aa / ws, ws / gc, cc2 / ws, lz / ws, gr / ws, mk / ws, ub / ws);
+    vp = VegP(aa / ws, ws / gc, cc2 / ws, lz / ws, select(vp.green, gr / max(wgr, 1e-6), wgr > 0.0), mk / ws, ub / ws);
   }
   let green = vp.green;
   let rsmin = vp.rs;
@@ -356,18 +361,12 @@ fn surface(@builtin(global_invocation_id) gid: vec3u) {
   ct = select(mix(ct, 5.0e-5, fsn), 0.0, water);                    // śnieg: mała bezwładność cieplna
   if (frozen) { ct = mix(1.5e-5, 3.0e-5, fsn); }                   // lód: cienka warstwa powierzchniowa
 
-  // woda i lód w kolumnie → grubość optyczna chmur. Równoważna woda chmurowa: lód (większe
-  // kryształki) liczy się ~0.36×, opad ~0.2× (duże krople)
-  // Przy okazji: promieniowanie zwrotne chmur z ich własnej temperatury (od dołu – każda warstwa
-  // świeci z emisyjnością 1 − exp(−0.05·LWP) i zasłania wyższe) – zimny cirrus grzeje noc dużo słabiej
-  // niż niski stratus; wcześniej każda chmura świeciła jak powietrze przy gruncie (ciepłe noce)
-  // oraz woda w piętrach: niskie < 2 km, średnie 2–6 km, wysokie > 6 km nad gruntem
   // Chmury z jednego opisu (cloudAt w common.wgsl – ten sam w widoku 3D, na obrazie satelitarnym i przekroju):
-  // „woda równoważna” warstwy (ekstynkcja / 150, w tym chmury podsiatkowe i konwekcji parametryzowanej),
+  // „woda równoważna” warstwy (ekstynkcja / 150, w tym chmury konwekcji parametryzowanej),
   // zachmurzenie ogólne z nakładania warstw (maksymalno-losowe: sąsiednie warstwy chmur nakładają się,
   // rozdzielone – losowo), promieniowanie zwrotne chmur z ich temperatury (od dołu – każda warstwa świeci
-  // z emisyjnością 1 − exp(−50·LWP) i zasłania wyższe) i woda w piętrach: niskie < 2 km, średnie 2–6 km,
-  // wysokie > 6 km nad gruntem
+  // z emisyjnością 1 − exp(−50·LWP [kg/m²]) i zasłania wyższe: zimny cirrus grzeje noc dużo słabiej niż niski stratus)
+  // i woda w piętrach: niskie < 2 km, średnie 2–6 km, wysokie > 6 km nad gruntem
   var lwp = 0.0;
   var trc = 1.0;
   var cl4 = 0.0;
@@ -392,12 +391,10 @@ fn surface(@builtin(global_invocation_id) gid: vec3u) {
     let cc = k * NXY + col;
     let rk = vg[VG_RC + k];
     let tk = (vg[VG_TC + k] + state[T_OFF + cc]) * vg[VG_EXC + k];
-    let qvk = max(state[QV_OFF + cc], 0.0);
-    let pk = vg[VG_PRS + k];
     let zk = vg[VG_ZC + k];
     let zg = zk - zgC(col);
     let wk = 0.5 * (state[W_OFF + cc] + state[W_OFF + cc + NXY]);
-    let cl = cloudAt(rk, state[QC_OFF + cc], state[QI_OFF + cc], state[QR_OFF + cc], qvk / qsat(tk, pk), qvk / qsat_ice(tk, pk),
+    let cl = cloudAt(rk, state[QC_OFF + cc], state[QI_OFF + cc], state[QR_OFF + cc],
                      tk, zk, convFlag(wk, hPrevC, zg, pblhC, muC, muelC), culc, cubc, cutc);
     let lk = cl.x * cl.y / 150.0 * vg[VG_DZC + k] * select(1.0, vg[VG_HF + col], k == kb);          // [kg/m²] (komórka przy gruncie: część nad gruntem)
     lwp += lk;
@@ -506,8 +503,8 @@ fn surface(@builtin(global_invocation_id) gid: vec3u) {
     if (vg[VG_ZC + k] - zgC(col) > 500.0) { break; }
     tup = max(tup, (vg[VG_TC + k] + state[T_OFF + k * NXY + col]) * vg[VG_EXC + k]);
   }
-  // tylko część nadwyżki ciepła warstwy powyżej (30%) – Brutsaert z temperatury przy gruncie jest już
-  // dopasowany do typowych profili; pełna średnia dawała latem za słabe nocne wychłodzenie (ciepła
+  // tylko część nadwyżki ciepła warstwy powyżej (30%) – emisyjność nieba z temperatury przy gruncie jest już
+  // dopasowana do typowych profili; pełna średnia dawała latem za słabe nocne wychłodzenie (ciepła
   // warstwa resztkowa), a 0 – zbyt mroźne mrozowiska
   let tsky = t1 + 0.3 * max(tup - t1, 0.0);
   // niebo czyste z warstwy przyziemnej + chmury w „oknie” (1 − ε_czyste) z temperatury chmur
@@ -751,8 +748,8 @@ fn surface(@builtin(global_invocation_id) gid: vec3u) {
   // z góry; każda warstwa chmury pochłania/emituje z emisyjnością 1 − exp(−0.13·LWP[g/m²])
   // Kanał pary wodnej (6.2 µm): para pochłania silnie (κ ≈ 6 m²/kg) – widać wilgotność górnej i środkowej
   // troposfery (ciemno = sucho, osiadanie; jasno = wilgotno, chmury wysokie). Radar: maksymalna
-  // odbiciowość w kolumnie (CMAX): deszcz Z = 3.63e9·(ρq_r)^1.75, śnieg/krupa 2.2e8·(ρq_i)^1.75 [mm⁶/m³],
-  // konwekcja parametryzowana Z = 200·R^1.6.
+  // odbiciowość w kolumnie (CMAX) [mm⁶/m³]: deszcz z rozkładu kropel, opad zamarznięty Z = 3.63e9·(ρq_r)^1.75,
+  // lód chmurowy 2.2e8·(ρq_i)^1.75, konwekcja parametryzowana Z = 200·R^1.6.
   var tr = 1.0;
   var e4 = 0.0;
   var trw = 1.0;
@@ -783,6 +780,11 @@ fn surface(@builtin(global_invocation_id) gid: vec3u) {
     if (qrk > 1e-9) {
       let nrk = nrBound(qrk, state[NR_OFF + cc], rk);
       zr = 720e18 * rk * nrk / pow(clamp(lamR(qrk, nrk), LAM_MIN, LAM_MAX), 6.0);
+      // najwyżej 4× (+6 dB) odbiciowości rozkładu Marshalla–Palmera o tej samej masie: przy śladzie wody (resztki po deszczu,
+      // szum adwekcji q_r i N_r osobno) liczba kropel ~0 dawała kilka kropel 2.8 mm – 1e-8 kg/kg → ~17 dBZ, szum echa
+      // w oczkach, gdzie nic nie pada (użytkownik: kropki na radarze przy dużym CAPE); duże krople ulew mieszczą się w +6 dB
+      let lmp = pow(PI * RHOW * 8e6 / (rk * qrk), 0.25);
+      zr = min(zr, 4.0 * 720e18 * 8e6 * pow(lmp, -7.0));
     }
     let zk = (1.0 - fck) * zr + fck * 3.63e9 * pow(rk * qrk, 1.75) + 2.2e8 * pow(rk * max(state[QI_OFF + cc] - 5e-5, 0.0), 1.75);
     zcol = max(zcol, zk);
@@ -794,9 +796,21 @@ fn surface(@builtin(global_invocation_id) gid: vec3u) {
   e4w += trw * ts * ts * ts * ts;
   sfc[sf(S_TBWV, col)] = sqrt(sqrt(e4w)) - 273.15;
   // (opad schematu dochodzący do gruntu – to samo pole co na mapie opadu; wcześniej PRCUS z jednego oczka: szum i echo tam, gdzie opad wyparował)
-  let zcu = 200.0 * pow(max(sfc[sf(S_PRCG, col)], 0.0), 1.6);
-  sfc[sf(S_DBZ, col)] = 10.0 * log(max(max(zmax, zcu), 0.01)) / log(10.0);
-  sfc[sf(S_DBZC, col)] = 10.0 * log(max(max(zcol, zcu), 0.01)) / log(10.0);   // cała kolumna (CMAX) – struktura burz
+  // Próg: echo schematu dopiero od ~0.1 mm/h, pełne od 0.3 mm/h (≥ ~13 dBZ). Bez progu ślad opadu schematu (0.07–0.1 mm/h, poniżej skali
+  // mapy natężenia) dawał 5–7 dBZ – przy schemacie działającym w każdym oczku z CAPE kropki echa migotały wokół progu skali tam, gdzie
+  // na mapie opadu nic nie ma (użytkownik: „kropki idą za CAPE”)
+  let prg = max(sfc[sf(S_PRCG, col)], 0.0);
+  let zcu = 200.0 * pow(prg, 1.6) * smoothstep(0.1, 0.3, prg);
+  // Słabe echo tylko tam, gdzie opad dochodzi do gruntu (PR z poprzedniego kroku: siatka + schemat, ≥ ~0.05 mm/h; mapa natężenia od 0.1).
+  // Śnieg i mżawka 0.01–0.1 mm/h w powietrzu (lekki śnieg opada ~1 m/s – 5× więcej wody w powietrzu niż deszcz) dają 5–15 dBZ, a na mapie
+  // opadu nic – użytkownik: plamy echa pod pojedynczymi cumulusami, „tam nic nie pada”. Silne echo (≥ 20–30 dBZ) zostaje i bez opadu przy
+  // gruncie – rdzeń burzy widać, zanim deszcz spadnie
+  let gpr = smoothstep(0.03, 0.08, max(sfc[sf(S_PR, col)], 0.0));
+  let zm = max(zmax, zcu);
+  let zc = max(zcol, zcu);
+  // (najwyżej −15 dB, nie do zera: twarde cięcie oczko po oczku rysowało na mapie brzegi echa wzdłuż siatki – użytkownik)
+  sfc[sf(S_DBZ, col)] = 10.0 * log(max(zm * max(max(gpr, 0.03), smoothstep(100.0, 1000.0, zm)), 0.01)) / log(10.0);
+  sfc[sf(S_DBZC, col)] = 10.0 * log(max(zc * max(max(gpr, 0.03), smoothstep(100.0, 1000.0, zc)), 0.01)) / log(10.0);   // cała kolumna (CMAX) – struktura burz
 
   // Wysokość warstwy granicznej i skala prędkości dla K-profilu (siatki mezoskalowe):
   // liczba Richardsona względem cząstki z powierzchni (z nadwyżką temperatury przy konwekcji)
@@ -1023,10 +1037,11 @@ fn airAt(X: f32, Y: f32) -> Air {
              parAt(21u, X, Y), parAt(22u, X, Y), parAt(23u, X, Y), parAt(24u, X, Y));
 }
 
-// Korekta klimatu (metoda delta, main.js cc*): w węzłach co ≤ 600 km (CCNX × CCNY, bufor vg CCG) średnia różnica dane − model
-// synoptyczny na 0 / 1.5 / 3 / 5.6 km n.p.m. i mnożnik wilgotności przy gruncie; dwuliniowo między węzłami (X, Y – położenie w
-// oczkach siatki), liniowo z wysokością, powyżej 5.6 km stała do tropopauzy, nad nią zanika jak anomalia z suwaka. Model synoptyczny
-// ma za zimną troposferę (Kraków: −5…−9 K na 850–500 hPa, −2…−6 K przy gruncie) i za stromy gradient grunt–850 hPa
+// Korekta klimatu (metoda delta, main.js cc*): w węzłach co ≤ 600 km (CCNX × CCNY, bufor vg CCG, 8 liczb na węzeł) średnia różnica
+// dane − model synoptyczny na 0 / 1.5 / 3 / 5.6 km n.p.m. (0–3), wykładnik wilgotności przy gruncie (4), mnożniki wilgotności 850 i 700 hPa
+// (5, 6) i mnożnik opadu (7; tryb lekki – norma opadu); dwuliniowo między węzłami (X, Y – położenie w oczkach siatki), temperatura liniowo
+// z wysokością, powyżej 5.6 km stała do tropopauzy, nad nią zanika jak anomalia z suwaka. Zabiera stały i sezonowy błąd modelu
+// synoptycznego (średnia z osobnej kopii modelu – CLAUDE.md, sekcja 10)
 fn ccBil(X: f32, Y: f32, k: u32) -> f32 {
   let fx = clamp(X / f32(NXV) * f32(CCNX) - 0.5, 0.0, f32(CCNX - 1u));
   let fy = clamp(Y / f32(NYV) * f32(CCNY) - 0.5, 0.0, f32(CCNY - 1u));
@@ -1202,7 +1217,8 @@ fn tcPar(n: u32) -> TcPar {
   t.sz = tcSize(vg[o + 23u]);
   t.B = clamp(TCB0 + 0.4 + 0.009 * t.dp, 1.6, 2.7);
   let vmx = sqrt(TC_FI * t.B * t.dp * 100.0 / (1.15 * 2.71828));
-  t.rm = clamp(46400.0 * exp(-0.0155 * vmx + 0.0169 * lat) * sqrt(t.sz), max(2.5 * max(DX, DY), 12000.0), 100000.0);
+  // (Willoughby i in. 2006 – szerokość bez znaku: na półkuli S ujemna dawała promień o ~40% mniejszy przy 15°S)
+  t.rm = clamp(46400.0 * exp(-0.0155 * vmx + 0.0169 * abs(lat)) * sqrt(t.sz), max(2.5 * max(DX, DY), 12000.0), 100000.0);
   t.ro = max(TC_RO * t.sz, 2.5 * t.rm);
   let rr = tcR12(t.sz);
   t.r1 = rr.x;
@@ -1498,7 +1514,8 @@ fn tgt_build(@builtin(global_invocation_id) gid: vec3u) {
   tgt[base + 4u * N + 3u * NXY + col] = wls;     // ruch pionowy dużej skali ~3 km [m/s]
   // geometria frontu (pola 4…11 przy gruncie terminu): kierunek do zimnego powietrza (2), położenie osi względem kolumny wzdłuż
   // tego kierunku [m], połowa szerokości gładkiej strefy D [m], połowa szerokości ostrego stopnia L [m], nachylenie powierzchni
-  // frontowej [m poziomo na m pionowo], waga 0…1, rodzaj (−1 ciepły, 0 stacjonarny, 1 chłodny łagodny … 2 chłodny ostry)
+  // frontowej [m poziomo na m pionowo], waga 0…1, rodzaj (−1 ciepły, 0 stacjonarny, 1 chłodny łagodny … 2 chłodny ostry);
+  // pola 12…14 – diagnostyka wykrywania: gradient [K/100 km], skupienie, kontrast [K]
   var geo = array<f32, 11>(0.0, 0.0, 0.0, 1.0, 1.0, 100.0, 0.0, 0.0, 0.0, 0.0, 0.0);
   if (NE == 0u || (col % NX < NXV && col / NX < NYV)) {
     let e = f32(GS);
@@ -1593,8 +1610,11 @@ fn tgt_build(@builtin(global_invocation_id) gid: vec3u) {
       }
       let Dz = max(D0, 1.5 * L);
       let bend = clamp((uhere - umean) * 7200.0, -min(50000.0, 0.6 * Dz), min(50000.0, 0.6 * Dz));
+      // rodzaj: stacjonarny 0 – między ciepłym (−1) a chłodnym (1…2), więc przejścia (słaby napływ zimna albo ciepła) są odcieniem
+      // stacjonarnego. Dawniej stacjonarny −2: przejście stacjonarny → chłodny szło przez zakres frontu ciepłego, a na mapie brzegi
+      // linii frontu stacjonarnego (rodzaj × waga × bliskość osi) wypadały w zakresie ciepłego – czerwone obrzeża fioletowej linii
       geo = array<f32, 11>(n.x, n.y, sAx + bend, Dz, L, mix(mix(mix(100.0, 200.0, max(ww, st)), 50.0, sh), 200.0, st * (1.0 - sh)), wf,
-                           cw * (1.0 + sh) - ww - 2.0 * st, gmax * 1e5, fness, dT);
+                           cw * (1.0 + sh) - ww, gmax * 1e5, fness, dT);
     }
   }
   for (var g = 0u; g < 11u; g++) { tgt[base + 4u * N + (4u + g) * NXY + col] = geo[g]; }
@@ -1636,7 +1656,7 @@ fn phBil(par: u32, f: u32, X: f32, Y: f32, k: u32) -> f32 {
 }
 
 // Wyostrzenie frontów Φ w chwili t + Δt (waga P.ta1) → bufor parzystości (P.step + 1) & 1 (bufor P.step & 1 ma Φ(t)).
-// Przy gruncie pole FRT – oś frontu na mapie (rodzaj × waga × bliskość osi).
+// Przy gruncie oś frontu na mapie: FRI – siła (waga × bliskość osi), FRT – rodzaj × siła (mapa „Fronty”: rodzaj = FRT / FRI).
 @compute @workgroup_size(WG)
 fn front_phi(@builtin(global_invocation_id) gid: vec3u, @builtin(num_workgroups) nwg: vec3u) {
   let id = lin_id(gid, nwg);
@@ -1676,7 +1696,9 @@ fn front_phi(@builtin(global_invocation_id) gid: vec3u, @builtin(num_workgroups)
   tgt[frPhi(par, 3u) + id] = pv;
   if (k == 0u) {
     let wd = max(1.5 * DX, min(0.3 * g.L, 12000.0));
-    sfc[sf(S_FRT, col)] = g.w * exp(-(g.s / wd) * (g.s / wd)) * g.typ;
+    let fi = g.w * exp(-(g.s / wd) * (g.s / wd));
+    sfc[sf(S_FRI, col)] = fi;
+    sfc[sf(S_FRT, col)] = fi * g.typ;
   }
 }
 
@@ -1965,15 +1987,15 @@ fn lbc_apply(@builtin(global_invocation_id) gid: vec3u) {
       tmp[QV_OFF + l] = max(tmp[QV_OFF + l] + fz * psQ, 0.0);
     }
     let rn = min(P.dt * P.nudge * smoothstep(2000.0, 4000.0, zagl), 1.0);
-    // jądro cyklonu tropikalnego: odchyłka wiatru przyciągana do celu (τ 1 h) – siłę cyklonu trzyma model synoptyczny (kategoria, potem warunki); bez tego
-    // domena rozkręcała wir ponad cel o 15–25 m/s (Cat 1: U10 ~60 m/s przy ~45 m/s w celu). θ' tylko słabo (τ 12 h): przy τ 2 h ciepło kondensacji
+    // jądro cyklonu tropikalnego: odchyłka wiatru przyciągana do celu (τ 1 h / TCN, domyślnie ~3.3 h) – siłę cyklonu trzyma model synoptyczny (kategoria, potem warunki); bez tego
+    // domena rozkręcała wir ponad cel o 15–25 m/s (Cat 1: U10 ~60 m/s przy ~45 m/s w celu). θ' tylko słabo (τ 12 h / TCN, ~40 h): przy τ 2 h ciepło kondensacji
     // znikało, zanim prąd wstępujący doszedł do górnej troposfery – ściana oka bez opadu, chmury do ~6 km. Ciśnienie na mapie w jądrze z celu (PSL)
     let rtc = TCN * tcCoreW(f32(i) + 0.5, f32(j) + 0.5) * P.dt / 3600.0;
     let pb = 1.0 - smoothstep(f32(MEB) - 5.0, f32(MEB), f32(m));
     // wyostrzenie frontów (część celu θ' – do limitu nasycenia pary)
     var phT = 0.0;
     if (k < KFR) { phT = phAt((P.step + 1u) & 1u, 0u, l); }
-    // dryf ciepła warstwy granicznej względem dużej skali usuwany powoli w całej domenie (τ = 2 doby),
+    // dryf ciepła warstwy granicznej względem dużej skali usuwany w całej domenie (τ = 6 h, niżej),
     // bez zmiany struktury poziomej i cyklu dobowego
     // próg liczony od średniej dobowej dużej skali (+0.5 K): cel przy gruncie to profil popołudniowy,
     // więc próg +1 K od celu pozwalał domenie stać ~3.5 K ponad średnią (ciepłe noce, upał)
@@ -2054,7 +2076,7 @@ fn lbc_apply(@builtin(global_invocation_id) gid: vec3u) {
         var e = 0.0;
         if (m < MEB) {
           e = pb * work[W_EB + f * MEB + m];
-          // θ: nadwyżka średniej dobowej ponad +1 K to dryf (np. upał narastający z dnia na dzień przy
+          // θ: odchyłka średniej dobowej poza tolerancją (thrW, thrC) to dryf (np. upał narastający z dnia na dzień przy
           // wysychającej glebie) – napływ przez brzeg go nie powtarza
           if (f == 0u) { e -= pb * dexc; }
           if (f == 1u) {
@@ -2650,7 +2672,7 @@ fn diffuse(@builtin(global_invocation_id) gid: vec3u) {
     }
     if (f == 2u) {
       // Wyporność względem stanu dużej skali (pola docelowego): b = g [(θ' − θ'_d)/θ0 + 0.61 (q_v − q_v,d)
-      // − q_c − q_r] na poziomie w. Duża skala jest w równowadze hydrostatycznej i geostroficznej
+      // − q_c − q_i − q_r] na poziomie w. Duża skala jest w równowadze hydrostatycznej i geostroficznej
       // z wiatrem docelowym (model synoptyczny), więc jej gradient temperatury nie może drugi raz
       // napędzać przepływu przez ciśnienie z solvera (przy sztywnym wieku dawało to fałszywy wiatr
       // przy gruncie rzędu połowy wiatru termicznego).
@@ -2741,14 +2763,14 @@ fn diffuse(@builtin(global_invocation_id) gid: vec3u) {
   }
 }
 
-// ======================= Mikrofizyka: ciepły deszcz (Kessler) + uproszczona faza lodowa =======================
-// Pola: q_c – woda chmurowa (może być przechłodzona do −38 °C), q_i – lód chmurowy, q_r – opad
-// (deszcz albo śnieg zależnie od temperatury warstwy).
-// Procesy: autokonwersja i akrecja (Kessler), zamarzanie kropel i proces Bergerona, zamarzanie
-// homogeniczne poniżej −38 °C, depozycja/sublimacja lodu (z nukleacją przy przesyceniu względem
-// lodu – cirrusy), agregacja lodu w śnieg (Lin 1983), zbieranie lodu przez śnieg, parowanie deszczu
-// i sublimacja śniegu (Klemp–Wilhelmson), topnienie przy przejściu śniegu przez 0 °C, opadanie
-// deszczu, śniegu i kryształków lodu.
+// ======================= Mikrofizyka: deszcz dwumomentowy, lód z liczbą kryształków =======================
+// Pola: q_c – woda chmurowa (może być przechłodzona do −38 °C), q_i – lód chmurowy, q_r – opad (deszcz, śnieg i krupa razem,
+// udział śniegu z temperatury warstwy), N_r – liczba cząstek opadu.
+// Procesy: autokonwersja (Khairoutdinov–Kogan) i akrecja (Kessler), samozderzenia i rozpad kropel, zamarzanie kropel na jądrach lodu
+// i wzrost kryształków przez dyfuzję pary (Bergeron), zamarzanie homogeniczne poniżej −38 °C, nukleacja i depozycja / sublimacja lodu
+// (cirrusy), agregacja lodu w śnieg (Lin 1983), zbieranie lodu przez opad, parowanie deszczu (Morrison) i sublimacja śniegu
+// (Klemp–Wilhelmson), topnienie przy przejściu śniegu przez 0 °C, opadanie deszczu, śniegu i kryształków lodu; do tego wciąganie
+// zależne od ścinania i prąd zstępujący pod burzą rozwiązywaną.
 const LF: f32 = 3.34e5;
 const LS: f32 = 2.834e6;
 const RV: f32 = 461.5;
@@ -3118,8 +3140,9 @@ fn micro(@builtin(global_invocation_id) gid: vec3u) {
       finN = foutN;
       if (fin > 0.0 && coldAbove != cold[k]) {
         // śnieg topnieje w cieplejszej warstwie (chłodzenie) albo deszcz zamarza w zimniejszej – ciepło
-        // proporcjonalne do zmiany udziału śniegu
-        thc[k] += (cold[k] - coldAbove) * LF * fin * dts / (m * CP * vg[VG_EXC + k]);
+        // proporcjonalne do zmiany udziału śniegu; masa komórki przy gruncie – tylko część nad gruntem (mlay: z pełną
+        // grubością cienka komórka w górach dostawała hf razy za mało ochłodzenia od topniejącego śniegu)
+        thc[k] += (cold[k] - coldAbove) * LF * fin * dts / (mlay(k, kb, col) * CP * vg[VG_EXC + k]);
       }
       fin = fout;
       coldAbove = cold[k];
@@ -3273,7 +3296,7 @@ fn micro(@builtin(global_invocation_id) gid: vec3u) {
 }
 
 // ======================= Korekta masy wilgoci =======================
-// Adwekcja semi-lagrangeowska nie zachowuje masy dokładnie. Po adwekcji skalujemy q_v, q_c, q_r tak,
+// Adwekcja semi-lagrangeowska nie zachowuje masy dokładnie. Po adwekcji skalujemy q_v, q_c, q_i, q_r tak,
 // żeby całkowita masa każdego składnika w domenie była taka sama jak przed adwekcją
 // (globalna korekta masy, jak w modelach operacyjnych).
 var<workgroup> red6: array<array<f32, 256>, 8>;
@@ -3327,19 +3350,19 @@ fn mass_apply(@builtin(global_invocation_id) gid: vec3u, @builtin(num_workgroups
   tmp[QV_OFF + id] = v;
 }
 
-// ======================= Konwekcja parametryzowana =======================
+// ======================= Konwekcja parametryzowana (CLAUDE.md, sekcja 8) =======================
 // Schemat strumienia masy w duchu Kain–Fritsch / Tiedtke (uproszczony, jedna kolumna), zależny od skali:
-//  • cząstka z warstwy wymieszanej (dolne 500 m); wyzwalanie z zaburzeniem temperatury od wznoszenia na
-//    siatce (zbieżność, fronty: ΔT = 4.64·w^(1/3), jak w KF) i od strumienia ciepła z gruntu (termiki);
-//  • wciąganie otoczenia do chmury (ε = 0.1/km, mieszanie energii statycznej wilgotnej) – mniejsza,
-//    realistyczna energia cząstki;
-//  • głęboka (W_CU, siatki ≥ 2 km; wierzchołek > ~3 km nad podstawą): warstwa chmurowa ogrzewa się w stronę
-//    profilu cząstki (domknięcie CAPE, τ = 40 min), woda z warstwy zasilającej; wydajność opadowa 30–90%
-//    zależna od wilgotności środkowej troposfery – reszta detrainuje (para w górnej części chmury
-//    i kondensat w kowadle); prądy zstępujące: odparowanie opadu w warstwie podchmurowej (zimne
-//    wypływy); opad rozkładany na otoczenie (cu_spread);
-//  • płytka (W_SH, siatki ≥ ~0.5 km; cumulusy do ~3 km, tylko przy grzaniu od gruntu): bez opadu –
-//    przenosi parę z warstwy przy gruncie do warstwy chmurowej (τ = 1 h); ogranicza parność przy gruncie.
+//  • cząstka z warstwy wymieszanej (dolne 500 m); wyzwalanie, gdy energia unoszenia (termiki, fronty podmuchowe kopuł) przewyższa |CIN|,
+//    albo wymuszone wznoszenie na siatce (KF: ΔT = 4.64·w^(1/3));
+//  • wciąganie otoczenia do chmury (ε = 0.1/km, mieszanie energii statycznej wilgotnej) – mniejsza, realistyczna energia cząstki;
+//  • głęboka: strumień masy z mocy unoszenia (ALP) i chmur Planta–Craiga (domyślnie średnia, bez losowania), tendencje × (1 − σ_u)²
+//    (Arakawa–Wu), domknięcie CAPE od ~3 km oczka (τ CCT) i ograniczenie bardzo dużego CAPE; warstwa chmurowa ogrzewa się w stronę profilu
+//    cząstki, woda z warstwy zasilającej; wydajność opadowa 45–95% z wilgotności nad podstawą × siła chmury – reszta detrainuje (para
+//    w górnej części chmury i kondensat w kowadle); prądy zstępujące: odparowanie opadu pod chmurą (kopuły); opad rozkładany na otoczenie,
+//    słaby paruje pod chmurą (cu_spread);
+//  • podniesiona i zimowa (cuMid, wzór ECMWF): chwiejność nad zimną warstwą przy gruncie, przelotny śnieg z lodowych wierzchołków;
+//  • płytka (W_SH, siatki ≥ ~0.5 km; cumulusy do ~3.5 km, przy grzaniu od gruntu): przenosi parę z warstwy przy gruncie do warstwy
+//    chmurowej (τ = 1 h); opad z grubszych chmur na oczkach ≥ ~5 km i z lodowych wierzchołków w chłodnej masie.
 const TAU_CU: f32 = 1200.0;
 const TAU_SH: f32 = 3600.0;
 // ---- Wyzwalanie i domknięcie konwekcji głębokiej (Grandpeix–Lafore 2010, Rio i in. 2009, Kain–Fritsch) ----
@@ -3467,7 +3490,7 @@ fn cuVirga(col: u32, kb: u32, kl: u32, pr0: f32) -> f32 {
   return fl * P.dt;
 }
 const TAU_MID: f32 = 3600.0;
-fn cuMid(col: u32, kb: u32, zg: f32, ks: u32, capes: f32) -> bool {
+fn cuMid(col: u32, kb: u32, zg: f32, ks: u32, capes: f32, cinS: f32) -> bool {
   var hmx = -1.0;
   var ke = kb;
   for (var k = kb; k < NZ; k++) {
@@ -3530,8 +3553,14 @@ fn cuMid(col: u32, kb: u32, zg: f32, ks: u32, capes: f32) -> bool {
   // cząstka stała) albo chłodna masa (podstawa < ~+3 °C) z lodowym wierzchołkiem
   let cold = icy * (1.0 - smoothstep(274.15, 280.15, tbas));
   if (!(ke > ks || capes < 10.0) && cold <= 0.0) { return false; }
+  // Gdzie cząstka z dolnych 500 m ma swobodne CAPE (≥ 100–400 J/kg) przy małym CIN (ta sama cząstka bez wciągania, > −50…−20 J/kg; CIN cząstki KF z wciąganiem przy suchej troposferze jest duży – nie działało), chwiejność nie jest podniesiona –
+  // obsługuje ją droga głęboka; ta droga słabnie płynnie (?mbl=0 – dawniej). Latem w dzień ruszała z wilgotnej warstwy pod podstawą cumulusów
+  // przy kilku cm/s wznoszenia – pasma i plamy słabego opadu przy dużym CAPE (użytkownik, warstwa diagnostyczna 71). Pierwsza wersja (źródło
+  // ≥ 500 m nad warstwą graniczną, gdy H > 20 W/m²) migała: oczka z opadem miały H ~5 W/m² (cień własnej chmury) – pada → cień → wolno padać,
+  // słońce → nie wolno („game of life”, test 27 XI). Lodowy wierzchołek w chłodnej masie (cold) bez zmian
+  let sbFree = select(0.0, smoothstep(100.0, 400.0, capes) * smoothstep(-50.0, -20.0, cinS) * (1.0 - cold), MBL > 0.0);
   let act = smoothstep(mix(50.0, 15.0, icy), mix(300.0, 80.0, icy), cape) * smoothstep(mix(2000.0, 1000.0, icy), mix(4000.0, 2000.0, icy), depth)
-          * smoothstep(0.75, 0.9, rhe) * lift * smoothstep(-40.0, -10.0, cin);
+          * smoothstep(0.75, 0.9, rhe) * lift * smoothstep(-40.0, -10.0, cin) * (1.0 - sbFree);
   let sig = clamp(PI * 1200.0 * 1200.0 / (DX * DY), 0.0, 1.0);
   let fr = min(act * (1.0 - sig) * (1.0 - sig) * P.dt / TAU_MID, 0.5);
   if (fr <= 1e-6) { return false; }
@@ -3561,15 +3590,23 @@ fn cuMid(col: u32, kb: u32, zg: f32, ks: u32, capes: f32) -> bool {
   }
   // wydajność opadowa z wilgotności w chmurze (jak schemat głęboki); lodowy wierzchołek – co najmniej 70%
   let eff = max(clamp(0.45 + 0.5 * rs / f32(kt - kl + 1u), 0.45, 0.95), 0.7 * icy);
-  let prc = eff * pw;
-  // reszta wody: para w górnej połowie chmury (z ochłodzeniem), kondensat u wierzchołka (lód poniżej −20 °C)
+  // Przy ciepłej podstawie (≥ ~+2…+6 °C) na siatkach ≤ 10 km (zanika do 15 km) ta droga nie pada (MRN, ?mrn=0 – dawniej): dalej ogrzewa
+  // i osusza warstwę źródłową (zdejmuje chwiejność), a woda zostaje jako para. Zapis użytkownika (lipiec, +10 K, 18:16): 751 z 880 oczek
+  // z opadem schematu ≥ 0.1 mm/h to ta droga – bez chmury nad źródłem (RH 85–91% na ~1 km, wyżej 40–45%, w ~0, LIFT < 150 m w połowie
+  // oczek) albo w warstwie już nasyconej, w której pada siatka (drugi opad z tej samej wilgoci). Przy oczkach ≤ 10 km wznoszenie
+  // mezoskalowe i nasycone warstwy liczy siatka; zimowe chmury z zimną podstawą i lodowym wierzchołkiem (przelotny śnieg) bez zmian
+  let wRnM = MRN * smoothstep(275.15, 279.15, tbas) * (1.0 - smoothstep(10000.0, 15000.0, DX));
+  let prc = eff * pw * (1.0 - wRnM);
+  // reszta wody: para w górnej połowie chmury (z ochłodzeniem), kondensat u wierzchołka (lód poniżej −20 °C) – ten tylko z chmury, która pada
+  // (jak kowadła drogi głębokiej, ANV: chmura bez opadu nie dostarcza lodu, który rysuje się na całe oczko)
   let det = pw - prc;
+  let fcd = 0.4 * (1.0 - wRnM);
   let km = (kl + kt) / 2u;
   var mu = 0.0;
   for (var k = km; k <= kt; k++) { mu += vg[VG_RC + k] * vg[VG_DZC + k]; }
   for (var k = km; k <= kt; k++) {
     let c = k * NXY + col;
-    let dq = 0.6 * det / mu;
+    let dq = (1.0 - fcd) * det / mu;
     state[QV_OFF + c] += dq;
     state[T_OFF + c] -= LV * dq / (CP * vg[VG_EXC + k]);
   }
@@ -3579,7 +3616,7 @@ fn cuMid(col: u32, kb: u32, zg: f32, ks: u32, capes: f32) -> bool {
   for (var k = ka; k <= kt; k++) {
     let c = k * NXY + col;
     let te = (vg[VG_TC + k] + state[T_OFF + c]) * vg[VG_EXC + k];
-    if (te < 253.15) { state[QI_OFF + c] += 0.4 * det / ma; } else { state[QC_OFF + c] += 0.4 * det / ma; }
+    if (te < 253.15) { state[QI_OFF + c] += fcd * det / ma; } else { state[QC_OFF + c] += fcd * det / ma; }
   }
   sfc[sf(S_PRK, col)] = 2.0;
   sfc[sf(S_PRCU, col)] = cuVirga(col, kb, kl, prc) / P.dt * 3600.0;
@@ -3603,7 +3640,7 @@ fn cumulus(@builtin(global_invocation_id) gid: vec3u) {
   stormParams(i, j, col, kb);
   sfc[sf(S_CUBASE, col)] = 0.0;
   sfc[sf(S_PRCU, col)] = 0.0;
-  sfc[sf(S_PRK, col)] = 0.0;
+  // (PRK bez zerowania: droga ostatniego opadu schematu w oczku – mapa diagnostyczna 71 pokazuje ją tam, gdzie opad schematu dochodzi do gruntu)
   sfc[sf(S_CUL, col)] = 0.0;
   sfc[sf(S_WKSRC, col)] = 0.0;
   sfc[sf(S_SHACT, col)] = 0.0;
@@ -3654,6 +3691,8 @@ fn cumulus(@builtin(global_invocation_id) gid: vec3u) {
   let qps = mq / mm;
   var sats = false;
   var capes = 0.0;
+  var cins = 0.0;          // CIN tej cząstki (ujemna wyporność poniżej pierwszej dodatniej) – do konwekcji podniesionej (cuMid)
+  var lfcs = false;
   // (cząstka rozpręża się do ciśnienia otoczenia: między tymi samymi poziomami ciśnienia jej droga to dz·T_cząstki/T_otoczenia. Bez tego CAPE mapy ~15% za duże wobec adiabaty w układzie ciśnienia, sekcja 13)
   var tep = (vg[VG_TC + ks] + state[T_OFF + ks * NXY + col]) * vg[VG_EXC + ks];
   for (var k = ks + 1u; k < NZ; k++) {
@@ -3674,7 +3713,7 @@ fn cumulus(@builtin(global_invocation_id) gid: vec3u) {
     let te = (vg[VG_TC + k] + state[T_OFF + c]) * vg[VG_EXC + k];
     let qe = max(state[QV_OFF + c], 0.0);
     let b = (tps * (1.0 + 0.61 * select(qps, qsat(tps, p), sats)) - te * (1.0 + 0.61 * qe)) / te;
-    if (sats && b > 0.0) { capes += G * b * dz; }
+    if (sats && b > 0.0) { capes += G * b * dz; lfcs = true; } else if (!lfcs && b < 0.0) { cins += G * b * dz; }
     tep = te;
   }
   for (var k = ks + 1u; k < NZ; k++) {
@@ -3754,9 +3793,14 @@ fn cumulus(@builtin(global_invocation_id) gid: vec3u) {
       if (tq < 190.0) { break; }
     }
     sfc[sf(S_MUCAPE, col)] = max(mu, capes);
+    // do map: wygładzone w czasie (τ 15 min) – chwilowe CAPE oczka skacze co krok (termiki w warstwie 0–500 m, poziom kondensacji
+    // przechodzący przez poziom siatki, schemat zdejmujący CAPE), więc mapa migotała (użytkownik); fizyka czyta wartości chwilowe
+    let fcs = min(P.dt / 900.0, 1.0);
+    sfc[sf(S_CAPES, col)] += fcs * (capes - sfc[sf(S_CAPES, col)]);
+    sfc[sf(S_MUCAPES, col)] += fcs * (max(mu, capes) - sfc[sf(S_MUCAPES, col)]);
     sfc[sf(S_MUEL, col)] = muTop;   // wierzchołek dodatniej wyporności cząstki MU nad gruntem (rodzaj chmur – convFlag)
   }
-  if (klcl >= NZ) { sfc[sf(S_CUM, col)] *= exp(-5.0 * P.dt / T_LIFE); _ = cuMid(col, kb, zg, ks, capes); return; }
+  if (klcl >= NZ) { sfc[sf(S_CUM, col)] *= exp(-5.0 * P.dt / T_LIFE); _ = cuMid(col, kb, zg, ks, capes, cins); return; }
   let zb = vg[VG_ZC + klcl];
 
   // ---------- Wyzwalanie i domknięcie (Grandpeix–Lafore 2010; Rio i in. 2009; Kain–Fritsch; Plant–Craig 2008) ----------
@@ -4023,7 +4067,7 @@ fn cumulus(@builtin(global_invocation_id) gid: vec3u) {
   }
 
   // konwekcja podniesiona i zimowa (wzór ECMWF) – gdy schemat głęboki nie działa
-  if (cuMid(col, kb, zg, ks, capes)) { return; }
+  if (cuMid(col, kb, zg, ks, capes, cins)) { return; }
 
   // ---------- konwekcja płytka (cumulusy przy grzaniu od gruntu) ----------
   let kt = select(ktop, kel, ktop == 0u && lfc);
@@ -4307,7 +4351,7 @@ fn org_update(@builtin(global_invocation_id) gid: vec3u) {
   sfc[sf(S_SMODE, col)] = select(0.0, 1.0 + wQm + 2.0 * wSm, o > 2.0 || sfc[sf(S_CUM, col)] > 1e6);
 }
 
-// Opad z konwekcji parametryzowanej rozłożony na otoczenie 5 × 5 oczek (rozkład Gaussa, σ ≈ 1.2 oczka):
+// Opad z konwekcji parametryzowanej rozłożony na otoczenie 3 × 3 oczek (wagi exp(−r²/0.7): 46% w oczku):
 // schemat opisuje chmury rozrzucone w obszarze, a nie jedną kolumnę (inaczej opad w „kwadracikach”)
 @compute @workgroup_size(64)
 fn cu_spread(@builtin(global_invocation_id) gid: vec3u) {
@@ -5009,9 +5053,10 @@ fn level_means(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_inde
 //    bez jego średniej z ~doby (cel ma już ogrzewanie od gruntu modelu synoptycznego, jak HFF) i z powrotem do celu τ 12 h; grubość
 //    warstwy z grzania (dzień ~0.2–1.8 km, noc ~120 m) – cykl dobowy, mrozowiska, inwersje;
 //  – chmury z wilgotności (warstwowe od RH ~85%, bez cumulusów), pokład w strefach opadu;
-//  – opad modelu synoptycznego × mnożnik korekty klimatu × manipulacja, rodzaj z temperatury przy gruncie, krople do radaru.
+//  – opad modelu synoptycznego przeskalowany do oczka i do normy (regulator LRM / LKP) × manipulacja, burze jako obiekty (lite_storm),
+//    rodzaj z temperatury przy gruncie, krople do radaru.
 // Resztę (grunt, śnieg, T i Td 2 m, wiatr 10 m, satelita, radar, widzialność, zjawiska) liczy zwykłe jądro surface – mapy, stacje,
-// CSV i analizy działają bez zmian. Pogoda gładka jak w modelu 75 km: bez pojedynczych burz, wyostrzonych frontów i chmur z siatki.
+// CSV i analizy działają bez zmian. Bez pojedynczych komórek konwekcyjnych z siatki, wyostrzonych frontów i chmur z siatki.
 // tryb lekki: pole przy gruncie s – dwuliniowo w punkcie (X, Y) [oczka; środek oczka i: i + 0.5] i w sąsiednim oczku (przy brzegu – brzeg)
 fn liteBil(s: u32, X: f32, Y: f32) -> f32 {
   let x = clamp(X - 0.5, 0.0, f32(NX) - 1.001);
@@ -5082,16 +5127,17 @@ var<workgroup> lsP: array<f32, 64>;
 var<workgroup> lsQ: array<f32, 64>;
 // budżet opadu burz (za 32 miejscami): 0 – współczynnik kS (liczba narodzin × kS, opad × kS w granicach 0.5…1.2)
 const W_STK: u32 = W_STM + NSTM * 16u;
+// Kandydaci narodzin burz: siatka co 2 oczka w całej liczonej domenie (0…NXV, 0…NYV – widoczna część z marginesem; strefa brzegowa NE leży za NXV, NYV).
+// Wcześniej od oczka NE do NX − NE: przy marginesie MG < NE (domeny < ~160 oczek) pas NE − MG oczek przy zachodnim i południowym brzegu widocznej mapy
+// był bez burz (7.5 km, 96 × 92: ~45 km), a burze płynące na zachód i południe znikały przed brzegiem
+fn liteCand(q: u32) -> vec2u { return vec2u(2u * (q % (NXV / 2u)) + 1u, 2u * (q / (NXV / 2u)) + 1u); }
 // opad konwekcyjny modelu synoptycznego, który zastępują burze [mm/h] w kandydacie q (jak w lite_col)
-fn litePc(q: u32, nxc: u32) -> f32 {
-  let ci = NE + 2u * (q % nxc) + 1u;
-  let cj = NE + 2u * (q / nxc) + 1u;
-  let X = f32(ci) + 0.5;
-  let Y = f32(cj) + 0.5;
-  let fpc = ccBil(X, Y, 7u);
-  let mu = sfc[sf(S_MUCAPE, cj * NX + ci)];
-  return max(parBsp(13u, X, Y), 0.0) * max(clamp(parBsp(14u, X, Y), 0.0, 1.0), smoothstep(500.0, 1500.0, mu)) * smoothstep(300.0, 1000.0, mu)
-         * 1.0 * P.rainF;
+fn litePc(q: u32) -> f32 {
+  let cc = liteCand(q);
+  let X = f32(cc.x) + 0.5;
+  let Y = f32(cc.y) + 0.5;
+  let mu = sfc[sf(S_MUCAPE, cc.y * NX + cc.x)];
+  return max(parBsp(13u, X, Y), 0.0) * max(clamp(parBsp(14u, X, Y), 0.0, 1.0), smoothstep(500.0, 1500.0, mu)) * smoothstep(300.0, 1000.0, mu) * P.rainF;
 }
 fn stmU(seed: u32) -> f32 { return f32(hash(seed)) / 4294967295.0; }
 // szum burzy zmieniający się w czasie (nowe ułożenie co ~40 min wieku burzy, przejście kosinusowe – stała wariancja): rdzenie się odnawiają
@@ -5101,15 +5147,13 @@ fn stNz(x: f32, y: f32, sd: u32, age: f32) -> f32 {
   let f = 1.5708 * fract(tq);
   return 1.6 * (cos(f) * gNz(x, y, sd + 11u * k) + sin(f) * gNz(x, y, sd + 11u * (k + 1u)));   // (szum gradientowy – szum wartości ciął kształty w prostokąty)
 }
-// potencjał narodzin w kandydacie q (siatka co 2 oczka we wnętrzu, bez strefy brzegowej)
-fn litePot(q: u32, nxc: u32) -> f32 {
-  let ci = NE + 2u * (q % nxc) + 1u;
-  let cj = NE + 2u * (q / nxc) + 1u;
-  let c = cj * NX + ci;
-  let X = f32(ci) + 0.5;
-  let Y = f32(cj) + 0.5;
-  let fpc = ccBil(X, Y, 7u);
-  let peC = max(parAt(13u, X, Y), 0.0) * clamp(parAt(14u, X, Y), 0.0, 1.0) * 1.0 * P.rainF;
+// potencjał narodzin w kandydacie q (liteCand)
+fn litePot(q: u32) -> f32 {
+  let cc = liteCand(q);
+  let c = cc.y * NX + cc.x;
+  let X = f32(cc.x) + 0.5;
+  let Y = f32(cc.y) + 0.5;
+  let peC = max(parAt(13u, X, Y), 0.0) * clamp(parAt(14u, X, Y), 0.0, 1.0) * P.rainF;
   let trig = max(max(smoothstep(0.05, 0.6, peC), smoothstep(0.01, 0.05, parAt(11u, X, Y))), 0.6 * smoothstep(100.0, 300.0, sfc[sf(S_H, c)]));
   let lbt = sfc[sf(select(S_LBT, S_LBT2, (P.step & 1u) == 1u), c)];
   var p = smoothstep(300.0, 1500.0, sfc[sf(S_MUCAPE, c)]) * trig * (1.0 - smoothstep(-1.0, -3.0, lbt));
@@ -5145,7 +5189,7 @@ fn lite_storm(@builtin(local_invocation_index) li: u32) {
       y += v.y * dt / DY;
       // w powietrzu bez chwiejności starzeje się 3× szybciej
       age += dt * (1.0 - smoothstep(150.0, 500.0, sfc[sf(S_MUCAPE, c)]));     // (bez chwiejności 2× szybciej – przy 3× wieczorem wszystkie gasły naraz)
-      let gone = x < f32(NE) || x > f32(NX - NE) || y < f32(NE) || y > f32(NY - NE);
+      let gone = x < 0.0 || x > f32(NXV) || y < 0.0 || y > f32(NYV);     // (poza liczoną domeną – w strefie brzegowej)
       if (age >= life || gone) {
         work[b] = 0.0;
         work[b + 12u] = 0.0;
@@ -5163,11 +5207,10 @@ fn lite_storm(@builtin(local_invocation_index) li: u32) {
   // -- narodziny: co termin (30 min) --
   let per = max(u32(1800.0 / dt + 0.5), 1u);
   if (P.step % per != 0u) { return; }
-  let nxc = (NX - 2u * NE) / 2u;
-  let nc = nxc * ((NY - 2u * NE) / 2u);
+  let nc = (NXV / 2u) * (NYV / 2u);
   var sum = 0.0;
   var sq = 0.0;
-  for (var q = li; q < nc; q += 64u) { sum += litePot(q, nxc); sq += litePc(q, nxc); }
+  for (var q = li; q < nc; q += 64u) { sum += litePot(q); sq += litePc(q); }
   lsP[li] = sum;
   lsQ[li] = sq;
   workgroupBarrier();
@@ -5215,21 +5258,21 @@ fn lite_storm(@builtin(local_invocation_index) li: u32) {
     while (t < 63u && tg > lsP[t]) { tg -= lsP[t]; t++; }
     var qc = t;
     var acc = 0.0;
-    for (var q = t; q < nc; q += 64u) { acc += litePot(q, nxc); qc = q; if (acc >= tg) { break; } }
-    if (litePot(qc, nxc) <= 0.0) { continue; }
+    for (var q = t; q < nc; q += 64u) { acc += litePot(q); qc = q; if (acc >= tg) { break; } }
+    if (litePot(qc) <= 0.0) { continue; }
     var s = NSTM;
     for (var k = 0u; k < NSTM; k++) { if (work[W_STM + k * 16u] < 0.5) { s = k; break; } }
     if (s == NSTM) { break; }
-    let ci = NE + 2u * (qc % nxc) + 1u;
-    let cj = NE + 2u * (qc / nxc) + 1u;
+    let cc = liteCand(qc);
+    let ci = cc.x;
+    let cj = cc.y;
     let c = cj * NX + ci;
     let X = f32(ci) + 0.5;
     let Y = f32(cj) + 0.5;
     let mu = sfc[sf(S_MUCAPE, c)];
     let sh = vec2f(sfc[sf(S_SHU, c)], sfc[sf(S_SHV, c)]);
     let shm = length(sh);
-    let fpc = ccBil(X, Y, 7u);
-    let peC = max(parAt(13u, X, Y), 0.0) * clamp(parAt(14u, X, Y), 0.0, 1.0) * 1.0 * P.rainF;
+    let peC = max(parAt(13u, X, Y), 0.0) * clamp(parAt(14u, X, Y), 0.0, 1.0) * P.rainF;
     let u1 = stmU(seed + 1u);
     let u2 = stmU(seed + 2u);
     let u3 = stmU(seed + 3u);
@@ -5424,7 +5467,7 @@ fn lite_col(@builtin(global_invocation_id) gid: vec3u) {
   // mały ułamek opadu, a przy samej części konwekcyjnej budżet burz był znikomy – 0.6 z 23 mm w 15 dobach lipca)
   let muL = sfc[sf(S_MUCAPE, col)];
   let base = max(parBsp(13u, X, Y), 0.0) * (1.0 - max(clamp(parBsp(14u, X, Y), 0.0, 1.0), smoothstep(500.0, 1500.0, muL)) * smoothstep(300.0, 1000.0, muL))
-             * 1.0 * P.rainF;
+             * P.rainF;
   let sP = select(S_LPR, S_LPR2, odd);
   let lpa = liteBil(sP, X - mu6 * dt / DX, Y - mv6 * dt / DY);
   // (nadwyżka ponad opad modelu – pozostałość burz – zanika wolniej, τ 90 min)
@@ -5437,9 +5480,8 @@ fn lite_col(@builtin(global_invocation_id) gid: vec3u) {
   let nT1 = liteFlow(X, Y, lcT, 5400.0, 31u, mu6, mv6);
   let nT2 = liteFlow(0.809 * X - 0.588 * Y, 0.588 * X + 0.809 * Y, 0.4 * lcT, 3600.0, 37u, 0.809 * mu6 - 0.588 * mv6, 0.588 * mu6 + 0.809 * mv6);
   let fTex = clamp(1.0 + 0.2 * nT1 + 0.1 * nT2, 0.55, 1.5);     // (słabsza – sumy opadu gładsze)
-  // Opad do normy (tryb lekki; użytkownik: „przeskaluj ilość opadów”): każde oczko pamięta średni opad bez skalowania z ~30 dób (pole LRM, dwa bufory,
-  // mieszane z sąsiadami 5%/krok – wygładzone na ~100–150 km, więc góry i różnice regionalne zostają), a opad × norma / ta średnia (0.15…1.5).
-  // Norma miesięczna [mm/h] z węzłów korekty klimatu (slot 7 – w trybie lekkim norma zamiast mnożnika z kopii; < 0 – brak normy, bez skalowania).
+  // Opad do normy (tryb lekki; użytkownik: „przeskaluj ilość opadów”): regulator niżej (LRM, kP) ściąga średni opad dużej skali do normy miesięcznej [mm/h]
+  // z węzłów korekty klimatu (slot 7 – w trybie lekkim norma zamiast mnożnika z kopii; < 0 – brak normy, bez skalowania).
   // Wcześniej mnożnik z kopii modelu (norma / średni opad kopii) – zostawiał miesiące po 300 mm (użytkownik)
   // wysokość względem średniej wysokości oczka danych normy (2.5°, węzły korekty – VG_CCE): +60% na 1000 m (×0.5…2.2). Względem średniej terenu ±100 km
   // kotliny w górach (Podhale) wychodziły „nisko” i suche – 288 mm lata na Podhalu przy 388 w centrum (użytkownik)
@@ -5469,7 +5511,7 @@ fn lite_col(@builtin(global_invocation_id) gid: vec3u) {
   let kOut = 0.8 * kP;
   let pr = prRaw * kOut;     // [mm/h]
   // liczniki diagnostyczne trybu lekkiego [mm]: opad modelu bez skalowania (cały, przed zastąpieniem przez burze) i opad burz (rdzenie, po skalowaniu do normy)
-  sfc[sf(S_LPB, col)] += max(parBsp(13u, X, Y), 0.0) * 1.0 * P.rainF * dt / 3600.0;
+  sfc[sf(S_LPB, col)] += max(parBsp(13u, X, Y), 0.0) * P.rainF * dt / 3600.0;
   sfc[sf(S_LPS, col)] += prS * kOut * dt / 3600.0;
   let wPr = smoothstep(0.02, 0.5, pr);
   // -- profil: cel + odchyłka warstwy granicznej, chmury z wilgotności --

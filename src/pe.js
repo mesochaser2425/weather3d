@@ -3,9 +3,10 @@
 // przycięte do terenu (własne miejsce z mapy świata)
 // (shaders/pe.wgsl). Fizyka: promieniowanie krótko- i długofalowe z cyklem dobowym (para wodna, CO₂, chmury),
 // bilans energii lądu (gleba dwuwarstwowa), SST z klimatologii, warstwa graniczna (K-profil), tarcie, kondensacja
-// z opadem i konwekcja Bettsa–Millera; przy ścianach N i S strefy brzegowe z profilem klimatycznym (tropiki /
-// Arktyka za ścianą). Niże, wyże i fronty powstają same z niestabilności baroklinicznej. Nasza domena leży w środku kanału; parametry sondażu dla niej
-// liczy GPU (pe_params) i zapisuje wprost do bufora domeny – bez odczytu na CPU.
+// z opadem i konwekcja Bettsa–Millera; przy ścianach N i S strefy brzegowe z klimatologią średniej strefowej (NCEP), regulatory
+// średniej strefowej i długich fal (CLAUDE.md, sekcja 11). Niże, wyże i fronty powstają same z niestabilności baroklinicznej. Kanał
+// ma stały pas szerokości (bandCenter), domena leży w swoim miejscu kanału (yc); parametry sondażu dla niej liczy GPU (pe_params)
+// i zapisuje wprost do bufora domeny – bez odczytu na CPU.
 
 import { climate } from './climate.js';
 import { zonClimT, zonClimU } from './zonclim.js';
@@ -1095,7 +1096,7 @@ export function classifyCenter(c) {
   const ta = c.tAnom + 1;
   // masa morska: start nad oceanem przy napływie z zachodu albo ≥ 25% drogi nad otwartą wodą (powietrze atlantyckie po 1–2 dobach
   // nad Europą Zachodnią to wciąż PPm – przy progu 35% drogi nad morzem było 43% PPk przy ~20–25% w klimatologii)
-  const westerly = (north ? 1 : 1) * (c.dX ?? 0) < -500e3;
+  const westerly = (c.dX ?? 0) < -500e3;                    // (start trajektorii > 500 km na zachód – na obu półkulach)
   const maritime = open >= 0.25 || ((c.seaO ?? 0) > 0.5 && westerly);
   let key;
   if (a < 23) key = humid ? 'PR' : 'PZk';

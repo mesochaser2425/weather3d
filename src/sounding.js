@@ -454,7 +454,7 @@ function tables(g, R, A, s) {
   put('Mean wind', 675, 183, 'right'); put(`[${unitD('m/s')}]`, 675, 204, 'right', f2);
   [['Sfc - 1 km', A.mw.s1], ['Sfc - 2 km', A.mw.s2], ['1 - 3 km', A.mw.m13], ['Sfc - 6 km', A.mw.s6]].forEach(([n, v], r) => put(`${n}: ${fmtU(v, 'm/s', 1)}`, 675, 234 + 35 * r, 'right'));
   put('Lapse rate', 888, 183, 'right'); put('[K/km]', 888, 204, 'right', f2);
-  [['Sfc - 1 km', A.lr.s1], ['Sfc - 3 km', A.lr.s3], ['3 - 6 km', A.lr.m36], ['500700 hPa', A.lr.lr75]].forEach(([n, v], r) => put(`${n}: ${fmt(v, 1)}`, 862, 234 + 35 * r, 'right'));
+  [['Sfc - 1 km', A.lr.s1], ['Sfc - 3 km', A.lr.s3], ['3 - 6 km', A.lr.m36], ['700 - 500 hPa', A.lr.lr75]].forEach(([n, v], r) => put(`${n}: ${fmt(v, 1)}`, 862, 234 + 35 * r, 'right'));
   // dolne pola
   put(`Precip. water [${unitD('mm')}]:`, 392, 399, 'right'); put(fmtU(A.pw, 'mm'), 400, 399);
   [['2 - 5 km RH [%]', A.rh25, 0], ['Sfc - 2 km RH [%]', A.rh02, 0]].forEach(([n, v, d], r) => { put(`${n}:`, 392, 399 + 37 * (r + 1), 'right'); put(fmt(v, d), 400, 399 + 37 * (r + 1)); });

@@ -7,13 +7,13 @@ import { fetchTerrain, fetchTerrainHi, peakFine, fetchLandCover, fetchCities, ca
 import { PEModel, DTQ, PE_DT, PE_SPI, NXP, NYP, DXP, LXP, LYP, classifyCenter, nestNodes, sstClim } from './pe.js';
 import { parVec, paramGrid, paramAt, airTz, embed } from './nesting.js';
 import { sunVector, dayOfYear, dateFromDoy, moonSky } from './sun.js';
-import { FIELDS, FIELDS_3D, FIELDS_MAP, LAYER_GROUPS, rangeFor, legendCss, RADAR_STEPS, ACC_STEPS, ACC_WGSL, legendTicks, niceStep } from './fields.js';
+import { FIELDS, FIELDS_3D, FIELDS_MAP, LAYER_GROUPS, rangeFor, legendCss, legendTicks, niceStep } from './fields.js';
 import { WXS, WX_CMAP0, WX_WGSL, WX_INDEX, wxTicks, wxColor, wxLegendCss, wxOf } from './wxscales.js';
 const tempColor = (t) => wxColor('temp', t);
 const radarColor = (r) => wxColor('prate', r);
 import { drawProfile, drawMeteogram, newView, attachView, MET_L, MET_R } from './profile.js';
 import { analyzeSounding, renderSounding } from './sounding.js';
-import { createStations } from './stations.js';
+import { createStations, dirName, rhOf } from './stations.js';
 import { toD, fromD, unitD, nD, fm, fT, fdT, fmH, fmZ, fmDx, fmVis, rnd, isImp, setImp, onUnits } from './units.js';
 import { MANIP_RAIN, MANIP_VAR, fmtT, fmtX, nearest, manipQuery, seg, segAt } from './manip.js';
 import { packRun, openRun, jsonPack, jsonUnpack, stashRun, stashedRun, clearStash, resumeUrl } from './runfile.js';
@@ -116,7 +116,7 @@ async function init() {
     return m;
   }
   const simModule = await module(header + commonSrc + simSrc, 'sim');
-  const renderModule = await module(header + commonSrc + ACC_WGSL + WX_WGSL + renderSrc, 'render');
+  const renderModule = await module(header + commonSrc + WX_WGSL + renderSrc, 'render');
 
   // --- Bufory ---
   const U = GPUBufferUsage;
@@ -164,6 +164,18 @@ async function init() {
   const pl = device.createPipelineLayout({ bindGroupLayouts: [simLayout] });
   const pipes = {};
   const pipe = (entryPoint) => (pipes[entryPoint] ??= device.createComputePipeline({ layout: pl, compute: { module: simModule, entryPoint } }));
+  const FFT = fftOk(CFG) && !new URLSearchParams(location.search).has('dft');
+  // Potoki jąder modelu z góry, asynchronicznie: przeglądarka kompiluje je w wątkach roboczych, nie w głównym wątku procesu GPU. Synchronicznie
+  // ~45 kompilacji (największe: konwekcja, mikrofizyka, powierzchnia) szło po kolei w głównym wątku – na zintegrowanych kartach AMD (Radeon Vega,
+  // sterownik 2025) trwało to tak długo, że strażnik Chrome zabijał proces GPU (RESULT_CODE_HUNG, „Instance dropped” w getCompilationInfo).
+  // Tylko jądra używane w tej konfiguracji (nieużywane, np. FFT przy linii z dużym czynnikiem pierwszym, mogłyby się nie skompilować);
+  // pominięte w liście tworzy dalej pipe() – synchronicznie
+  const SIM_ENTRIES = ['surface', 'route', 'front_phi', 'advect', 'mass_sum', 'mass_scale', 'mass_apply', 'lbc_apply', 'turb_k', 'diffuse', 'micro',
+    'cumulus', 'org_update', 'cu_spread', 'cg_init', 'tridiag', 'phi_add', 'project', 'cg_ap', 'cg_alpha', 'cg_xr', 'cg_beta', 'cg_p', 'cg_rz0',
+    'stats_k', 'tgt_build', 'tgt_div', 'tgt_lam', 'tgt_proj', 'init_state', 'level_means', 'mon_day', 'mon_abs',
+    ...(CFG.OPEN ? ['lbc_means'] : []), ...(CFG.DX > 400 ? ['lap4'] : []), ...(CFG.LITE ? ['lite_storm', 'lite_col'] : []),
+    ...(FFT ? ['fft_x', 'fft_y', 'ifft_y', 'ifft_x', 'ifft_xt', 'cg_rz'] : ['dft_x', 'dft_y', 'idft_y', 'idft_z', 'tgt_idx'])];
+  await Promise.all(SIM_ENTRIES.map(async (e) => { pipes[e] = await device.createComputePipelineAsync({ layout: pl, compute: { module: simModule, entryPoint: e } }); }));
 
   const groups = (total, wg = WG) => {
     const g = Math.ceil(total / wg);
@@ -179,8 +191,7 @@ async function init() {
     K('cumulus', NXY, 64), K('org_update', NXY, 64), K('cu_spread', NXY, 64),   // konwekcja parametryzowana (głęboka ≥ 2 km, płytka ≥ 0.5 km); zawsze CAPE
     K('cg_init', N)];
   // prekondycjoner (solver bez terenu): szybka transformata Fouriera w pamięci współdzielonej (linia na grupę),
-  // a gdy długość linii ma czynnik pierwszy > 32 – zwykła DFT (wolniejsza)
-  const FFT = fftOk(CFG) && !new URLSearchParams(location.search).has('dft');
+  // a gdy długość linii ma czynnik pierwszy > 32 – zwykła DFT (wolniejsza; FFT wyżej, przy liście potoków)
   const lines = (e, n) => ({ n: e, p: pipe(e), g: [n, 1] });
   const precond = FFT
     ? [lines('fft_x', NY * NZ), lines('fft_y', NX * NZ), K('tridiag', NXY, 64), lines('ifft_y', NX * NZ), lines('ifft_x', NY * NZ), K('cg_rz', N)]
@@ -228,7 +239,8 @@ async function init() {
       { binding: 8, visibility: F, sampler: { type: 'filtering' } },
     ],
   });
-  const renderPipe = device.createRenderPipeline({
+  // (wszystkie potoki obrazu też asynchronicznie – jak jądra modelu wyżej)
+  const renderPipe = await device.createRenderPipelineAsync({
     layout: device.createPipelineLayout({ bindGroupLayouts: [renderLayout] }),
     vertex: { module: renderModule, entryPoint: 'vs' },
     fragment: { module: renderModule, entryPoint: 'fs', targets: [{ format }] },
@@ -272,21 +284,20 @@ async function init() {
   const volP = buf(32, U.UNIFORM | U.COPY_DST, 'volP');
   const v3U = buf(160 + 2 * 576, U.UNIFORM | U.COPY_DST, 'v3U');
   const sClamp = device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge', addressModeW: 'clamp-to-edge' });
-  const cpipe = (entry) => device.createComputePipeline({ layout: 'auto', compute: { module: volModule, entryPoint: entry } });
-  const pNoise = cpipe('noise_gen'), pGround = cpipe('ground_build'), pVol = cpipe('vol_build'), pLight = cpipe('vol_light');
+  const cpipe = (entry) => device.createComputePipelineAsync({ layout: 'auto', compute: { module: volModule, entryPoint: entry } });
+  const apipe = (entry) => device.createComputePipelineAsync({ layout: 'auto', compute: { module: atmModule, entryPoint: entry } });
+  const rpipe = (module, fs, fmt) => device.createRenderPipelineAsync({ layout: 'auto', vertex: { module, entryPoint: 'vs' },
+    fragment: { module, entryPoint: fs, targets: [{ format: fmt }] }, primitive: { topology: 'triangle-list' } });
+  const [pNoise, pGround, pVol, pLight, pNoiseMip, pStats, pTrans, pMS, pIrr, pExpo, p3, p3n, pPost] = await Promise.all([
+    cpipe('noise_gen'), cpipe('ground_build'), cpipe('vol_build'), cpipe('vol_light'), cpipe('noise_mip'),
+    apipe('atm_stats'), apipe('atm_trans'), apipe('atm_ms'), apipe('atm_irr'), apipe('atm_expo'),
+    rpipe(v3Module, 'fs', format), rpipe(v3nModule, 'fs', 'rgba16float'), rpipe(v3nModule, 'fs_post', format)]);
   const bgOf = (p, entries) => device.createBindGroup({ layout: p.getBindGroupLayout(0), entries: entries.map(([b, r]) => ({ binding: b, resource: r })) });
   const noiseLevel = (l) => noiseTex.createView({ baseMipLevel: l, mipLevelCount: 1 });
   const bNoise = bgOf(pNoise, [[4, noiseLevel(0)]]);
-  const pNoiseMip = cpipe('noise_mip');
   const bGround = bgOf(pGround, [[0, { buffer: volP }], [1, { buffer: vgBuf }], [2, { buffer: stateBuf }], [3, { buffer: sfcBuf }], [5, groundTex.createView()], [11, frzTex.createView()]]);
   const bVol = bgOf(pVol, [[0, { buffer: volP }], [1, { buffer: vgBuf }], [2, { buffer: stateBuf }], [3, { buffer: sfcBuf }], [6, densTex.createView()], [7, densPrev.createView()]]);
   const bLight = bgOf(pLight, [[0, { buffer: volP }], [1, { buffer: vgBuf }], [2, { buffer: stateBuf }], [7, densTex.createView()], [8, groundTex.createView()], [9, sClamp], [10, lightTex.createView()]]);
-  const p3 = device.createRenderPipeline({
-    layout: 'auto',
-    vertex: { module: v3Module, entryPoint: 'vs' },
-    fragment: { module: v3Module, entryPoint: 'fs', targets: [{ format }] },
-    primitive: { topology: 'triangle-list' },
-  });
   const b3 = bgOf(p3, [[0, { buffer: v3U }], [1, densTex.createView()], [2, lightTex.createView()], [3, groundTex.createView()],
     [4, noiseTex.createView()], [5, sClamp], [6, sRep], [7, frzTex.createView()]]);
   // nowy widok 3D: atmosfera – profil średni domeny (zmętnienie, chmury, albedo podłoża) i tablice nieba (przepuszczalność,
@@ -296,25 +307,11 @@ async function init() {
   const profBuf = buf((NZ + 2) * 16, U.STORAGE | U.COPY_SRC, 'atmProf');
   const v3nU = buf(1392, U.UNIFORM | U.COPY_DST, 'v3nU');
   const expoBuf = buf(32, U.STORAGE | U.COPY_SRC, 'atmExpo');
-  const apipe = (entry) => device.createComputePipeline({ layout: 'auto', compute: { module: atmModule, entryPoint: entry } });
-  const pStats = apipe('atm_stats'), pTrans = apipe('atm_trans'), pMS = apipe('atm_ms'), pIrr = apipe('atm_irr'), pExpo = apipe('atm_expo');
   const bStats = bgOf(pStats, [[30, { buffer: profBuf }], [34, lightTex.createView()], [35, groundTex.createView()], [36, { buffer: vgBuf }]]);
   const bTrans = bgOf(pTrans, [[23, { buffer: profBuf }], [31, transTex.createView()]]);
   const bMS = bgOf(pMS, [[20, transTex.createView()], [23, { buffer: profBuf }], [24, sClamp], [32, msTex.createView()]]);
   const bIrr = bgOf(pIrr, [[20, transTex.createView()], [21, msTex.createView()], [23, { buffer: profBuf }], [24, sClamp], [33, irrTex.createView()]]);
-  // obraz HDR (rgba16float, × ekspozycja) → ekspozycja ze średniej jasności (atm_expo) → obraz końcowy (fs_post)
-  const p3n = device.createRenderPipeline({
-    layout: 'auto',
-    vertex: { module: v3nModule, entryPoint: 'vs' },
-    fragment: { module: v3nModule, entryPoint: 'fs', targets: [{ format: 'rgba16float' }] },
-    primitive: { topology: 'triangle-list' },
-  });
-  const pPost = device.createRenderPipeline({
-    layout: 'auto',
-    vertex: { module: v3nModule, entryPoint: 'vs' },
-    fragment: { module: v3nModule, entryPoint: 'fs_post', targets: [{ format }] },
-    primitive: { topology: 'triangle-list' },
-  });
+  // obraz HDR (rgba16float, × ekspozycja) → ekspozycja ze średniej jasności (atm_expo) → obraz końcowy (fs_post); potoki p3n, pPost wyżej
   let hdr = null;
   const hdrOf = (w, h) => {
     if (hdr && hdr.w === w && hdr.h === h) return hdr;
@@ -428,7 +425,7 @@ async function init() {
     const sea = num('sea');
     return Float32Array.from(sim.hv, (h) => Math.max(h - sea, 0));
   };
-  // miejscowości na mapie (OpenStreetMap) – właściwa funkcja przypisana po utworzeniu stacji; wołane przy każdej zmianie terenu,
+  // miejscowości na mapie (GeoNames, public/cities) – właściwa funkcja przypisana po utworzeniu stacji; wołane przy każdej zmianie terenu,
   // pobiera tylko przy zmianie miejsca / rozmiaru mapy
   let refreshCities = () => {};
   function applyTerrain() {
@@ -681,12 +678,12 @@ async function init() {
     }).finally(() => { drv.centerBusy = false; });
   }
 
-  // ---- Korekta klimatu modelu synoptycznego (metoda delta) ----
-  // Model synoptyczny ma za zimną troposferę: Kraków, 3 losowania × rok wobec analiz 2022–2025 – 850/700/500 hPa o 5–9 K, przy gruncie
-  // o 2–6 K, gradient grunt–850 hPa o 1–5 K za stromy (za duże CAPE, za dużo konwekcji, chmur i opadu). Profil docelowy domeny
-  // dostaje poprawkę = średnia z danych − średnia modelu na 0 / 1.5 / 3 / 5.6 km n.p.m. (≈ grunt, 850, 700, 500 hPa) i mnożnik
-  // wilgotności przy gruncie (norma punktu rosy / model). Węzły korekty co ≤ 600 km na obszarze domeny (1 węzeł do 600 km, 2 × 2 do
-  // 1200 km, …, ≤ 6 × 6; grid.js ccN), poprawka interpolowana dwuliniowo (sim.wgsl ccBil, bufor vg CCG). Dla każdego węzła:
+  // ---- Korekta klimatu modelu synoptycznego (metoda delta, CLAUDE.md sekcja 10) ----
+  // Model synoptyczny ma stały i sezonowy błąd (przed regulatorami średniej strefowej troposfera o kilka K za zimna; dalej m.in. opad 2–3× za duży).
+  // Profil docelowy domeny dostaje poprawkę = średnia z danych − średnia modelu na 0 / 1.5 / 3 / 5.6 km n.p.m. (≈ grunt, 850, 700, 500 hPa),
+  // wykładnik wilgotności przy gruncie (RH → RH^a – średnia jak w normie punktu rosy), mnożniki wilgotności 850 i 700 hPa i mnożnik opadu.
+  // Węzły korekty co ≤ 600 km na obszarze domeny (1 węzeł do 600 km, 2 × 2 do 1200 km, …, ≤ 4 × 4; grid.js ccN), poprawka interpolowana
+  // dwuliniowo (sim.wgsl ccBil, bufor vg CCG). Dla każdego węzła:
   // przy gruncie klimatologia wbudowana (stacje: GHCN_CAMS, GPCC; climbase.js), w tle normy ERA5 1991–2020 (T, Td, opad na wysokości oczka ERA5); swobodna atmosfera zawsze
   // z climbase.js: T NCEP 1991–2020 na stałych wysokościach – wobec radiosondaży IGRA (Polska płd.) ±0.5 K. Wcześniej norma T 2 m minus różnica T 2 m − T poziomu z analiz
   // 2022–2024: troposfera ~1.3 K za zimna na wszystkich poziomach (na 850 hPa styczeń −1.9, luty −2.6 K). Średnia modelu z okna ±CC_WIN dób wokół bieżącej chwili, tak samo
@@ -785,7 +782,7 @@ async function init() {
       if (nd.norm.P) {
         let pn = 0, pm = 0;
         s.forEach((x, i) => { pn += wt[i] * ccMon(nd.norm.P, x.doy); pm += wt[i] * 24 * (x.pr || 0); });
-        // (tryb lekki: mnożnik działa na cały opad domeny – zakres 0.1–1.5; przy 0.3–1 zostawał nadmiar, gdy model pada > 3× za dużo)
+        // (tryb lekki: mnożnik tylko do diagnostyki – lite_col skaluje opad do normy własnym regulatorem, ccUpload wysyła normę)
         nd.pnd = pn / ws; nd.pmd = pm / ws;   // (norma i średni opad modelu [mm/dobę] – diagnostyka, sim.cc())
         if (pm > 0) nd.fp = CFG.LITE ? Math.min(1.5, Math.max(0.1, pn / pm)) : Math.min(1, Math.max(0.3, pn / pm));
       }
@@ -793,9 +790,9 @@ async function init() {
     ccUpload();
   }
   const ccOn = () => drv.mode === 'syn' && $('climcorr').checked && !cc.off;
-  // wykładnik a ∈ [0.5, 2] taki, że f(a) = cel (f maleje z a); poza zakresem – granica
   // dodatek do normy wilgotności w cieple (?cq8= , testy A/B)
   const CCQ_PLUS = (() => { const v = new URLSearchParams(location.search).get('cq8'); return v === null ? 0.04 : Number(v); })();
+  // wykładnik a ∈ [0.5, 2] taki, że f(a) = cel (f maleje z a); poza zakresem – granica
   function ccExp(f, target) {
     let lo = 0.5, hi = 2;
     if (f(lo) <= target) return lo;
@@ -803,8 +800,8 @@ async function init() {
     for (let n = 0; n < 16; n++) { const m = 0.5 * (lo + hi); if (f(m) > target) lo = m; else hi = m; }
     return 0.5 * (lo + hi);
   }
-  // poprawki węzłów do bufora vg (CCG: 8 wartości na węzeł – 4 temperatury, mnożniki wilgotności: grunt, 850, 700 hPa, mnożnik opadu);
-  // wyłączona – zera i mnożniki 1
+  // poprawki węzłów do bufora vg (CCG: 8 wartości na węzeł – 4 temperatury, wykładnik wilgotności przy gruncie, mnożniki 850 i 700 hPa,
+  // mnożnik opadu – w trybie lekkim norma opadu); wyłączona – zera i mnożniki 1
   function ccUpload() {
     const a = new Float32Array(8 * 36), on = ccOn();
     cc.nodes.forEach((nd, t) => {
@@ -942,11 +939,12 @@ async function init() {
     accBase();
   }
   // Widok „Miesiące”: statystyki miesięcy kalendarzowych symulacji. Liczniki bieżącego miesiąca na GPU (pola MTS…MSN: Σ T 2 m·Δt,
-  // Σ dobowych T maks. i min. z pełnych dób, opad i śnieg); o północy kończącej miesiąc – odczyt widocznej części do pamięci
-  // (T × 100 jako Int16, opad × 10 jako Uint16 – 10 B na oczko i miesiąc: 200 × 200 oczek ~0.4 MB) i zerowanie liczników.
+  // Σ dobowych T maks. i min. z pełnych dób, opad i śnieg, ekstrema, dni upalne i noce tropikalne); o północy kończącej miesiąc – odczyt
+  // widocznej części do pamięci (5 temperatur × 100 jako Int16, 3 opady × 10 jako Uint16, 2 liczniki dni jako Uint16 – 20 B na oczko i miesiąc:
+  // 200 × 200 oczek ~0.8 MB) i zerowanie liczników.
   // Zakładka „Analizy klimatyczne”: okresy – miesiące, pory roku (meteorologiczne: XII–II, III–V, VI–VIII, IX–XI) i lata
   // kalendarzowe, składane z zapisanych miesięcy (+ bieżący do tej chwili): T średnia ważona czasem, T maks. i min. – liczbą pełnych
-  // dób, opad i śnieg sumowane. Przyciski map (pola 80–85), suwak okresu, tabela średnich po widocznej domenie.
+  // dób, opad i śnieg sumowane. Przyciski map (pola 80–90), suwak okresu, tabela średnich po widocznej domenie.
   const MON_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
   const SEASONS = ['winter', 'spring', 'summer', 'autumn'];
   const MON_F = [S.MTS, S.MTX, S.MTN, S.MPR, S.MSN, S.MXA, S.MNA, S.MPD, S.MHOT, S.MTRO];
@@ -1039,7 +1037,7 @@ async function init() {
         tX: T[3].reduce((m, y) => Math.max(m, y), -32768) / 100, tN: T[4].reduce((m, y) => Math.min(m, y), 32767) / 100, pD: P[2].reduce((m, y) => Math.max(m, y), 0) / 10 } });
     monUi(); monShow();
   }
-  // wielkość f (80–85) okresu p w oczkach widocznej części [NXD·NYD]: zapisane miesiące + bieżący (z kopii liczników); T średnia
+  // wielkość f (80–90) okresu p w oczkach widocznej części [NXD·NYD]: zapisane miesiące + bieżący (z kopii liczników); T średnia
   // ważona czasem, T maks. i min. – liczbą pełnych dób (bez pełnych dób – T średnia), opad, deszcz i śnieg sumowane
   // (only ≥ 0 – tylko to oczko, wynik o długości 1)
   function perField(p, f, only = -1) {
@@ -1356,6 +1354,9 @@ async function init() {
     device.queue.writeBuffer(workBuf, 0, new Float32Array(5 * N));
     device.queue.writeBuffer(workBuf, (W_MSC + 4 + 4 * CFG.MEB + 2 * NZ) * 4, new Float32Array(2 * CFG.MEB));   // średnia dobowa odchyłki θ i q_v
     device.queue.writeBuffer(workBuf, (W_MUV + 2 * NZ) * 4, new Float32Array(1));                              // średni strumień ciepła z gruntu
+    // tryb lekki: burze-obiekty i budżet ich opadu (W_STM, W_STK) – bez tego po restarcie (nowe miejsce, Restart) burze z poprzedniego
+    // przebiegu padały dalej na nowej mapie, aż do końca życia (do ~12 h)
+    device.queue.writeBuffer(workBuf, (W_MUV + 2 * NZ + 1) * 4, new Float32Array(32 * 16 + 4));
     // powierzchnia: temperatura gruntu = lokalna temperatura powietrza przy gruncie
     const sf = new Float32Array(NSF * NXY);
     const water = num('water') + 273.15;
@@ -1436,7 +1437,7 @@ async function init() {
       u[16] = num('fieldH'); u[17] = num('fieldV');
       f[18] = drv.mode === 'syn' ? 0 : -num('wls') / 100;
       // waga czasowa pól docelowych (między terminem A i B), slot terminu A, przyciąganie swobodnej
-      // atmosfery do dużej skali (τ = 12 h)
+      // atmosfery do dużej skali (τ = 48 h)
       f[19] = (t - drv.tA) / DTQ; f[20] = (t + DT - drv.tA) / DTQ; u[21] = drv.slot;
       f[24] = 1 / (48 * 3600);
       f[25] = drv.mode === 'syn' && drv.model ? 0.4 * drv.model.halfDiur : 0;   // cel przy gruncie − średnia dobowa
@@ -1606,7 +1607,8 @@ async function init() {
     if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
   }
 
-  // Zakres kolorów dla widoku na podstawie min/max ze statystyk
+  // Zakres kolorów dla widoku: skale stałe (fields.js), z danych tylko dni upalne i noce tropikalne
+  const hotHi = { id: -1, t: 0, hi: 0 };
   function viewRange(v) {
     const id = v.mode === 0 ? num('fieldH') : num('fieldV');
     const st = sim.stats;
@@ -1616,7 +1618,19 @@ async function init() {
       else if (id >= 20) { hi = st[10]; lo = st[11]; }
       else { hi = st[6]; lo = st[7]; }
     }
-    return { id, ...rangeFor(id, lo, hi, { contrast: Math.pow(2, -num('range')), hmax: sim.hmax, nIso: v.mode === 1 ? 20 : 8, vertical: v.mode === 1 }) };
+    // dni upalne i noce tropikalne: jedyna skala zależna od danych (maksimum okresu w widocznej części; jądro statystyk tych map
+    // nie liczy) – przy stałej 0–30 miejsca z ponad 30 dniami w roku były jednolicie czerwone; liczone najwyżej raz na sekundę
+    if (id === 89 || id === 90) {
+      const now = performance.now();
+      if (id !== hotHi.id || now - hotHi.t > 1000) {
+        const p = monSelPer();
+        let m = 0;
+        if (p) for (const x of perField(p, id)) if (x > m) m = x;
+        hotHi.id = id; hotHi.t = now; hotHi.hi = m;
+      }
+      lo = 0; hi = hotHi.hi;
+    }
+    return { id, ...rangeFor(id, lo, hi, { contrast: Math.pow(2, -num('range')), hmax: sim.hmax, vertical: v.mode === 1, z: num('zs'), zt: num('zt') * 1000, dx: CFG.DX }) };
   }
 
   // Jesień do kolorów drzew: od ~18 VIII (58 dób po przesileniu letnim) do końca grudnia, na półkuli S pół roku później. Na przełomie zieleń jest pełna albo prawie zerowa
@@ -3150,7 +3164,8 @@ async function init() {
     $, S, NX, NXY, MG, NXD, NYD, DX: CFG.DX, DY: CFG.DY,
     // czas kopii pól przy gruncie (nie bieżący czas symulacji) – inaczej próbka sprzed północy trafiała do nowej doby
     sfc: () => sim.sfc, time: () => sim.sfcT ?? sim.time, clock, toast: (m) => toast(m), mapInner: $('mapInner'),
-    csvMeta: () => `Weather3D; grid ${CFG.DX / 1000} km; visible ${CFG.NXV} x ${CFG.NYV}; levels ${CFG.NZ}; centre ${num('lat').toFixed(2)} ${num('lon').toFixed(2)}; start ${$('date').value}; weather seed ${drv.seed ?? ''}; climate correction ${ccOn() ? cc.src : 'off'}; ${manipCsv()}`,
+    // (widoczna część NXD × NYD – dawniej NXV × NYV, czyli razem z niewidocznym marginesem: 116 × 112 przy widocznych 96 × 92)
+    csvMeta: () => `Weather3D; grid ${CFG.DX / 1000} km; visible ${NXD} x ${NYD}; levels ${CFG.NZ}; centre ${num('lat').toFixed(2)} ${num('lon').toFixed(2)}; start ${$('date').value}; weather seed ${drv.seed ?? ''}; climate correction ${ccOn() ? cc.src : 'off'}; ${manipCsv()}`,
     // położenie na ekranie [%] punktu domeny (ułamki fx w prawo, fy w górę) przy bieżącym zoomie
     mapPos: (fx, fy) => [(fx - mz.x) * mz.s * 100, (1 - fy - mz.y) * mz.s * 100],
     probe: () => sim.probe,
@@ -3189,12 +3204,8 @@ async function init() {
     profMode = m;
     sim.profModePref = m;
     savePrefs();
-    for (const b of document.querySelectorAll('#profSeg button')) b.classList.toggle('on', b.dataset.p === m);
-    $('profSub').textContent = m === 'point' ? 'probe at a point (click the map) · dots: parcel from the ground' : 'domain mean · dashed: start sounding';
     sndSrcUi();
-    drawProf();
   }
-  for (const b of document.querySelectorAll('#profSeg button')) b.addEventListener('click', () => setProfMode(b.dataset.p));
   cxy.addEventListener('pointerleave', () => { sim.hover = null; $('tip').style.display = 'none'; });
   cxy.addEventListener('pointermove', (e) => {
     if (v3.on) return;
@@ -3239,7 +3250,7 @@ async function init() {
       row('precip.', fm(v('PR'), 'mm/h', 1)) + ' · ' + row('total', fm(v('PACC'), 'mm', 1)) + (v('QOUT') > 0.05 ? ' · ' + row('discharge', `${fm(v('QOUT'), 'm³/s', v('QOUT') < 10 ? 1 : 0)}`) : ''),
       ...(monFld() ? [row('period', monTip(col))] : []),
       row('pressure (large scale)', fm(v('PSL'), 'hPa', 1)) + ' · ' + row('visibility', fmVis(v('VIS'))),
-      row('CAPE', `${Math.round(v('CAPE'))} J/kg`) + (v('FLASH') > 0.01 ? ' · ' + row('lightning', `${v('FLASH').toFixed(2)} /km²/h`) : '') + (v('HAIL') > 0 ? ' · ' + row('hail', fm(v('HAIL'), 'cm', 1)) : ''),
+      row('CAPE', `${Math.round(v('CAPES'))} J/kg`) + (v('FLASH') > 0.01 ? ' · ' + row('lightning', `${v('FLASH').toFixed(2)} /km²/h`) : '') + (v('HAIL') > 0 ? ' · ' + row('hail', fm(v('HAIL'), 'cm', 1)) : ''),
       row('radar', v('DBZ') < 5 ? '–' : `${v('DBZ').toFixed(0)} dBZ`) + (v('PHEN') > 0.5 ? ' · ' + row('phenomenon', ['', 'hoar frost', 'rime', 'freezing rain / glaze', 'fog', 'in cloud (summits, slopes)'][Math.round(v('PHEN'))]) : ''),
       row('H', `${Math.round(v('H'))} W/m²`) + ' · ' + row('LE', `${Math.round(v('LE'))} W/m²`),
     ].join('<br>');
@@ -3449,19 +3460,11 @@ async function init() {
         if (fd.cmap === WX_CMAP0 + 2 && !monFld(r.id)) note += sim.accInfo || '';
         if (monFld(r.id)) note += ` – ${$('monV').textContent}`;
       }
-      if (fd.cmap === 6) {
-        unitOf = 'mm/h'; lo = `${dT(0.1)}`; hi = `${dT(50)}+ ${unitD('mm/h')}`;
-        ticks = RADAR_STEPS.slice(1).map((t, n) => [dT(t), (n + 1) / RADAR_STEPS.length]);
-      }
-      if (fd.cmap === 14) {
-        unitOf = 'mm'; lo = `${dT(0.5)}`; hi = `${dT(2000)}+ ${unitD('mm')}`;
-        ticks = ACC_STEPS.map((t, n) => [t, n / ACC_STEPS.length]).filter(([t], n) => n > 0 && [1, 5, 20, 50, 100, 200, 500, 1000].includes(t)).map(([t, q]) => [dT(t), q]);
-        note += sim.accInfo || '';
-      }
       if (fd.cmap === 15) {
-        lo = '5'; hi = '75 dBZ';
-        ticks = [10, 20, 30, 40, 50, 60, 70].map((t) => [t, (t - 5) / 70]);
-        note += ' – ~20 dBZ drizzle / light snow, 40 downpour, > 55 hail';
+        // (skala radaru −2.5…67.5 dBZ, wxscales.js; echo od 5 dBZ)
+        lo = '5'; hi = '67.5 dBZ';
+        ticks = [10, 20, 30, 40, 50, 60].map((t) => [t, (t + 2.5) / 70]);
+        note += ' – ~20 dBZ light rain / snow, 35 moderate, 45 heavy, > 55 hail';
       }
       if (r.id === 55) note += ' · red contours: SRH 0–3 km every 100 m²/s² (thick 200) · arrows: shear 0–6 km (full length ' + fm(30, 'm/s') + ')';
       if (fd.cmap === 21) note += ' · > 150 m²/s² favours supercells, > 300 – tornadoes (with high CAPE and shear)';
@@ -3474,7 +3477,7 @@ async function init() {
       if (fd.cmap === 18) { lo = ''; hi = ''; ticks = []; note = 'Phenomena: grey – none · light grey – fog · purple-grey – summits and slopes in cloud · light blue – hoar frost · white – rime · crimson – freezing rain (glaze)'; }
       if (fd.cmap === 31) { lo = ''; hi = ''; ticks = []; note = `Surface type, left to right: ${VEG_NAMES.join(' · ')}`; }
       if (fd.cmap === 16) note += ' – dark: dry air (subsidence), light: moist upper troposphere and high clouds';
-      if (fd.cmap === 30) { lo = 'stationary · warm'; hi = 'sharp cold'; ticks = [[0, 1 / 2], [1, 3 / 4]]; note = 'Surface fronts (axis from the synoptic model, sharpened in the domain and bent by the flow): purple – stationary (wind along the front), red – warm, light blue – gentle cold (wide precipitation band), navy – sharp cold (sudden temperature drop, lift line, possible squall line); background – T 2 m'; }
+      if (fd.cmap === 30) { lo = 'warm'; hi = 'sharp cold'; ticks = []; note = 'Surface fronts (axis from the synoptic model, sharpened in the domain and bent by the flow): red – warm, purple – stationary (wind along the front), light blue – gentle cold (wide precipitation band), navy – sharp cold (sudden temperature drop, lift line, possible squall line); in-between colours – transitions; background – T 2 m'; }
       // (trzy kolory pięter, każdy od braku chmur do gęstych – nie skala koloru satelity)
       if (r.id === 37) { el.querySelector('.bar').style.background = 'linear-gradient(90deg, rgb(90,90,90) 0%, rgb(255,158,56) 33.3%, rgb(90,90,90) 33.3%, rgb(89,217,102) 66.6%, rgb(90,90,90) 66.6%, rgb(140,199,255) 100%)'; lo = 'low'; hi = 'high'; ticks = []; note += ` – low (< ${fmZ(2)}) orange, middle (${fmZ(2)} – ${fmZ(6)}) green, high (> ${fmZ(6)}) blue; each colour from none (grey) to dense`; }
       else if (fd.cmap === 9) { lo = 'ground'; hi = 'clouds'; ticks = []; note += ' – visible light, dark at night'; }
@@ -3483,7 +3486,7 @@ async function init() {
         hi = fmH(sim.hmax);
         ticks = hd > 0 ? legendTicks(0, hd).filter((t) => t > 0 && t < hd).map((t) => [t, t / hd]) : [];
       }
-      const isoT = [0, 20, 21, 24, 46, 47].includes(r.id) && r.iso === 1;
+      const isoT = [0, 20, 21, 24, 46, 47, 80, 81, 82, 86, 87].includes(r.id) && r.iso === 1;
       // (izolinie rysuje shader w stałych krokach w °C i hPa)
       const dIso = fd.unit === '°C' ? (isImp() ? +(r.iso * 1.8).toFixed(1) : r.iso) : fd.unit === 'hPa' ? +toD(r.iso, 'hPa').toPrecision(2) : +toD(r.iso, fd.unit).toPrecision(2);
       const zero = isImp() ? '32 °F' : '0 °C';
@@ -3598,13 +3601,13 @@ async function init() {
       for (let j = 0; j < NYD; j++) for (let i = 0; i < NXD; i++) out[j * NXD + i] = sim.sfc[S[name] * NXY + (j + MG) * NX + i + MG];
       return { nx: NXD, ny: NYD, dx: CFG.DX, v: out };
     },
-    // narysuj jedną klatkę (przy zatrzymanej pętli) – do zrzutów ekranu
-    // czas GPU jednego rysowania mapy [ms] (znaczniki czasu, n powtórzeń w jednym poleceniu) – koszt obrazu, np. satelity; stan z ostatniego draw()
+    // dawny obraz chmur na satelicie VIS (jak ?sat=0)
     satOld(on) { sim.satOld = !!on; },
-    // huragan (testy): dx, dy [km] od środka domeny, kategoria 1–5, kick-in [doby]
+    // huragan (testy): sloty huraganów kliknięciem, ślady cyklonów dla domeny (pe_tcdom); spawnTC – dx, dy [km] od środka domeny, kategoria 1–5, kick-in [doby]
     peTC: () => drv.model.readTC(),
-    peTCD: () => drv.model.readTCD(),   // ślady cyklonów tropikalnych dla domeny (pe_tcdom)
+    peTCD: () => drv.model.readTCD(),
     spawnTC(dx, dy, cat = 3, days = 1) { $('tcCat').value = cat; $('tcRamp').value = days; tcSpawnAt((LXP / 2 + dx * 1000) / DXP - 0.5, (LYP / 2 + drv.model.yc + dy * 1000) / DXP - 0.5); },
+    // czas GPU jednego rysowania mapy [ms] (znaczniki czasu, n powtórzeń w jednym poleceniu) – koszt obrazu, np. satelity; stan z ostatniego draw()
     async mapMs(n = 20) {
       if (!hasTS) return null;
       const v = views[0];
@@ -3622,6 +3625,7 @@ async function init() {
       rd.unmap(); qs.destroy(); rb.destroy(); rd.destroy();
       return ms;
     },
+    // narysuj jedną klatkę (przy zatrzymanej pętli) – do zrzutów ekranu
     async draw() {
       writeParams(1);
       const enc = device.createCommandEncoder();
@@ -4558,13 +4562,15 @@ async function init() {
           if (!isMin && !isMax) continue;
           // tylko zamknięte ośrodki: na okręgu ~450 km wszędzie co najmniej 2 hPa wyżej (niż) / niżej (wyż);
           // słabe minima wzdłuż osi zatoki (pofalowany front) nie są osobnymi niżami
+          // wyże są szerokie i płaskie: okrąg ~750 km i 1 hPa (przy kryterium niżów – 450 km, 2 hPa – wyż prawie nigdy nie był oznaczany)
+          const rr = isMax ? 10 : 6;
           let ringLo = Infinity, ringHi = -Infinity;
           for (let a = 0; a < 24; a++) {
-            const q = pg(Math.round(i + 6 * Math.cos(a * Math.PI / 12)), Math.round(j + 6 * Math.sin(a * Math.PI / 12)));
+            const q = pg(Math.round(i + rr * Math.cos(a * Math.PI / 12)), Math.round(j + rr * Math.sin(a * Math.PI / 12)));
             ringLo = Math.min(ringLo, q); ringHi = Math.max(ringHi, q);
           }
           if (isMin && ringLo - p0 < 2) continue;
-          if (isMax && p0 - ringHi < 2) continue;
+          if (isMax && p0 - ringHi < 1) continue;
           const [px, py] = toPx((i + 0.5) * DXP - LXP / 2, (j + 0.5) * DXP - LYP / 2 - yc);
           if (px < 8 || py < 8 || px > W - 8 || py > H - 8) continue;
           const col = isMin ? '#c62828' : '#1e4fd0';
@@ -4850,7 +4856,7 @@ async function init() {
     return `${dateFromDoy(sim.year, ck.doy)}, ${h}:${String(m).padStart(2, '0')}`;
   };
 
-  // ---------- sonda w punkcie: sondaż i meteogram ----------
+  // ---------- sonda w punkcie: profil (sondaż w zakładce Atmosphere) i meteogram ----------
   // kolumna z sondy → profile na poziomach modelu (pod gruntem NaN) i obiekt „sondażu” dla soundingIndices
   function probeProfile() {
     const pc = sim.probeCol, col = sim.probeColAt;
@@ -4882,16 +4888,6 @@ async function init() {
     return { col, kb, zg, lev, snd: snd2, T2, q2, ps };
   }
 
-  // temperatura konwekcji: poziom kondensacji konwekcyjnej (linia stałej wilgotności właściwej od gruntu
-  // przecina profil T) sprowadzony suchoadiabatycznie do gruntu
-  function convTemp(pp) {
-    for (let za = 50; za < 6000; za += 25) {
-      const Te = pp.snd.T(za), p = pp.snd.pres(za);
-      if (qsat(Te, p) <= pp.q2) return { zccl: za, tc: Te * Math.pow(pp.ps / p, 0.286) - 273.15 };
-    }
-    return null;
-  }
-
   const meteo = { hist: [], col: -1 };
   function recordMeteo() {
     const col = sim.probeColAt;
@@ -4908,69 +4904,39 @@ async function init() {
     if (meteo.hist.length > 432) meteo.hist.shift();         // 3 doby co 10 min
   }
 
+  // Sonda: czytelna ramka z temperaturą, opadem i zachmurzeniem w punkcie, pod nią meteogram (użytkownik: sondaż w tej zakładce był
+  // nieczytelny – pełny sondaż sondy i średniej domeny jest w zakładce Atmosphere); odświeżane z interfejsem (co ~0.25 s)
   function drawProf() {
-    if (profMode === 'point' && sim.probe) { drawProbe(); return; }
-    if (!sim.means) return;
-    const z = [], T = [], Td = [], T0 = [], Td0 = [], cloud = [];
-    let base = null, top = null;
-    for (let k = 0; k < NZ; k++) {
-      const zz = grid.zc[k];
-      if (sim.means[4 * k + 3] < 0.02) { z.push(zz); T.push(NaN); Td.push(NaN); T0.push(snd.T(zz) - 273.15); Td0.push(dewpoint(snd.qv(zz), snd.pres(zz)) - 273.15); cloud.push(0); continue; }
-      const th = grid.data[grid.off.TC + k] + sim.means[4 * k];
-      const p = grid.data[grid.off.PRS + k];
-      z.push(zz);
-      T.push(th * grid.data[grid.off.EXC + k] - 273.15);
-      Td.push(dewpoint(sim.means[4 * k + 1], p) - 273.15);
-      T0.push(snd.T(zz) - 273.15);
-      Td0.push(dewpoint(snd.qv(zz), snd.pres(zz)) - 273.15);
-      cloud.push(sim.means[4 * k + 2]);
-      if (sim.means[4 * k + 2] > 0.005) { if (base === null) base = zz; top = zz; }
+    const col = sim.probeColAt;
+    const set = (id, t) => { const e = $(id); if (e.innerHTML !== t) e.innerHTML = t; };
+    if (!sim.probe || col < 0 || !sim.sfc) {
+      for (const id of ['pbT', 'pbP', 'pbC']) set(id, '–');
+      for (const id of ['pbTs', 'pbPs', 'pbCs', 'profInfo']) set(id, '');
+      set('profSub', 'click the map to place the probe');
+      return;
     }
-    drawProfile($('cprof'), { z, T, Td, T0, Td0, cloud, top: num('zt') * 1000 });
-    const st = sim.stats;
-    const cover = st ? (100 * st[14] / (NXD * NYD)).toFixed(0) : '–';
-    $('profInfo').textContent = base === null ? `No clouds. Cloud cover ${cover} %.`
-      : `Cloud base ≈ ${fmH(Math.round(base / 50) * 50)}, tops ≈ ${fmH(Math.round(top / 50) * 50)} a.s.l. Cloud cover ${cover} %.`;
-  }
-
-  function drawProbe() {
-    const pp = probeProfile();
-    if (!pp) { $('profInfo').textContent = 'Probe: waiting for data…'; return; }
-    const z = [], T = [], Td = [], cloud = [], parcel = [], wind = [];
-    for (let k = 0; k < NZ; k++) { z.push(grid.zc[k]); T.push(NaN); Td.push(NaN); cloud.push(0); parcel.push(NaN); wind.push(null); }
-    // cząstka z dolnych 500 m – ta sama co na mapie CAPE (sonda pokazywała CAPE cząstki z 2 m: popołudniu nad nagrzanym gruntem
-    // 2–20× większe niż na mapie, np. 300 J/kg przy 15 J/kg mapy); CAPE cząstki z 2 m – obok, w nawiasie
-    const ix = soundingIndices(pp.snd, CFG, 500), ixs = soundingIndices(pp.snd);
-    const pz = ix.prof.z, pT = ix.prof.parcel;
-    for (const L of pp.lev) {
-      T[L.k] = L.T - 273.15; Td[L.k] = dewpoint(L.q, L.p) - 273.15; cloud[L.k] = 1000 * L.cl > 0.02 ? Math.min(1, 1000 * L.cl / 0.5) : 0;
-      wind[L.k] = [L.u, L.v];
-      // cząstka z dolnych 500 m (próbkowana co 100 m nad gruntem) na poziomach modelu
-      const n = Math.floor(L.za / 100);
-      if (n >= 0 && n + 1 < pz.length) parcel[L.k] = pT[n] + (pT[n + 1] - pT[n]) * (L.za - pz[n]) / 100;
-    }
-    // hodograf 0–9 km i ruch prawej superkomórki (Bunkers)
-    const hp = pp.lev.filter((L) => L.za <= 9000).map((L) => [L.u, L.v, L.za]);
-    let storm = null;
-    {
-      const l6 = pp.lev.filter((L) => L.za <= 6000);
-      if (l6.length > 2) {
-        const um = l6.reduce((a, L) => a + L.u, 0) / l6.length, vm = l6.reduce((a, L) => a + L.v, 0) / l6.length;
-        const su = l6[l6.length - 1].u - l6[0].u, sv = l6[l6.length - 1].v - l6[0].v, sm = Math.max(Math.hypot(su, sv), 0.1);
-        storm = [um + 7.5 * sv / sm, vm - 7.5 * su / sm];
-      }
-    }
-    drawProfile($('cprof'), { z, T, Td, cloud, parcel, wind, top: num('zt') * 1000, ground: pp.zg, parcelLabel: 'parcel from the lowest 500 m', hodo: { pts: hp, storm } });
-    const i = pp.col % NX, j = Math.floor(pp.col / NX), ct = convTemp(pp);
-    const sv = (n) => sim.sfc[S[n] * NXY + pp.col];
-    const f0 = (x) => (x === null || x === undefined ? '–' : fmH(Math.round(x / 10) * 10));
-    const t2 = pp.T2 - 273.15;
-    $('profInfo').innerHTML = [
-      `<b>Probe</b> ${nD((i - MG + 0.5) * CFG.DX / 1000, 'km', 1)}, ${nD((j - MG + 0.5) * CFG.DY / 1000, 'km', 1)} ${unitD('km')} · terrain ${fmH(pp.zg)}`,
-      `LCL ${f0(ix.lcl)} · LFC ${f0(ix.lfc)} · EL ${f0(ix.el)} a.g.l. · CAPE <b>${Math.round(ix.cape)}</b> J/kg (parcel from 2 m: ${Math.round(ixs.cape)}) · CIN ${ix.cin === null ? '–' : Math.round(ix.cin)} J/kg`,
-      `shear 0–6 km <b>${nD(Math.hypot(sv('SHU'), sv('SHV')), 'm/s')}</b> ${unitD('m/s')} · 0–1 km ${fm(sv('SHR01'), 'm/s')} · SRH 0–3 km <b>${Math.round(sv('SRH03'))}</b> · 0–1 km ${Math.round(sv('SRH01'))} m²/s²`,
-      ct ? `Convective T ≈ <b>${fT(ct.tc)}</b> (now ${fT(t2)}${t2 >= ct.tc - 0.3 ? ' – reached, thermals reach condensation' : `, ${fdT(ct.tc - t2)} short`}) · ${isImp() ? '32 °F' : '0 °C'} at ${f0(ix.frz)} · precipitable water ${fm(ix.pw, 'mm')}` : '',
-    ].filter(Boolean).join('<br>');
+    const v = (n) => sim.sfc[S[n] * NXY + col];
+    const ok = (x) => isFinite(x) && Math.abs(x) < 200;
+    const i = col % NX, j = Math.floor(col / NX);
+    set('profSub', `${nD((i - MG + 0.5) * CFG.DX / 1000, 'km', 1)}, ${nD((j - MG + 0.5) * CFG.DY / 1000, 'km', 1)} ${unitD('km')} · terrain ${fmH(sim.h ? sim.h[col] : 0)}`);
+    // temperatura 2 m, ekstrema od północy, punkt rosy
+    const t2 = v('T2'), td = v('TD2');
+    set('pbT', fT(t2));
+    set('pbTs', `${ok(v('TMAX')) ? `max <b>${fT(v('TMAX'))}</b> · min <b>${fT(v('TMIN'))}</b><br>` : ''}dew point ${fT(td)}`);
+    // opad: natężenie, rodzaj (udział śniegu), suma od północy, pokrywa śnieżna
+    const pr = Math.max(v('PR'), 0), fs = pr > 0 ? Math.min(1, Math.max(0, v('PSN') / pr)) : 0;
+    const kind = fs < 0.15 ? 'rain' : fs > 0.85 ? 'snow' : 'rain and snow';
+    const pday = Math.max(v('PACC') - v('PD0'), 0), snd = v('SND');
+    set('pbP', pr < 0.05 ? 'none' : fm(pr, 'mm/h', 1));
+    set('pbPs', [pr < 0.05 ? '' : `${pr < 2.5 ? 'light' : pr < 10 ? 'moderate' : 'heavy'} ${kind}`,
+      `since midnight <b>${fm(pday, 'mm', 1)}</b>`, snd > 0.005 ? `snow cover ${fm(100 * snd, 'cm')}` : ''].filter(Boolean).join('<br>'));
+    // zachmurzenie ogólne (to samo pole co mapa i meteogram) w oktantach, usłonecznienie od północy, mgła
+    const cov = Math.min(1, Math.max(0, v('COVER'))), vis = v('VIS');
+    set('pbC', `${Math.round(100 * cov)} %`);
+    set('pbCs', [cov < 0.0625 ? 'clear sky' : cov < 0.3125 ? 'few clouds' : cov < 0.5625 ? 'partly cloudy' : cov < 0.9375 ? 'mostly cloudy' : 'overcast',
+      `sunshine today <b>${v('SUNH').toFixed(1)} h</b>`, vis < 1 ? `fog – visibility ${fmVis(vis)}` : ''].filter(Boolean).join('<br>'));
+    // wiersz pod ramką: wiatr, ciśnienie, wilgotność
+    set('profInfo', `wind <b>${fm(v('U10'), 'm/s')}</b> ${dirName(v('UA'), v('VA'))} · gusts ${fm(v('GUST'), 'm/s')} · pressure <b>${fm(v('PSL'), 'hPa', 1)}</b> · humidity ${Math.round(rhOf(t2, td))} %`);
   }
 
   // Start z wyborem ze strony tytułowej (?start=szerokość,długość,miesiąc 0–11): pierwszy dzień miesiąca, miejsce jak z mapy świata (klimat, teren,
@@ -5303,7 +5269,7 @@ async function init() {
         drv.mode === 'syn' ? `synoptic model   ${cost.pe.toFixed(2)} ms per 450 s step, targets ${cost.term.toFixed(2)} ms per term; with them ${stepCost().toFixed(2)} ms per step${drv.fcStale ? ' (forecast paused)' : ''}` : '',
         v3.on && ts3 ? `3D view          ${(ts3.tex + ts3.img).toFixed(2)} ms per frame (textures ${ts3.tex.toFixed(2)}, image ${ts3.img.toFixed(2)}; ${v3.newView ? 'new' : 'old'})` : '',
         `grid             ${NXD}×${NYD}×${NZ}${CFG.NE ? ` (+2×${MG} margin, +${CFG.NE} boundary zone)` : ' periodic'}, spacing ${CFG.DX} m, Δt ${DT} s`,
-        `schemes          boundary layer ${(100 * CFG.W_PBL).toFixed(0)}%, deep convection ${(100 * CFG.W_CU).toFixed(0)}%, shallow ${(100 * CFG.W_SH).toFixed(0)}%`,
+        `scheme weights   boundary layer ${(100 * CFG.W_PBL).toFixed(0)}%, coarse-grid convection ${(100 * CFG.W_CU).toFixed(0)}%, shallow ${(100 * CFG.W_SH).toFixed(0)}%`,
         st ? `w min / max      ${(-st[1]).toFixed(1)} / ${st[0].toFixed(1)} m/s` : '',
         st ? `q_c max          ${(1000 * st[12]).toFixed(2)} g/kg` : '',
         st ? `error ∇·(ρu)/ρ   ${st[4].toExponential(1)} 1/s` : '',

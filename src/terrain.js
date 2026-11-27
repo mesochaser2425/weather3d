@@ -1,7 +1,6 @@
 // Teren: kształty (szum Perlina, grzbiet, góra, dolina), mapa z obrazu, malowanie pędzlem.
-// Wysokości trzymamy jako gładkie pole h [m] w kolumnach; model widzi teren schodkowy:
-// komórka jest podziemna, gdy leży poniżej h zaokrąglonego do najbliższego poziomu siatki w (zw).
-// Domena jest periodyczna, więc kształty też są (grzbiet, dolina i szum zawijają się na brzegach).
+// Wysokości trzymamy jako gładkie pole h [m] w kolumnach; model widzi je jako oczka przycięte do terenu (deriveTerrain niżej).
+// Kształty są periodyczne (grzbiet, dolina i szum zawijają się na brzegach) – pasują też do domeny periodycznej (?bc=per).
 
 import { sOfZ, zOfS } from './grid.js';
 
