@@ -51,6 +51,7 @@ struct View {
 @group(0) @binding(6) var<storage, read> vegHi: array<u32>;   // gęstsze pokrycie terenu (V.vhF × V.vhF punktów na oczko, 1 bajt na punkt, 12 – skały)
 @group(0) @binding(7) var noiseT: texture_3d<f32>;            // szum 3D kafelkowy (vol.wgsl noise_gen): r Perlin–Worley, g / b Worley (grubszy / drobniejszy), a Perlin fbm
 @group(0) @binding(8) var noiseS: sampler;
+@group(0) @binding(9) var<storage, read> snowHi: array<f32>;  // śnieg w punktach gęstszego terenu (snowhi.wgsl): woda w śniegu [mm], za nią grubość [m]
 
 fn ldb(b: u32, i: u32) -> f32 {
   if (b == 0u) { return state[i]; }
@@ -136,12 +137,14 @@ fn cmapOf(f: u32) -> u32 {
     case 45u: { return 20u; }
     case 46u, 47u, 80u, 81u, 82u, 86u, 87u: { return 22u; }
     case 83u, 84u, 85u, 88u: { return 24u; }
-    case 89u, 90u: { return 0u; }
+    case 89u, 90u, 91u, 92u, 93u, 94u, 95u, 96u, 97u: { return 0u; }
     case 48u: { return 8u; }
-    case 49u, 50u, 51u, 52u: { return 23u; }
-    case 53u, 54u: { return 21u; }
+    case 49u, 50u: { return 23u; }
+    case 51u, 52u: { return 41u; }   // uskok wiatru, SRH, SCP: skale Meteologix (wxscales.js, klasy stałe)
+    case 53u, 54u: { return 42u; }
     case 55u: { return 27u; }
-    case 56u, 66u: { return 8u; }
+    case 56u: { return 43u; }
+    case 66u: { return 8u; }
     case 69u, 70u: { return 25u; }
     case 71u: { return 32u; }
     case 30u: { return 10u; }
@@ -247,8 +250,15 @@ fn mapCol(f: u32, col: u32) -> f32 {
     case 87u: { let s = sfcAt(S_MNA, col); return select(sfcAt(S_MV, col), min(select(999.0, 1000.0 - s, s > 0.0), sfcAt(S_TMIN, col)), V.monCur > 0.5); }
     case 88u: { return select(sfcAt(S_MV, col), max(sfcAt(S_MPD, col), sfcAt(S_PACC, col) - sfcAt(S_PD0, col)), V.monCur > 0.5); }
     // liczba dni upalnych (T maks. ≥ 30 °C) i nocy tropikalnych (T min. ≥ 20 °C) w okresie
-    case 89u: { return select(sfcAt(S_MV, col), sfcAt(S_MHOT, col), V.monCur > 0.5); }
+    case 89u: { return select(sfcAt(S_MV, col), sfcAt(S_MHOT, col) - sfcAt(S_MDVH, col), V.monCur > 0.5); }   // upalne 30…35 °C (rozłączne z ≥ 35)
     case 90u: { return select(sfcAt(S_MV, col), sfcAt(S_MTRO, col), V.monCur > 0.5); }
+    case 91u: { return select(sfcAt(S_MV, col), sfcAt(S_MDXF, col), V.monCur > 0.5); }
+    case 92u: { return select(sfcAt(S_MV, col), sfcAt(S_MDVF, col), V.monCur > 0.5); }
+    case 93u: { return select(sfcAt(S_MV, col), sfcAt(S_MDFR, col), V.monCur > 0.5); }
+    case 94u: { return select(sfcAt(S_MV, col), sfcAt(S_MDFD, col), V.monCur > 0.5); }
+    case 95u: { return select(sfcAt(S_MV, col), sfcAt(S_MDWM, col), V.monCur > 0.5); }
+    case 96u: { return select(sfcAt(S_MV, col), sfcAt(S_MDSU, col), V.monCur > 0.5); }
+    case 97u: { return select(sfcAt(S_MV, col), sfcAt(S_MDVH, col), V.monCur > 0.5); }
     case 24u: { return sfcAt(S_TS, col) - 273.15; }
     case 25u: { return sfcAt(S_H, col); }
     case 26u: { return sfcAt(S_LE, col); }
@@ -675,6 +685,20 @@ fn groundHi(X: f32, Y: f32) -> GroundHi {
 // gładka wysokość terenu (dwusześciennie jak mapAt, bez zawijania przy brzegach otwartych)
 fn hgtAt(X: f32, Y: f32) -> f32 { return mapAt(30u, X, Y); }
 
+// śnieg w rozdzielczości gęstszego terenu (snowhi.wgsl; tylko przy V.hiF > 1.5): k = 0 woda w śniegu [mm], 1 grubość pokrywy [m]
+fn snowHiAt(X: f32, Y: f32, k: u32) -> f32 {
+  let F = u32(V.hiF);
+  let W = NXD * F;
+  let H = NYD * F;
+  let u = clamp((X - f32(MG)) * V.hiF - 0.5, 0.0, f32(W) - 1.001);
+  let v = clamp((Y - f32(MG)) * V.hiF - 0.5, 0.0, f32(H) - 1.001);
+  let i = u32(u);
+  let j = u32(v);
+  let o = k * W * H;
+  let a = mix(snowHi[o + j * W + i], snowHi[o + j * W + i + 1u], u - f32(i));
+  let b = mix(snowHi[o + (j + 1u) * W + i], snowHi[o + (j + 1u) * W + i + 1u], u - f32(i));
+  return mix(a, b, v - f32(j));
+}
 // teren do obrazu na mapach: gęstszy DEM (dwuliniowo), gdy wczytany – inaczej siatka modelu. Model liczy na średniej z oczka
 // (przy 5 km Tatry to jeden grzbiet ~1900 m), mapa pokazuje prawdziwe grzbiety i doliny
 fn demAt(X: f32, Y: f32) -> f32 {
@@ -736,7 +760,9 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
 
   var val: f32;
   // dni upalne i noce tropikalne: liczby całkowite w oczku – bez wygładzenia tarasy i kanciaste plamy
-  if (isMap) { if (f == 89u || f == 90u) { val = mapBlur(f, X, Y); } else if (f == 38u || f == 42u) { val = radarAt(f, X, Y); } else { val = mapAt(f, X, Y); } } else { val = field3s(f, X, Y, S, V.mode == 0u); }
+  // wiatr 10 m i porywy B-sklejane (wiatr przy gruncie różni się oczko po oczku – szorstkość, stateczność; monotoniczna interpolacja rysowała
+  // każde oczko-ekstremum jako płaski kwadrat – pikseloza wiatru, użytkownik)
+  if (isMap) { if (f >= 89u && f <= 97u) { val = mapBlur(f, X, Y); } else if (f == 32u && V.hiF > 1.5) { val = 100.0 * snowHiAt(X, Y, 1u); } else if (f == 49u || f == 50u) { val = sfcBsp(select(S_GUST, S_U10, f == 50u), X, Y); } else if (f == 38u || f == 42u) { val = radarAt(f, X, Y); } else { val = mapAt(f, X, Y); } } else { val = field3s(f, X, Y, S, V.mode == 0u); }
   let fw = max(fwidth(val), 1e-6);
   let t = (val - V.lo) / (V.hi - V.lo);
   let cm = cmapOf(f);
@@ -747,6 +773,9 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
   if (cm == 40u) {
     // ciśnienie: stała skala (wxscales.js, mslp)
     col = wxPal(8u, val);
+  } else if (cm >= 41u && cm <= 43u) {
+    // uskok wiatru [m/s], SRH [m²/s²], SCP – skale Meteologix (klasy stałe)
+    col = wxPal(select(select(WX_SCP, WX_SRH, cm == 42u), WX_SHEAR, cm == 41u), val);
   } else if (cm >= 22u && cm <= 27u) {
     // skale WX Charts (klasy progowe, wxscales.js): wiatr w km/h; opad i śnieg poniżej pierwszego progu – teren
     let p = cm - 22u;
@@ -888,7 +917,9 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
     let slS = length(demSlope(X, Y));
     let qs = vec2f(X * DX, Y * DY) / 1800.0;
     let nzS = 0.65 * vnoise(qs + vec2f(5.3, 2.9)) + 0.35 * vnoise(qs * 2.6 + vec2f(1.7, 7.4)) - 0.5;
-    let aS0 = max(sfcBsp(S_SWE, Xg, Yg), 0.0) / 10.0 * exp(clamp(dhS / 350.0, -4.0, 2.0)) * (1.0 - 0.75 * smoothstep(0.7, 1.2, slS));
+    // (z gęstszym terenem – śnieg liczony w jego punktach, snowhi.wgsl)
+    let sweS = select(max(sfcBsp(S_SWE, Xg, Yg), 0.0) * exp(clamp(dhS / 350.0, -4.0, 2.0)), max(snowHiAt(Xg, Yg, 0u), 0.0), V.hiF > 1.5);
+    let aS0 = sweS / 10.0 * (1.0 - 0.75 * smoothstep(0.7, 1.2, slS));
     let fsn = select(smoothstep(0.0, 1.0, aS0 + 0.45 * nzS * smoothstep(0.02, 0.3, aS0)) * (1.0 - 0.5 * fwo), 0.0, wice);
     let gcol = mix(ground, vec3f(0.92, 0.94, 0.97), fsn) * (0.25 + 0.75 * lit);
     // zachmurzenie ogólne z tego samego opisu chmur co widok 3D i promieniowanie (cloudAt): w przerwach

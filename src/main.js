@@ -3,7 +3,7 @@ import { SHAPES, genShape, shapeFromImage, paintBrush, deriveTerrain, heightPng 
 import { LANDUSE, makeLand } from './land.js';
 import { LOCATIONS, CLIM, climate, biome, VEG, VEG_NAMES } from './climate.js';
 import { baseClim } from './climbase.js';
-import { fetchTerrain, fetchTerrainHi, peakFine, fetchLandCover, fetchCities, cachedClimate, cachedNormals, climateOf, MONTH_DAYS, fetchNormals, worldDem, worldElev, regionDem, demColor, lonLatToTile, tileToLonLat } from './geo.js';
+import { fetchTerrain, fetchTerrainHi, peakFine, fetchLandCover, fetchLeafType, fetchCities, cachedClimate, cachedNormals, climateOf, MONTH_DAYS, fetchNormals, worldDem, worldElev, regionDem, demColor, lonLatToTile, tileToLonLat } from './geo.js';
 import { PEModel, DTQ, PE_DT, PE_SPI, NXP, NYP, DXP, LXP, LYP, classifyCenter, nestNodes, sstClim } from './pe.js';
 import { parVec, paramGrid, paramAt, airTz, embed } from './nesting.js';
 import { sunVector, dayOfYear, dateFromDoy, moonSky } from './sun.js';
@@ -25,6 +25,7 @@ import view3dSrc from './shaders/view3d.wgsl?raw';
 import view3dnSrc from './shaders/view3dn.wgsl?raw';
 import atmoSrc from './shaders/atmo.wgsl?raw';
 import atmoLutSrc from './shaders/atmolut.wgsl?raw';
+import snowHiSrc from './shaders/snowhi.wgsl?raw';
 
 const MAX_STEPS = 128;      // maks. liczba kroków na klatkę
 const SLOT = 256;           // odstęp slotów parametrów w buforze uniform (wyrównanie dynamicznego offsetu)
@@ -137,7 +138,9 @@ async function init() {
   // stacje wyżej niż grunt modelu (szczyty): θ', q_v, u, v na dwóch poziomach wokół wysokości stacji (12 liczb na stację)
   const ST_AIR = 32, ST_AIR_OFF = PROBE_OFF + PROBE_N * 4;
   const MUV_OFF = ST_AIR_OFF + ST_AIR * 48;
-  const DIAG_BYTES = MUV_OFF + 8 * NZ;
+  // stacje: woda w śniegu i grubość pokrywy z gęstej pokrywy (snowhi.wgsl) w punkcie stacji (2 liczby na stację)
+  const ST_SN = 64, ST_SN_OFF = MUV_OFF + 8 * NZ;
+  const DIAG_BYTES = ST_SN_OFF + ST_SN * 8;
   const diagRead = buf(DIAG_BYTES, U.MAP_READ | U.COPY_DST, 'diagRead');
   const paramBuf = buf(SLOT * MAX_STEPS, U.UNIFORM | U.COPY_DST, 'params');
   const TG_SLOT = 4 * N + 15 * NXY;                // pola docelowe jednego terminu (3D: θ', q_v, u, v; 2D: u_g, v_g, p, w, geometria frontu ×8, diagnostyka ×3)
@@ -226,6 +229,8 @@ async function init() {
   const demHiBuf = buf(Math.max(16, DEMF >= 2 ? NXD * NYD * DEMF * DEMF * 4 : 16), U.STORAGE | U.COPY_DST, 'demHi');
   // gęstsze pokrycie terenu tylko do obrazu (satelita, „Surface type”): typ powierzchni w tych samych punktach co gęstszy teren, 1 bajt na punkt
   const vegHiBuf = buf(Math.max(16, DEMF >= 2 ? Math.ceil(NXD * NYD * DEMF * DEMF / 4) * 4 : 16), U.STORAGE | U.COPY_DST, 'vegHi');
+  // śnieg w rozdzielczości gęstszego terenu (snowhi.wgsl, tylko obraz): woda w śniegu i grubość w punktach demHi + liczniki opadu oczek
+  const snowHiBuf = buf(Math.max(16, DEMF >= 2 ? (2 * NXD * NYD * DEMF * DEMF + 2 * NXY) * 4 : 16), U.STORAGE | U.COPY_DST | U.COPY_SRC, 'snowHi');
   // szum 3D (Perlin–Worley, Worley, Perlin; vol.wgsl noise_gen) – faktura chmur na satelicie i detal chmur w widoku 3D
   const NOISE_N = 128, NOISE_MIPS = 8;
   const noiseTex = device.createTexture({ size: [NOISE_N, NOISE_N, NOISE_N], dimension: '3d', format: 'rgba8unorm', mipLevelCount: NOISE_MIPS, usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING, label: 'noise' });
@@ -237,6 +242,7 @@ async function init() {
       ...[1, 2, 3, 4, 5, 6].map((b) => ({ binding: b, visibility: F, buffer: { type: 'read-only-storage' } })),
       { binding: 7, visibility: F, texture: { sampleType: 'float', viewDimension: '3d' } },
       { binding: 8, visibility: F, sampler: { type: 'filtering' } },
+      { binding: 9, visibility: F, buffer: { type: 'read-only-storage' } },
     ],
   });
   // (wszystkie potoki obrazu też asynchronicznie – jak jądra modelu wyżej)
@@ -256,7 +262,7 @@ async function init() {
     const bg = device.createBindGroup({
       layout: renderLayout,
       entries: [...[ubuf, vgBuf, stateBuf, workBuf, sfcBuf, demHiBuf, vegHiBuf].map((b, i) => ({ binding: i, resource: { buffer: b } })),
-        { binding: 7, resource: noiseTex.createView() }, { binding: 8, resource: sRepMip }],
+        { binding: 7, resource: noiseTex.createView() }, { binding: 8, resource: sRepMip }, { binding: 9, resource: { buffer: snowHiBuf } }],
     });
     return { ...v, ctx, ubuf, bg };
   });
@@ -294,6 +300,50 @@ async function init() {
     rpipe(v3Module, 'fs', format), rpipe(v3nModule, 'fs', 'rgba16float'), rpipe(v3nModule, 'fs_post', format)]);
   const bgOf = (p, entries) => device.createBindGroup({ layout: p.getBindGroupLayout(0), entries: entries.map(([b, r]) => ({ binding: b, resource: r })) });
   const noiseLevel = (l) => noiseTex.createView({ baseMipLevel: l, mipLevelCount: 1 });
+  // Śnieg w rozdzielczości gęstszego terenu (tylko obraz: mapa grubości pokrywy, satelita): po krokach, co ~10 min symulacji (w trybie MAX
+  // co porcję kroków); start z oczek przy nowym przebiegu i wczytaniu gęstszego terenu (snowHi.need)
+  const snowModule = await module(header + snowHiSrc, 'snowhi');
+  const snP = buf(32, U.UNIFORM | U.COPY_DST, 'snP');
+  const [pSnow, pSnowMark] = await Promise.all(['snow_hi', 'snow_hi_mark'].map((e) => device.createComputePipelineAsync({ layout: 'auto', compute: { module: snowModule, entryPoint: e } })));
+  const bSnow = bgOf(pSnow, [[0, { buffer: snP }], [1, { buffer: vgBuf }], [2, { buffer: stateBuf }], [3, { buffer: sfcBuf }], [4, { buffer: demHiBuf }], [5, { buffer: snowHiBuf }], [6, { buffer: vegHiBuf }]]);
+  const bSnowMark = bgOf(pSnowMark, [[0, { buffer: snP }], [3, { buffer: sfcBuf }], [5, { buffer: snowHiBuf }]]);
+  const snowHi = { t: 0, need: true };
+  function snowHiPass(enc, tEnd) {
+    if (DEMF < 2 || !demHiOk()) return;
+    const init = snowHi.need, dt = tEnd - snowHi.t;
+    if (!init && dt < 600) return;
+    const ck = clock(tEnd), sun = sunVector(num('lat'), ck.doy, ck.hour);
+    device.queue.writeBuffer(snP, 0, new Float32Array([Math.max(dt, 0), DEMF, init ? 1 : 0, sun.x, sun.y, sun.z, vegHiOk() ? 1 : 0, 0]));
+    const pass = enc.beginComputePass();
+    pass.setPipeline(pSnow); pass.setBindGroup(0, bSnow); pass.dispatchWorkgroups(Math.ceil(NXD * DEMF / 8), Math.ceil(NYD * DEMF / 8));
+    pass.setPipeline(pSnowMark); pass.setBindGroup(0, bSnowMark); pass.dispatchWorkgroups(Math.ceil(NXY / 64));
+    pass.end();
+    snowHi.t = tEnd; snowHi.need = false;
+  }
+  // dymek przy kursorze: woda w śniegu i grubość gęstej pokrywy w punkcie pod kursorem (mały odczyt z GPU, gdy kursor przejdzie na inny punkt
+  // albo poprzedni odczyt ma > 1 s)
+  const snowTipBuf = buf(8, U.MAP_READ | U.COPY_DST, 'snowTip');
+  let snowTipBusy = false;
+  function snowTipPoint(x, y) {
+    if (DEMF < 2 || !demHiOk() || snowHi.need) return -1;
+    const W = NXD * DEMF, H = NYD * DEMF, u = Math.floor((x - MG) * DEMF), v = Math.floor((y - MG) * DEMF);
+    return u < 0 || v < 0 || u >= W || v >= H ? -1 : v * W + u;
+  }
+  function snowTipRequest(p) {
+    if (snowTipBusy || p < 0 || (sim.snowTip && sim.snowTip.p === p && performance.now() - sim.snowTip.t < 1000)) return;
+    const NP = NXD * DEMF * NYD * DEMF, enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(snowHiBuf, p * 4, snowTipBuf, 0, 4);
+    enc.copyBufferToBuffer(snowHiBuf, (NP + p) * 4, snowTipBuf, 4, 4);
+    device.queue.submit([enc.finish()]);
+    snowTipBusy = true;
+    snowTipBuf.mapAsync(GPUMapMode.READ).then(() => {
+      const a = new Float32Array(snowTipBuf.getMappedRange().slice(0));
+      snowTipBuf.unmap();
+      snowTipBusy = false;
+      sim.snowTip = { p, swe: a[0], snd: a[1], t: performance.now() };
+      updateTip();
+    }).catch(() => { snowTipBusy = false; });
+  }
   const bNoise = bgOf(pNoise, [[4, noiseLevel(0)]]);
   const bGround = bgOf(pGround, [[0, { buffer: volP }], [1, { buffer: vgBuf }], [2, { buffer: stateBuf }], [3, { buffer: sfcBuf }], [5, groundTex.createView()], [11, frzTex.createView()]]);
   const bVol = bgOf(pVol, [[0, { buffer: volP }], [1, { buffer: vgBuf }], [2, { buffer: stateBuf }], [3, { buffer: sfcBuf }], [6, densTex.createView()], [7, densPrev.createView()]]);
@@ -428,12 +478,39 @@ async function init() {
   // miejscowości na mapie (GeoNames, public/cities) – właściwa funkcja przypisana po utworzeniu stacji; wołane przy każdej zmianie terenu,
   // pobiera tylko przy zmianie miejsca / rozmiaru mapy
   let refreshCities = () => {};
+  // głębokość wody [m] na pełnej siatce: z batymetrii (sim.wdep, mapa świata), ≥ 3 m; bez danych (jeziora – kafle mają tylko lustro wody,
+  // teren malowany, zapis stanu) – morze 30 m, jezioro 10 m
+  function waterDepth() {
+    const dv = new Float32Array(NXV * NYV);
+    for (let k = 0; k < NXV * NYV; k++) {
+      const d = sim.wdep && sim.wdep.length === NXV * NYV ? sim.wdep[k] : 0;
+      dv[k] = d >= 1 ? Math.max(3, d) : sim.hv[k] <= num('sea') + 1 ? 30 : 10;
+    }
+    return embed(dv);
+  }
+  // klimatologia temperatury wody dla bieżącej daty (pole TWC): morze – SST modelu synoptycznego (albo klimatologia SST), jeziora – z klimatu
+  // jak suwak „woda” na starcie, suwak ustawiony ręcznie – jego wartość; + anomalia z manipulacji (temperatura atmosfery na starcie i morza)
+  function twcUpdate() {
+    const out = new Float32Array(NXY), ck = clock(sim.time);
+    const tan = drv.mode === 'syn' ? num('tanom') : 0, sst = manipSstAt(sim.time) || 0;
+    for (let c = 0; c < NXY; c++) {
+      if (!(sim.land && sim.land.cls[c] === 3)) continue;
+      let t;
+      if (sim.waterUser) t = num('water');
+      else if (sim.h[c] <= 1 && drv.mode === 'syn') t = (drv.model ? drv.model.seaTemp(((c % NX) + 0.5 - NXV / 2) * CFG.DX, (Math.floor(c / NX) + 0.5 - NYV / 2) * CFG.DY) : null) ?? sstClim(latRow(c), ck.doy);
+      else t = Math.min(30, Math.max(0, climate(latRow(c), ck.doy - 25, 0.9, 0).tDay + 1));
+      out[c] = t + 273.15 + (sim.waterUser ? 0 : tan) + sst;
+    }
+    device.queue.writeBuffer(sfcBuf, S.TWC * NXY * 4, out);
+  }
   function applyTerrain() {
     sim.hs = seaHeights();
     sim.h = embed(sim.hs);
-    const t = deriveTerrain(sim.h, CFG, new URLSearchParams(location.search).get('pc') !== '0');
+    const q = new URLSearchParams(location.search);
+    const t = deriveTerrain(sim.h, CFG, q.get('pc') !== '0', q.get('tfl') !== '0');
     device.queue.writeBuffer(vgBuf, grid.off.KB * 4, t.kb);
     device.queue.writeBuffer(vgBuf, grid.off.HF * 4, t.hf);
+    device.queue.writeBuffer(vgBuf, grid.off.WDEP * 4, waterDepth());
     device.queue.writeBuffer(vgBuf, grid.off.HGT * 4, sim.h);
     device.queue.writeBuffer(vgBuf, grid.off.SLX * 4, t.slx);
     device.queue.writeBuffer(vgBuf, grid.off.SLY * 4, t.sly);
@@ -517,7 +594,9 @@ async function init() {
     // roślinność z klimatu (szerokość, kontynentalizm, wilgotność klimatu) i wysokości terenu
     const veg = new Float32Array(NXY);
     for (let c = 0; c < NXY; c++) {
-      veg[c] = biome(sim.land.cls[c], latRow(c), num('cont'), num('hum'), sim.h[c], cellRnd(c));
+      // (udział lasu iglastego z danych – ESA CCI, fetchLeafType – tylko w widocznej części siatki obliczeniowej, jak maski pędzla)
+      const ndl = sim.ndl && c % NX < NXV && c < NYV * NX ? sim.ndl[Math.floor(c / NX) * NXV + c % NX] : NaN;
+      veg[c] = biome(sim.land.cls[c], latRow(c), num('cont'), num('hum'), sim.h[c], cellRnd(c), ndl);
       if (sim.vmask && sim.land.cls[c] !== 3 && c % NX < NXV && c < NYV * NX) {
         const pv = sim.vmask[Math.floor(c / NX) * NXV + c % NX];
         if (pv >= 0) veg[c] = pv;
@@ -616,7 +695,8 @@ async function init() {
   // zapis wprost do bufora vg) albo ze stałej masy powietrza (pg z CPU)
   function buildSlot(slot, pg = null) {
     // (stała masa powietrza: bez cyklonów tropikalnych z modelu synoptycznego w celu – lista pusta)
-    if (pg) { device.queue.writeBuffer(vgBuf, grid.off.PGRID * 4, pg); device.queue.writeBuffer(vgBuf, grid.off.TCL * 4, new Float32Array(8 * 24)); }
+    // (stała masa: bez siatki parametrów wokół domeny – znacznik 0, wykrywanie frontów z siatki parametrów jak dawniej)
+    if (pg) { device.queue.writeBuffer(vgBuf, grid.off.PGRID * 4, pg); device.queue.writeBuffer(vgBuf, grid.off.TCL * 4, new Float32Array(8 * 24)); device.queue.writeBuffer(vgBuf, (grid.off.FRH + 7 * CFG.FRH.n) * 4, new Float32Array(1)); }
     const ab = new ArrayBuffer(PARAM_BYTES);
     new Uint32Array(ab)[22] = slot;
     new Float32Array(ab)[31] = mAt('T', sim.time);     // manipulacja atmosfery: anomalia temperatury, mnożnik opadu
@@ -624,7 +704,7 @@ async function init() {
     device.queue.writeBuffer(paramBuf, 0, ab);
     const enc = device.createCommandEncoder(), tm = tmOf(tmTerm);
     const pass = enc.beginComputePass(tm ? { timestampWrites: tm.wr } : undefined);
-    if (!pg) { drv.model.encodeParams(pass); drv.model.encodeTC(pass); }
+    if (!pg) { drv.model.encodeParams(pass, true); drv.model.encodeTC(pass); }
     pass.setPipeline(tgtBuild.p);
     pass.setBindGroup(0, simBG, [0]);
     pass.dispatchWorkgroups(tgtBuild.g[0], tgtBuild.g[1]);
@@ -940,14 +1020,23 @@ async function init() {
   }
   // Widok „Miesiące”: statystyki miesięcy kalendarzowych symulacji. Liczniki bieżącego miesiąca na GPU (pola MTS…MSN: Σ T 2 m·Δt,
   // Σ dobowych T maks. i min. z pełnych dób, opad i śnieg, ekstrema, dni upalne i noce tropikalne); o północy kończącej miesiąc – odczyt
-  // widocznej części do pamięci (5 temperatur × 100 jako Int16, 3 opady × 10 jako Uint16, 2 liczniki dni jako Uint16 – 20 B na oczko i miesiąc:
-  // 200 × 200 oczek ~0.8 MB) i zerowanie liczników.
+  // widocznej części do pamięci (5 temperatur × 100 jako Int16, 3 opady × 10 jako Uint16, 2 liczniki dni jako Uint16, 7 klas dni
+  // charakterystycznych jako Uint8 – 27 B na oczko i miesiąc: 200 × 200 oczek ~1.1 MB) i zerowanie liczników.
   // Zakładka „Analizy klimatyczne”: okresy – miesiące, pory roku (meteorologiczne: XII–II, III–V, VI–VIII, IX–XI) i lata
   // kalendarzowe, składane z zapisanych miesięcy (+ bieżący do tej chwili): T średnia ważona czasem, T maks. i min. – liczbą pełnych
   // dób, opad i śnieg sumowane. Przyciski map (pola 80–90), suwak okresu, tabela średnich po widocznej domenie.
   const MON_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
   const SEASONS = ['winter', 'spring', 'summer', 'autumn'];
-  const MON_F = [S.MTS, S.MTX, S.MTN, S.MPR, S.MSN, S.MXA, S.MNA, S.MPD, S.MHOT, S.MTRO];
+  const MON_F = [S.MTS, S.MTX, S.MTN, S.MPR, S.MSN, S.MXA, S.MNA, S.MPD, S.MHOT, S.MTRO, S.MDXF, S.MDVF, S.MDFR, S.MDFD, S.MDWM, S.MDSU, S.MDVH];
+  // Dni charakterystyczne (zakładka „Characteristic days”, pola 89–97; kolejność kolumn tabeli): klasy rozłączne wg T maks. (doba tylko
+  // w najostrzejszej klasie), przymrozkowe (T min < 0 przy T maks ≥ 0), noce tropikalne. Zapisany miesiąc: C – Uint16 dni z T maks. ≥ 30 °C
+  // i noce tropikalne, D – Uint8 klasy 91–97; upalne 30…35 °C = C[0] − bardzo upalne (D[6]); bieżący miesiąc – liczniki na GPU
+  const DAY_F = [91, 92, 93, 94, 95, 96, 89, 97, 90];
+  const DAY_S = { 91: 'MDXF', 92: 'MDVF', 93: 'MDFR', 94: 'MDFD', 95: 'MDWM', 96: 'MDSU', 97: 'MDVH' };
+  const dayFld = (f = num('fieldH')) => f >= 89 && f <= 97;
+  const monDayN = (m, f, v) => (f === 90 ? (m.C ? m.C[1][v] : 0) : f === 89 ? (m.C ? m.C[0][v] : 0) - (m.D ? m.D[6][v] : 0) : (m.D ? m.D[f - 91][v] : 0));
+  const curDayN = (f, c) => { const g = (nm) => sim.sfc[S[nm] * NXY + c]; return f === 90 ? g('MTRO') : f === 89 ? g('MHOT') - g('MDVH') : g(DAY_S[f]); };
+  const monDn = (m) => DAY_F.map((f) => { let s = 0; for (let v = 0; v < NXD * NYD; v++) s += monDayN(m, f, v); return s / (NXD * NYD); });
   const monDay = K('mon_day', NXY, 64), monAbs = K('mon_abs', NXY, 64);
   const mon = { list: [], key: -1, t0: 0, days: 0, dayT0: 0, pending: null };
   const monKey = (t) => {
@@ -955,7 +1044,7 @@ async function init() {
     return d.getUTCFullYear() * 12 + d.getUTCMonth();
   };
   const monLabel = (k) => `${MON_NAMES[k % 12]} ${Math.floor(k / 12)}`;
-  const monFld = (f = num('fieldH')) => f >= 80 && f <= 90;
+  const monFld = (f = num('fieldH')) => f >= 80 && f <= 97;
   // okresy rodzaju kind ('m' miesiące, 's' pory roku, 'y' lata): { key, months (zapisane), cur (obejmuje bieżący miesiąc) } –
   // chronologicznie; klucz pory roku = rok·4 + pora (zima z grudniem roku poprzedniego)
   let anaKind = 'm';
@@ -989,6 +1078,7 @@ async function init() {
     monUi();
   }
   function monMidnight(enc) {
+    twcUpdate();
     // ekstrema miesiąca: każda północ (także po niepełnej dobie)
     {
       const pass = enc.beginComputePass();
@@ -1016,6 +1106,7 @@ async function init() {
     await p.rb.mapAsync(GPUMapMode.READ);
     const a = new Float32Array(p.rb.getMappedRange()), n = NXD * NYD;
     const T = [new Int16Array(n), new Int16Array(n), new Int16Array(n), new Int16Array(n), new Int16Array(n)], P = [new Uint16Array(n), new Uint16Array(n), new Uint16Array(n)], C = [new Uint16Array(n), new Uint16Array(n)];
+    const D = Array.from({ length: 7 }, () => new Uint8Array(n));
     const q = (x) => Math.max(-32767, Math.min(32767, Math.round(100 * x)));
     for (let j = 0; j < NYD; j++) for (let i = 0; i < NXD; i++) {
       const c = (j + MG) * NX + i + MG, v = j * NXD + i, tm = a[c] / p.secs;
@@ -1028,13 +1119,16 @@ async function init() {
       T[4][v] = q(1000 - a[6 * NXY + c]);
       P[2][v] = Math.min(65535, Math.round(10 * a[7 * NXY + c]));
       C[0][v] = Math.round(a[8 * NXY + c]); C[1][v] = Math.round(a[9 * NXY + c]);
+      for (let k = 0; k < 7; k++) D[k][v] = Math.min(255, Math.round(a[(10 + k) * NXY + c]));
     }
     p.rb.unmap(); p.rb.destroy();
     const avg = (x, sc) => x.reduce((s, y) => s + y, 0) / n / sc;
-    mon.list.push({ key: p.key, days: p.days, secs: p.secs, T, P, C,
+    const rec = { key: p.key, days: p.days, secs: p.secs, T, P, C, D,
       avg: { t: avg(T[0], 100), tx: avg(T[1], 100), tn: avg(T[2], 100), p: avg(P[0], 10), s: avg(P[1], 10),
         // ekstrema w widocznej domenie
-        tX: T[3].reduce((m, y) => Math.max(m, y), -32768) / 100, tN: T[4].reduce((m, y) => Math.min(m, y), 32767) / 100, pD: P[2].reduce((m, y) => Math.max(m, y), 0) / 10 } });
+        tX: T[3].reduce((m, y) => Math.max(m, y), -32768) / 100, tN: T[4].reduce((m, y) => Math.min(m, y), 32767) / 100, pD: P[2].reduce((m, y) => Math.max(m, y), 0) / 10 } };
+    rec.avg.dn = monDn(rec);
+    mon.list.push(rec);
     monUi(); monShow();
   }
   // wielkość f (80–90) okresu p w oczkach widocznej części [NXD·NYD]: zapisane miesiące + bieżący (z kopii liczników); T średnia
@@ -1043,12 +1137,9 @@ async function init() {
   function perField(p, f, only = -1) {
     const v0 = only >= 0 ? only : 0, v1 = only >= 0 ? only + 1 : NXD * NYD, acc = new Float64Array(v1 - v0);
     if (f >= 89) {
-      // liczba dni upalnych / nocy tropikalnych: zapisane miesiące + liczniki bieżącego
-      for (const m of p.months) if (m.C) for (let v = v0; v < v1; v++) acc[v - v0] += m.C[f - 89][v];
-      if (p.cur && sim.sfc) {
-        const o = S[f === 89 ? 'MHOT' : 'MTRO'] * NXY;
-        for (let v = v0; v < v1; v++) acc[v - v0] += sim.sfc[o + (Math.floor(v / NXD) + MG) * NX + (v % NXD) + MG];
-      }
+      // dni charakterystyczne: zapisane miesiące + liczniki bieżącego
+      for (const m of p.months) for (let v = v0; v < v1; v++) acc[v - v0] += monDayN(m, f, v);
+      if (p.cur && sim.sfc) for (let v = v0; v < v1; v++) acc[v - v0] += curDayN(f, (Math.floor(v / NXD) + MG) * NX + (v % NXD) + MG);
       return acc;
     }
     if (f >= 86) {
@@ -1112,20 +1203,35 @@ async function init() {
     const doby = (n) => `${n} full day${n === 1 ? '' : 's'}`;
     $('monV').textContent = p ? `${perLabel(anaKind, p.key)}${p.cur ? ' (in progress)' : ''} · ${doby(p.months.reduce((s, m) => s + m.days, 0) + (p.cur ? mon.days : 0))}` : '–';
     for (const b of $('anaKind').children) b.classList.toggle('on', b.dataset.k === anaKind);
-    monTable(true);
+    // zakładka dni charakterystycznych: ten sam okres
+    $('daySel').max = el.max; $('daySel').value = el.value; $('dayV').textContent = $('monV').textContent;
+    for (const b of $('dayKind').children) b.classList.toggle('on', b.dataset.k === anaKind);
+    monTable(true); dayTable(true);
   }
   // przyciski map; suwak i wiersz tabeli przy innej mapie włączają ostatnio wybraną mapę miesięczną
-  let monLast = 80;
+  let monLast = 80, dayLast = 89;
   function monPick(f) {
     if (f) monLast = f;
-    if (f || !monFld()) $('fieldH').value = String(monLast);
+    if (f || !monFld() || dayFld()) $('fieldH').value = String(monLast);
     monUi(); monShow(); labels();
   }
-  for (const [f, name] of [[80, 'Mean T'], [81, 'Mean T max'], [82, 'Mean T min'], [86, 'Absolute T max'], [87, 'Absolute T min'], [88, 'Max daily precip.'], [83, 'Precip.'], [84, 'Rain'], [85, 'Snow'], [89, 'Hot days'], [90, 'Tropical nights']]) {
+  function dayPick(f) {
+    if (f) dayLast = f;
+    if (f || !dayFld()) $('fieldH').value = String(dayLast);
+    monUi(); monShow(); labels();
+  }
+  for (const [f, name] of [[80, 'Mean T'], [81, 'Mean T max'], [82, 'Mean T min'], [86, 'Absolute T max'], [87, 'Absolute T min'], [88, 'Max daily precip.'], [83, 'Precip.'], [84, 'Rain'], [85, 'Snow']]) {
     const b = document.createElement('button');
     b.className = 'btn'; b.textContent = name; b.title = FIELDS[f].name; b.dataset.f = f;
     b.onclick = () => monPick(f);
     $('monBtns').appendChild(b);
+  }
+  const DAY_NAMES = { 91: 'Extremely frosty', 92: 'Very frosty', 93: 'Frosty', 94: 'Frost days', 95: 'Warm', 96: 'Summer days', 89: 'Hot', 97: 'Very hot', 90: 'Tropical nights' };
+  for (const f of DAY_F) {
+    const b = document.createElement('button');
+    b.className = 'btn'; b.textContent = DAY_NAMES[f]; b.title = FIELDS[f].name; b.dataset.f = f;
+    b.onclick = () => dayPick(f);
+    $('dayBtns').appendChild(b);
   }
   // średnie bieżącego miesiąca po widocznej domenie – z kopii pól przy gruncie (null, gdy kopia sprzed początku miesiąca)
   function monCur() {
@@ -1146,8 +1252,13 @@ async function init() {
         pD = Math.max(pD, v('MPD'), v('PACC') - v('PD0'));
       }
     }
+    const dn = DAY_F.map((f) => {
+      let s = 0;
+      for (let j = MG; j < MG + NYD; j++) for (let i = MG; i < MG + NXD; i++) s += curDayN(f, j * NX + i);
+      return s / (NXD * NYD);
+    });
     return { t: g('MTS') / secs, tx: mon.days ? g('MTX') / mon.days : NaN, tn: mon.days ? g('MTN') / mon.days : NaN, p: g('MPR'), s: g('MSN'),
-      tX, tN, pD, secs, days: mon.days };
+      tX, tN, pD, dn, secs, days: mon.days };
   }
   // średnie okresu po widocznej domenie: z średnich zapisanych miesięcy i bieżącego (monCur) – T ważona czasem, maks. i min. liczbą
   // pełnych dób, opad i śnieg sumowane (null – brak danych)
@@ -1158,7 +1269,9 @@ async function init() {
     const W = (w, k) => parts.reduce((s, a) => s + (Number.isFinite(a[k]) ? a[w] : 0), 0);
     const t = S1('t', 'secs') / W('secs', 't'), dx = W('days', 'tx'), dn = W('days', 'tn');
     return { t, tx: dx > 0 ? S1('tx', 'days') / dx : NaN, tn: dn > 0 ? S1('tn', 'days') / dn : NaN, p: S1('p'), s: S1('s'),
-      tX: Math.max(...parts.map((a) => a.tX)), tN: Math.min(...parts.map((a) => a.tN)), pD: Math.max(...parts.map((a) => a.pD)) };
+      tX: Math.max(...parts.map((a) => a.tX)), tN: Math.min(...parts.map((a) => a.tN)), pD: Math.max(...parts.map((a) => a.pD)),
+      // dni charakterystyczne: średnia liczba dób w oczku (kolejność DAY_F), sumowana po miesiącach
+      dn: DAY_F.map((_, k) => parts.reduce((s, a) => s + (a.dn ? a.dn[k] : 0), 0)) };
   }
   // tabela zakładki: sekcje miesiące, pory roku, lata (klik w wiersz – mapa tego okresu), okres w toku z gwiazdką, „Razem” – cały
   // przebieg; full = false – tylko wartości (co odczyt pól, bez przebudowy wierszy)
@@ -1195,6 +1308,49 @@ async function init() {
     if (!tf.rows.length) { const tr = tf.insertRow(); for (let c = 0; c < 9; c++) tr.insertCell(); tr.cells[0].textContent = 'Total'; }
     cells(perAvg(all, cur)).forEach((t, c) => { tf.rows[0].cells[c + 1].textContent = t; });
   }
+  // tabela zakładki dni charakterystycznych – jak monTable; kolumny: średnia liczba pełnych dób w oczku w klasach DAY_F (progi w jednostkach na ekranie)
+  function dayTable(full) {
+    const tb = $('dayTab').tBodies[0], hr0 = $('dayTab').tHead.rows[0];
+    if (full || !hr0.cells.length) {
+      const t = (v) => nD(v, '°C', 0), F = (v) => fT(v, 0);
+      const lab = [['Period', 'Period'], [`≤${t(-15)}`, `Extremely frosty: T max ≤ ${F(-15)}`], [`≤${t(-10)}`, `Very frosty: ${F(-15)} < T max ≤ ${F(-10)}`],
+        [`<${t(0)}`, `Frosty: ${F(-10)} < T max < ${F(0)}`], ['Fr', `Frost days: T min < ${F(0)}, T max ≥ ${F(0)}`], [`≥${t(20)}`, `Warm: ${F(20)} ≤ T max < ${F(25)}`],
+        [`≥${t(25)}`, `Summer days: ${F(25)} ≤ T max < ${F(30)}`], [`≥${t(30)}`, `Hot: ${F(30)} ≤ T max < ${F(35)}`], [`≥${t(35)}`, `Very hot: T max ≥ ${F(35)}`],
+        ['TN', `Tropical nights: T min ≥ ${F(20)}`]];
+      hr0.innerHTML = lab.map(([s, ti]) => `<th title="${ti}">${s}</th>`).join('');
+      [-15, -10, 0, 20, 25, 30, 35].forEach((v, k) => document.querySelectorAll(`.dT${k}`).forEach((e) => { e.textContent = F(v); }));
+    }
+    if (mon.key < 0) return;                                  // przed pierwszym startem
+    const cur = monCur();
+    const fx = (v) => (Number.isFinite(v) ? (v >= 9.95 ? v.toFixed(0) : v.toFixed(1)) : '–');
+    const cells = (a) => (a && a.dn ? a.dn.map(fx) : Array(9).fill('–'));
+    const secs = [['m', 'Months'], ['s', 'Seasons'], ['y', 'Years']].map(([k, name]) => ({ k, name, ps: periods(k) }));
+    const nRows = secs.reduce((s, x) => s + 1 + x.ps.length, 0);
+    if (full || tb.rows.length !== nRows) {
+      tb.innerHTML = '';
+      const selK = anaKind, sel = monSelIdx();
+      for (const { k, name, ps } of secs) {
+        const hr = tb.insertRow(); hr.className = 'sec';
+        const hc = hr.insertCell(); hc.colSpan = 10; hc.textContent = name;
+        ps.forEach((p, r) => {
+          const tr = tb.insertRow();
+          [`${perLabel(k, p.key, true)}${p.cur ? '*' : ''}`, ...cells(perAvg(p, cur))].forEach((x) => { tr.insertCell().textContent = x; });
+          tr.classList.toggle('on', k === selK && r === sel);
+          tr.onclick = () => { anaKind = k; monUi(); $('monSel').value = String(r); dayPick(); };
+        });
+      }
+    } else {
+      let r = 0;
+      for (const { ps } of secs) {
+        r++;
+        for (const p of ps) { if (p.cur) cells(perAvg(p, cur)).forEach((x, c) => { tb.rows[r].cells[c + 1].textContent = x; }); r++; }
+      }
+    }
+    const all = { months: mon.list, cur: true }, tf = $('dayTab').tFoot;
+    if (mon.list.length < 1) { tf.innerHTML = ''; return; }
+    if (!tf.rows.length) { const tr = tf.insertRow(); for (let c = 0; c < 10; c++) tr.insertCell(); tr.cells[0].textContent = 'Total'; }
+    cells(perAvg(all, cur)).forEach((x, c) => { tf.rows[0].cells[c + 1].textContent = x; });
+  }
   // skala sumy opadu: okres z listy „Suma opadu – okres” albo długość wybranego okresu analiz (mapy 83–85)
   function psumF(id) {
     if (id === 88) return Math.max(0.1, (1 / 16) ** 0.7);     // opad jednej doby
@@ -1209,8 +1365,9 @@ async function init() {
     const pr = monSelPer();
     if (!pr) return '–';
     const v = j * NXD + i, at = (f) => perField(pr, f, v)[0];
+    if (dayFld()) return DAY_F.map((f) => `${DAY_NAMES[f].toLowerCase()} ${at(f)}`).join(' · ');
     const t = at(80), tx = at(81), tn = at(82), p = at(83), s = at(85), ax = at(86), an = at(87), pd = at(88);
-    return `T ${fT(t)} (${nD(tn, '°C', 1)} … ${nD(tx, '°C', 1)}) · precip. ${fm(p, 'mm', 1)} (rain ${nD(Math.max(0, p - s), 'mm', 1)}, snow ${nD(s, 'mm', 1)}) · absolute ${nD(an, '°C', 1)} … ${fT(ax)} · max day ${pd.toFixed(1)} mm · hot days ${at(89)} · tropical nights ${at(90)}`;
+    return `T ${fT(t)} (${nD(tn, '°C', 1)} … ${nD(tx, '°C', 1)}) · precip. ${fm(p, 'mm', 1)} (rain ${nD(Math.max(0, p - s), 'mm', 1)}, snow ${nD(s, 'mm', 1)}) · absolute ${nD(an, '°C', 1)} … ${fT(ax)} · max day ${pd.toFixed(1)} mm · days with T max ≥ ${fT(30, 0)}: ${at(89) + at(97)} · tropical nights ${at(90)}`;
   }
   // skala sumy opadu rozciągana z długością okresu: progi WX Charts (0.1 … 2000 mm, pomyślane dla ~16 dób) × (dni/16)^0.7 –
   // doba: do ~290 mm, 7 dni ~1100, 30 dni ~3100, 90 dni ~6000 (okres „od startu” – liczba dób symulacji, co najmniej 1)
@@ -1267,7 +1424,7 @@ async function init() {
       try { const w = await worldDem(); geo = { lon: num('lon'), elev: (la, lo) => worldElev(w, la, lo) }; } catch { geo = null; }
     }
     const m = await PEModel.create(device, { varAt: manipVarAt, sstAt: manipSstAt, lat: num('lat'), lon: num('lon'), cont: num('cont'), hum: num('hum'), doy: dayOfYear($('date').value), hour: num('hour'),   // godzina startu: słońce w PE zgodne z domeną
-      seed: drv.seed, geo, nest: { vgBuf, pgOff: grid.off.PGRID, tclOff: grid.off.TCL, half: [CFG.NXV * CFG.DX / 2, CFG.NYV * CFG.DY / 2], ...NODES } });
+      seed: drv.seed, geo, nest: { vgBuf, pgOff: grid.off.PGRID, tclOff: grid.off.TCL, frhOff: grid.off.FRH, half: [CFG.NXV * CFG.DX / 2, CFG.NYV * CFG.DY / 2], ...NODES } });
     await m.spinup(SPIN, (f) => { $('wxNow').textContent = `The synoptic model is spinning up: ${Math.round(SPIN * f)} / ${SPIN} days…`; });
     // korekta klimatu: kopia modelu z zaburzonym stanem i innym losowaniem rdzenia arktycznego (własna pogoda) liczy CC_START dób
     // naprzód (próbki co 12 h), dalej w tle – zawsze CC_WIN dób przed symulacją (weatherTick)
@@ -1293,6 +1450,7 @@ async function init() {
   function reset() { resetting = resetting.then(doReset).catch((e) => fail(String(e.stack || e))); return resetting; }
   async function doReset() {
     sim.busy = true;
+    snowHi.need = true;
     manipFlat();
     if (drv.mode === 'syn') {
       await prepareModel();
@@ -1394,6 +1552,7 @@ async function init() {
       sf[S.PSL * NXY + c] = pv[12];
     }
     device.queue.writeBuffer(sfcBuf, 0, sf);
+    twcUpdate();                                  // klimatologia temperatury wody dla daty startu
     sim.startHour = num('hour');
     sim.doy0 = doy;
     sim.year = Number(($('date').value || '2026').slice(0, 4));
@@ -1481,6 +1640,7 @@ async function init() {
       const enc = device.createCommandEncoder();
       const useTS = measure && first && ts && !ts.pending;
       encodeSteps(enc, m, useTS);
+      snowHiPass(enc, sim.time + m * DT);
       if (useTS) {
         enc.resolveQuerySet(ts.qs, 0, 2, ts.resolve, 0);
         enc.copyBufferToBuffer(ts.resolve, 0, ts.read, 0, 16);
@@ -1546,6 +1706,18 @@ async function init() {
       });
     });
     sim.stReqEnc = req;
+    // śnieg stacji z gęstej pokrywy (punkt gęstszego terenu pod stacją), gdy jest
+    let sn = [];
+    if (DEMF >= 2 && demHiOk() && !snowHi.need) {
+      try { sn = stations.snowPts().slice(0, ST_SN); } catch { sn = []; }
+      const W = NXD * DEMF, H = NYD * DEMF, NP = W * H;
+      sn.forEach((s, n) => {
+        const u = Math.min(W - 1, Math.max(0, Math.floor(s.xkm * 1000 / CFG.DX * DEMF))), v = Math.min(H - 1, Math.max(0, Math.floor(s.ykm * 1000 / CFG.DY * DEMF)));
+        enc.copyBufferToBuffer(snowHiBuf, (v * W + u) * 4, diagRead, ST_SN_OFF + n * 8, 4);
+        enc.copyBufferToBuffer(snowHiBuf, (NP + v * W + u) * 4, diagRead, ST_SN_OFF + n * 8 + 4, 4);
+      });
+    }
+    sim.stSnEnc = sn;
   }
 
   // dwie stałe tablice na zmianę (wcześniej co 0.4 s nowa kopia wszystkich pól przy gruncie – przy 160 × 160 oczkach ~14 MB do sprzątania);
@@ -1571,6 +1743,10 @@ async function init() {
       sim.sfcT = sim.diagT;
       sim.probeCol = sim.probeEnc >= 0 ? new Float32Array(raw, PROBE_OFF, PROBE_N) : null;
       sim.probeColAt = sim.probeEnc;
+      // śnieg stacji z gęstej pokrywy
+      const stSn = new Map();
+      (sim.stSnEnc || []).forEach((s, n) => { const a = new Float32Array(raw, ST_SN_OFF + n * 8, 2); stSn.set(s, { swe: a[0], snd: a[1] }); });
+      sim.stSnow = stSn;
       // stacje na szczytach: powietrze na wysokości stacji (liniowo między poziomami; poniżej pierwszego poziomu nad gruntem –
       // od wartości przy gruncie: T i Td 2 m, wiatr 10 m)
       const req = sim.stReqEnc || [], air = new Map();
@@ -1595,6 +1771,7 @@ async function init() {
       sim.stAir = air;
       recordMeteo();
       if (curTab() === 'mon' && document.body.classList.contains('drawer')) monTable(false);
+      if (curTab() === 'days' && document.body.classList.contains('drawer')) dayTable(false);
       if (monFld() && !monLive() && monSelPer()?.cur) monShow();    // okres analiz z bieżącym miesiącem – mapa na bieżąco
       sim.statsPending = false;
     });
@@ -1620,7 +1797,7 @@ async function init() {
     }
     // dni upalne i noce tropikalne: jedyna skala zależna od danych (maksimum okresu w widocznej części; jądro statystyk tych map
     // nie liczy) – przy stałej 0–30 miejsca z ponad 30 dniami w roku były jednolicie czerwone; liczone najwyżej raz na sekundę
-    if (id === 89 || id === 90) {
+    if (dayFld(id)) {
       const now = performance.now();
       if (id !== hotHi.id || now - hotHi.t > 1000) {
         const p = monSelPer();
@@ -1957,7 +2134,7 @@ async function init() {
   ];
 
   // --- menu (pasek ikon po lewej): klik otwiera wysuwany panel nad mapą, ponowny klik / × / Esc go chowa ---
-  const TAB_TITLES = { wx: 'Weather', atm: 'Atmosphere', ter: 'Terrain', view: 'Layers', mon: 'Climate analysis', set: 'Settings' };
+  const TAB_TITLES = { wx: 'Weather', atm: 'Atmosphere', ter: 'Terrain', view: 'Layers', mon: 'Climate analysis', days: 'Characteristic days', set: 'Settings' };
   const curTab = () => { const b = document.querySelector('#tabs button.on'); return b ? b.dataset.tab : 'wx'; };
   function selectTab(name, open) {
     document.querySelectorAll('#tabs button').forEach((x) => x.classList.toggle('on', x.dataset.tab === name));
@@ -1966,6 +2143,7 @@ async function init() {
     if (name === 'atm') requestAnimationFrame(() => drawSnd(true));
     if (name === 'wx') requestAnimationFrame(() => { wxModeUi(); drawSyn(); drawForecast(); drawPreview(); });
     if (name === 'mon') monTable(true);
+    if (name === 'days') dayTable(true);
     if (name === 'view') { if (layTabCur === 'most') layMostBuild(); layMark(true); }
     savePrefs();
   }
@@ -2314,6 +2492,7 @@ async function init() {
     if (sim.lmask) st.lmask = Array.from(sim.lmask);
     if (sim.vmask) st.vmask = Array.from(sim.vmask);
     if (sim.lwet) st.lwet = Array.from(sim.lwet, (x) => Math.round(100 * x));
+    if (sim.ndl) st.ndl = Array.from(sim.ndl, (x) => (Number.isFinite(x) ? Math.round(100 * x) : -1));   // udział lasu iglastego (−1 – brak danych)
     st.stations = stations.exportList();
     st.manip = manip;
     if (sh === 'dem' && sim.demLL) st.demLL = sim.demLL;            // środek terenu z DEM (gęstszy teren do obrazu)
@@ -2339,6 +2518,7 @@ async function init() {
     sim.lmask = st.lmask && st.lmask.length === NXV * NYV ? Int8Array.from(st.lmask) : null;
     sim.vmask = st.vmask && st.vmask.length === NXV * NYV ? Int8Array.from(st.vmask) : null;
     sim.lwet = st.lwet && st.lwet.length === NXV * NYV ? Float32Array.from(st.lwet, (x) => x / 100) : null;
+    sim.ndl = st.ndl && st.ndl.length === NXV * NYV ? Float32Array.from(st.ndl, (x) => (x < 0 ? NaN : x / 100)) : null;
   }
   function setState(st) {
     const g = st.grid || {};
@@ -2435,9 +2615,14 @@ async function init() {
       const nv = NXD * NYD, mb = new Uint8Array(20 * nv * mon.list.length);
       mon.list.forEach((x, i) => [...x.T, ...x.P, ...(x.C || [new Uint16Array(nv), new Uint16Array(nv)])].forEach((a, k) => mb.set(new Uint8Array(a.buffer, a.byteOffset, a.byteLength), (i * 10 + k) * 2 * nv)));
       chunks.push({ name: 'mon', data: mb });
+      // dni charakterystyczne: 7 × Uint8 na oczko i miesiąc (klasy 91–97)
+      const md = new Uint8Array(7 * nv * mon.list.length);
+      mon.list.forEach((x, i) => (x.D || []).forEach((a, k) => md.set(a, (i * 7 + k) * nv)));
+      chunks.push({ name: 'monD', data: md });
       // teren i mokradła dokładnie (w zapisie ustawień zaokrąglone – inne nachylenia i inne pola docelowe przy gruncie)
       chunks.push({ name: 'hv', data: sim.hv.slice() });
       if (sim.lwet) chunks.push({ name: 'lwet', data: sim.lwet.slice() });
+      if (sim.ndl) chunks.push({ name: 'ndl', data: sim.ndl.slice() });
       if (syn) {
         chunks.push({ name: 'land.sea', data: m.sea }, { name: 'land.encl', data: m.encl }, { name: 'land.hgt', data: m.hgt });
         if (m.lc) chunks.push({ name: 'land.Ts', data: m.lc.Ts }, { name: 'land.ha', data: m.lc.ha }, { name: 'land.ta', data: m.lc.ta });
@@ -2502,6 +2687,8 @@ async function init() {
       const hv = await read('hv'), lw = await read('lwet');
       if (hv && hv.length === NXV * NYV) sim.hv.set(hv);
       if (lw && lw.length === NXV * NYV) sim.lwet = lw;
+      const nd = await read('ndl');
+      sim.ndl = nd && nd.length === NXV * NYV ? nd : null;
       $('speed').value = js.speed;
       document.querySelectorAll('#speedSeg button').forEach((x) => x.classList.toggle('on', x.dataset.speed === js.speed));
       $('wxMode').value = drv.mode;
@@ -2524,7 +2711,7 @@ async function init() {
         status('loading the saved run: synoptic model…');
         const Ts = await read('land.Ts');
         const land = { sea: await read('land.sea'), encl: await read('land.encl'), hgt: await read('land.hgt'), ...(Ts ? { lc: { Ts, ha: await read('land.ha'), ta: await read('land.ta') } } : {}) };
-        const opts = { varAt: manipVarAt, sstAt: manipSstAt, land, nest: { vgBuf, pgOff: grid.off.PGRID, tclOff: grid.off.TCL, half: [CFG.NXV * CFG.DX / 2, CFG.NYV * CFG.DY / 2], ...NODES } };
+        const opts = { varAt: manipVarAt, sstAt: manipSstAt, land, nest: { vgBuf, pgOff: grid.off.PGRID, tclOff: grid.off.TCL, frhOff: grid.off.FRH, half: [CFG.NXV * CFG.DX / 2, CFG.NYV * CFG.DY / 2], ...NODES } };
         const mk = async (p, info) => PEModel.restore(device, opts, info, { S: await read(`${p}.S`), wk: await read(`${p}.wk`), dg: await read(`${p}.dg`) });
         drv.model = await mk('pe', js.pe.main);
         drv.ccModel = js.pe.cc ? await mk('cc', js.pe.cc) : null;
@@ -2532,7 +2719,7 @@ async function init() {
         drv.key = '';
         drv.fcModel = drv.model.clone(); drv.fc = []; drv.fcBusy = false; drv.ccBusy = false; drv.fcStale = false; drv.ccAcc = 0;
         const enc = device.createCommandEncoder(), pass = enc.beginComputePass();
-        drv.model.encodeParams(pass);
+        drv.model.encodeParams(pass, true);
         drv.model.encodeTC(pass);
         pass.end();
         device.queue.submit([enc.finish()]);
@@ -2553,6 +2740,7 @@ async function init() {
       const sf0 = await read('sfc'), sf = new Float32Array(NSF * NXY);
       js.sfcNames.forEach((n, i) => { if (n in S) sf.set(sf0.subarray(i * NXY, (i + 1) * NXY), S[n] * NXY); });
       q.writeBuffer(sfcBuf, 0, sf);
+      twcUpdate();
       const tg = await read('tgt');
       if (ok(tg, tgtBuf)) q.writeBuffer(tgtBuf, 0, tg);
       else if (js.pe) { buildSlot(0); buildSlot(1); buildSlot(2); }
@@ -2566,6 +2754,12 @@ async function init() {
       const KM = js.mon.list.length ? Math.round(mb.length / (2 * nv * js.mon.list.length)) : 10;
       const arr = (T, i, k) => new T(mb.buffer.slice(mb.byteOffset + (i * KM + k) * 2 * nv, mb.byteOffset + (i * KM + k + 1) * 2 * nv));
       mon.list = js.mon.list.map((x, i) => ({ ...x, T: [0, 1, 2, 3, 4].map((k) => arr(Int16Array, i, k)), P: [5, 6, 7].map((k) => arr(Uint16Array, i, k)), C: KM >= 10 ? [8, 9].map((k) => arr(Uint16Array, i, k)) : [new Uint16Array(nv), new Uint16Array(nv)] }));
+      // (pliki sprzed dni charakterystycznych: bez kawałka monD – klasy zerowe, dni ≥ 30 °C liczone jako upalne)
+      const md = await read('monD');
+      mon.list.forEach((x, i) => {
+        x.D = Array.from({ length: 7 }, (_, k) => (md && md.length >= (i * 7 + k + 1) * nv ? md.slice((i * 7 + k) * nv, (i * 7 + k + 1) * nv) : new Uint8Array(nv)));
+        if (!x.avg.dn) x.avg.dn = monDn(x);
+      });
       Object.assign(mon, { key: js.mon.key, t0: js.mon.t0, days: js.mon.days, dayT0: js.mon.dayT0, pending: null });
       const stL = jsonUnpack(await text('stLive'));
       stations.importFull({ sel: stL.sel, live: stL.live, hist: jsonUnpack(await text('stHist')) });
@@ -2784,6 +2978,7 @@ async function init() {
       if (!sim.demLL || sim.demLL[0] !== lat || sim.demLL[1] !== lon) return;     // w międzyczasie inne miejsce
       device.queue.writeBuffer(demHiBuf, 0, d.h);
       sim.demHi = { lat, lon, hmax: d.hmax, h: d.h };
+      snowHi.need = true;
       if (sim.lcHi) buildVegHi();
     } catch (e) { console.warn(`detailed terrain for the image: ${e.message}`); }
   }
@@ -2850,7 +3045,10 @@ async function init() {
           if (k === 3) v = VEG.WATER;
           else if (k === 6) v = VEG.GLACIER;
           else {
-            v = biome(k === 1 ? 1 : k === 2 ? 2 : 0, lat, cont, hum, h, hash(i, j));
+            // typ liści z danych w punkcie (ESA CCI 300 m; mieszany – jak udział 0.5), bez lasu w danych – udział oczka, bez danych – z temperatury
+            const lk = sim.ndlHi ? sim.ndlHi[(j + MG * DEMF) * WV + i + MG * DEMF] : 255;
+            const ndl = lk === 1 ? 1 : lk === 0 ? 0 : lk === 2 ? 0.5 : sim.ndl ? sim.ndl[(cj + MG) * NXV + ci + MG] : NaN;
+            v = biome(k === 1 ? 1 : k === 2 ? 2 : 0, lat, cont, hum, h, hash(i, j), ndl);
             if (k === 5 && v !== VEG.DESERT && v !== VEG.STEPPE) v = 12;
           }
         }
@@ -2881,9 +3079,11 @@ async function init() {
     $('location').value = 'custom';
     // teren: wysokości od poziomu morza, dno ≤ 0 jako woda (applyLandCover oddaje lądowi depresje); grunt modelu nie schodzi poniżej 0
     sim.wmask = new Int8Array(NXV * NYV);
-    sim.lmask = null; sim.vmask = null; sim.lwet = null;          // pokrycie poprzedniego miejsca nie przechodzi na nowe (WorldCover nadpisze)
+    sim.lmask = null; sim.vmask = null; sim.lwet = null; sim.ndl = null; sim.ndlHi = null;          // pokrycie poprzedniego miejsca nie przechodzi na nowe (WorldCover nadpisze)
     let hmax = 0;
+    sim.wdep = new Float32Array(NXV * NYV);                     // głębokość wody z batymetrii kafli (morze; jeziora – 0, domyślna w waterDepth)
     for (let k = 0; k < NXV * NYV; k++) {
+      sim.wdep[k] = Math.max(0, -t.h[k]);
       sim.hv[k] = Math.max(0, t.h[k]);
       if (t.h[k] <= 0) sim.wmask[k] = 1;
       hmax = Math.max(hmax, sim.hv[k]);
@@ -2901,6 +3101,9 @@ async function init() {
   // maxMs > 0 – najwyżej tyle czekania (dane, które przyjdą później, nie są już używane)
   async function applyLandCover(lat, lon, onProgress = status, maxMs = 0) {
     let load = null;
+    // typ liści lasu (ESA CCI) równolegle z WorldCover, w tym samym limicie czekania; bez niego – typ lasu z temperatury rocznej
+    const t0lc = performance.now();
+    const leafP = fetchLeafType(lat, lon, NXV, NYV, CFG.DX, DEMF).catch((e) => { console.warn(`leaf type: ${e.message}`); return null; });
     try {
       load = fetchLandCover(lat, lon, NXV, NYV, CFG.DX, onProgress, DEMF);
       const lc = await (maxMs ? Promise.race([load, new Promise((_, no) => setTimeout(() => no(new Error('no answer')), maxMs))]) : load);
@@ -2924,11 +3127,19 @@ async function init() {
         sim.lwet[c] = lc.wet[c];
       }
       sim.lcHi = lc.hi ? { lat, lon, d: lc.hi } : null;
+      const left = maxMs ? Math.max(1000, maxMs - (performance.now() - t0lc)) : 0;
+      const lt = await (left ? Promise.race([leafP, new Promise((ok) => setTimeout(() => ok(null), left))]) : leafP);
+      sim.ndl = lt ? lt.ndl : null;
+      sim.ndlHi = lt && lt.hi ? lt.hi : null;
       applyTerrain(); applyLand();
       buildVegHi();
       const pc = (x) => Math.round(100 * x / Math.max(nv, 1));
-      window.__lcStats = { las: pc(nf), zabudowa: pc(nu), wody: pc(nl), oczek: nv, depresje: nd };
-      toast(`Land cover (ESA WorldCover): forest ${pc(nf)}%, urban ${pc(nu)}%, inland water ${pc(nl)}%`);
+      // udział lasu iglastego w oczkach lasu z danymi typu liści (ESA CCI)
+      let sN = 0, nN = 0;
+      if (sim.ndl) for (let c = 0; c < n; c++) if (sim.lmask[c] === 1 && Number.isFinite(sim.ndl[c])) { sN += sim.ndl[c]; nN++; }
+      const conif = nN ? Math.round(100 * sN / nN) : null;
+      window.__lcStats = { las: pc(nf), zabudowa: pc(nu), wody: pc(nl), oczek: nv, depresje: nd, iglaste: conif, lasZTypem: nN };
+      toast(`Land cover (ESA WorldCover): forest ${pc(nf)}%${conif !== null ? ` (coniferous ${conif}% – ESA CCI)` : ''}, urban ${pc(nu)}%, inland water ${pc(nl)}%`);
       return true;
     } catch (e) {
       toast(`Land cover: ${e.message} – keeping the mosaic`);
@@ -3038,6 +3249,9 @@ async function init() {
   }
   $('accWin').addEventListener('change', () => { accBase(); labels(); });
   $('monSel').addEventListener('input', () => monPick());
+  // zakładka dni charakterystycznych: ten sam okres co analizy (suwak i rodzaj okresu)
+  $('daySel').addEventListener('input', () => { $('monSel').value = $('daySel').value; dayPick(); });
+  for (const b of $('dayKind').children) b.addEventListener('click', () => { anaKind = b.dataset.k; $('monSel').value = '1e9'; dayPick(); });
   // rodzaj okresu analiz: miesiące, pory roku, lata (suwak – na najnowszy)
   for (const b of $('anaKind').children) b.addEventListener('click', () => {
     anaKind = b.dataset.k; $('monSel').value = '1e9'; monPick();
@@ -3179,6 +3393,7 @@ async function init() {
     peak: (xkm, ykm, rkm) => peakNear(xkm, ykm, rkm),
     modelH: (col) => sim.h[col],
     air: (s) => (sim.stAir && sim.stAir.get(s)) || null,
+    snow: (s) => (sim.stSnow && sim.stSnow.get(s)) || null,
   });
   sim.stations = stations;
   // miejscowości tylko na prawdziwym terenie (z mapy świata / DEM); klasy wielkości względem rozmiaru mapy (geo.js)
@@ -3238,6 +3453,11 @@ async function init() {
     const rh = Math.min(100, 100 * es(td2) / es(t2));
     const lc = sim.veg ? VEG_NAMES[sim.veg[col]] : '';
     const row = (k, val) => `<span class="k">${k}</span> <b>${val}</b>`;
+    // pokrywa śnieżna: z gęstej pokrywy w punkcie pod kursorem (snowhi.wgsl), gdy jest – inaczej z oczka; do nadejścia odczytu nowego punktu
+    // zostaje wartość poprzedniego (wcześniej na chwilę wartość z oczka modelu – migała przy ruchu kursora, użytkownik)
+    const sp = snowTipPoint(hv.x, hv.y);
+    snowTipRequest(sp);
+    const snowTipSnd = sp >= 0 && sim.snowTip ? sim.snowTip.snd : v('SND');
     tip.innerHTML = [
       row('position', `${nD((i - MG + 0.5) * CFG.DX / 1000, 'km', 1)}, ${nD((j - MG + 0.5) * CFG.DY / 1000, 'km', 1)} ${unitD('km')}`),
       // wysokość prawdziwego terenu (gęstszy DEM), a w nawiasie gruntu modelu – średniej z oczka
@@ -3246,7 +3466,7 @@ async function init() {
       row('feels like', fT(feelsLike(t2, rh, v('U10')), 0)) + ' · ' + row('today', `${nD(v('TMIN'), '°C', 1)} … ${fT(v('TMAX'))}`) + ' · ' + row('sunshine', `${v('SUNH').toFixed(1)} h`),
       row('wind 10 m', fm(v('U10'), 'm/s', 1)) + ' · ' + row('gusts', fm(v('GUST'), 'm/s')),
       row('ground', fT(v('TS') - 273.15)) + ' · ' + row('solar', `${Math.round(v('SW'))} W/m²`),
-      row('greenness', `${(100 * v('GRN')).toFixed(0)}%`) + ' · ' + row('snow', fm(100 * v('SND'), 'cm')),
+      row('greenness', `${(100 * v('GRN')).toFixed(0)}%`) + ' · ' + row('snow', fm(100 * snowTipSnd, 'cm')),
       row('precip.', fm(v('PR'), 'mm/h', 1)) + ' · ' + row('total', fm(v('PACC'), 'mm', 1)) + (v('QOUT') > 0.05 ? ' · ' + row('discharge', `${fm(v('QOUT'), 'm³/s', v('QOUT') < 10 ? 1 : 0)}`) : ''),
       ...(monFld() ? [row('period', monTip(col))] : []),
       row('pressure (large scale)', fm(v('PSL'), 'hPa', 1)) + ' · ' + row('visibility', fmVis(v('VIS'))),
@@ -3406,6 +3626,8 @@ async function init() {
   const WX_NICE = { temp: [-20, 0, 20, 32, 50, 70, 90, 110], wind: [10, 20, 30, 40, 60, 80, 100, 130] };
   function wxLegend(i) {
     const ws = WXS[i], n = ws.t.length, top = ws.t[n - 1];
+    // klasy stałe (Meteologix): podpisy tylko na granicach klas, bez końców paska; m/s imperialnie w mph
+    if (ws.step) return ['', unitD(ws.unit), wxTicks(i).map(([t, q]) => [isImp() && ws.unit === 'm/s' ? rnd(toD(t, 'm/s')) : t, q])];
     if (!isImp()) return [`${ws.t[0]}`, `${top}+ ${ws.unit}`, wxTicks(i)];
     const lab = (x) => { const v = toD(x, ws.unit); return ws.unit === '°C' || ws.unit === 'km/h' ? Math.round(v) : rnd(v); };
     const nice = WX_NICE[ws.key];
@@ -3460,6 +3682,7 @@ async function init() {
         if (fd.cmap === WX_CMAP0 + 2 && !monFld(r.id)) note += sim.accInfo || '';
         if (monFld(r.id)) note += ` – ${$('monV').textContent}`;
       }
+      if (dayFld(r.id)) note += ` – ${$('monV').textContent} · exclusive classes: a day counts only in the most extreme class it reaches`;
       if (fd.cmap === 15) {
         // (skala radaru −2.5…67.5 dBZ, wxscales.js; echo od 5 dBZ)
         lo = '5'; hi = '67.5 dBZ';
@@ -3467,7 +3690,7 @@ async function init() {
         note += ' – ~20 dBZ light rain / snow, 35 moderate, 45 heavy, > 55 hail';
       }
       if (r.id === 55) note += ' · red contours: SRH 0–3 km every 100 m²/s² (thick 200) · arrows: shear 0–6 km (full length ' + fm(30, 'm/s') + ')';
-      if (fd.cmap === 21) note += ' · > 150 m²/s² favours supercells, > 300 – tornadoes (with high CAPE and shear)';
+      if (r.id === 53 || r.id === 54) note += ' · > 150 m²/s² favours supercells, > 300 – tornadoes (with high CAPE and shear)';
       if (r.id === 56) note += ' · > 1 supercells possible, > 4 – favourable';
       if (r.id === 51) note += ` · > ${fm(20, 'm/s')} organised storms, > ${fm(25, 'm/s')} supercells`;
       if (r.id === 42) note += ' · flickering dots: lightning (density ∝ flash rate)';
@@ -3536,6 +3759,7 @@ async function init() {
     $('xyInfo').textContent = v3.on ? 'clouds, terrain and sun' : fh >= 20 ? FIELDS[fh].name : `${FIELDS[fh].name} · ${fmH(num('zs'))} a.s.l.`;
     $('zsCtl').style.display = fh >= 20 || v3.on ? 'none' : '';
     for (const b of $('monBtns').children) b.classList.toggle('on', +b.dataset.f === fh);
+    for (const b of $('dayBtns').children) b.classList.toggle('on', +b.dataset.f === fh);
     $('xzInfo').textContent = `${FIELDS[num('fieldV')].name} · y = ${+nD(num('ys'), 'km', 1)} ${unitD('km')}`;
     $('xzTop').textContent = `height 0 – ${fmZ(num('zt'))}`;
     layMark();

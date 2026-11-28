@@ -103,7 +103,7 @@ const SMT = +(QP.get('smt') ?? 20);
 // gradient temperatury w dolnych 1.5 km stanu początkowego [K/km]: 0 – zależny od klimatu (zimą słabszy), ?pegl=6.5 – dawny
 const PEGL = +(QP.get('pegl') || 0);
 const NU4 = DXP ** 4 / (64 * +(QP.get('nu4h') || 12) * 3600);  // ∇⁴: najkrótsze fale tłumione w ~12 h (4 h tłumiło niże – za słaby transport ciepła na północ, lato 45–53°N ~2 K za zimne)
-const UBYTES = 112, USLOT = 256;
+const UBYTES = 128, USLOT = 256;
 const GRADF = 1.0;                     // wzmocnienie gradientu temperatury równowagi względem klimatu
 const S0 = 1361;                         // stała słoneczna [W/m²]
 // promieniowanie długofalowe: pasmo nieprzezroczyste (para wodna τ ∝ u^0.45 – „silne linie”, CO₂ ∝ p·m) i okno
@@ -258,7 +258,7 @@ async function getShared(device) {
   const pl = device.createPipelineLayout({ bindGroupLayouts: [layout] });
   const pipes = {};
   for (const e of ['pe_zm', 'pe_wv', 'pe_rad', 'pe_diag', 'pe_stage', 'pe_div', 'pe_dft', 'pe_tri', 'pe_idft', 'pe_acc', 'pe_res', 'pe_pmean', 'pe_proj', 'pe_column', 'pe_lap',
-    'pe_hyper', 'pe_params', 'pe_center', 'pe_hist', 'pe_map', 'pe_tcpot', 'pe_tcpick', 'pe_tcins', 'pe_tccen', 'pe_tcamp', 'pe_tcforce', 'pe_tcdom']) {
+    'pe_hyper', 'pe_params', 'pe_frh', 'pe_center', 'pe_hist', 'pe_map', 'pe_tcpot', 'pe_tcpick', 'pe_tcins', 'pe_tccen', 'pe_tcamp', 'pe_tcforce', 'pe_tcdom']) {
     pipes[e] = await device.createComputePipelineAsync({ layout: pl, compute: { module: mod, entryPoint: e } });
   }
   const U = GPUBufferUsage;
@@ -728,7 +728,9 @@ export class PEModel {
     const wt = this.spinning ? WVS : WVN, wi = this.spinning ? WVS : WVI;
     const wvP = this.wvOn && wt > 0 ? 1 / (wt * 86400) : 0, wvI = this.wvOn && wi > 0 ? 1 / (wi * wi * 86400 * 86400) : 0;
     for (let s = 0; s < 4; s++) {
-      const f = new Float32Array(ab, s * USLOT, 28), u = new Uint32Array(ab, s * USLOT, 28);
+      const f = new Float32Array(ab, s * USLOT, 32), u = new Uint32Array(ab, s * USLOT, 32);
+      // parametry profilu T wokół domeny (pe_frh – wykrywanie frontów): przesunięcie w buforze vg i liczba węzłów (ich położenia w tablicy węzłów za siatką parametrów)
+      u[28] = this.nest && this.nest.frhOff ? this.nest.frhOff : 0; u[29] = this.nest && this.nest.frhN ? this.nest.frhN : 0;
       // cyklony tropikalne dla domeny (pe_tcdom): przesunięcie listy w buforze vg, połowa wymiarów liczonej domeny [m] (f[25] – czas od
       // poprzedniej listy, encodeTC)
       u[24] = this.nest && this.nest.tclOff ? this.nest.tclOff : 0;
@@ -934,11 +936,13 @@ export class PEModel {
     await this.device.queue.onSubmittedWorkDone();
   }
 
-  // parametry sondażu dla domeny zagnieżdżonej → bufor vg domeny (przed tgt_build)
-  encodeParams(pass) {
+  // parametry sondażu dla domeny zagnieżdżonej → bufor vg domeny (przed tgt_build); halo – także parametry profilu T wokół domeny
+  // (pe_frh, wykrywanie frontów) – tylko model, którego pola docelowe buduje domena (kopie korekty klimatu i prognozy nie nadpisują)
+  encodeParams(pass, halo = false) {
     if (!this.nest || !this.nodeCount) return;
     pass.setPipeline(this.sh.pipes.pe_params); pass.setBindGroup(0, this.bgs[this.p][3], [3 * USLOT]);
     pass.dispatchWorkgroups(Math.ceil(this.nodeCount / 64));
+    if (halo && this.nest.frhN && this.nest.frhOff) { pass.setPipeline(this.sh.pipes.pe_frh); pass.dispatchWorkgroups(Math.ceil(this.nest.frhN / 64)); }
   }
 
   // cyklony tropikalne dla domeny (pe_tcdom → lista w buforze vg, drobne jądro w celu tgt_build) – tylko model główny, raz na termin
@@ -1129,5 +1133,18 @@ export function nestNodes(cfg) {
       }
     }
   }
-  return { nodes, nodeCount: NGX * NGY };
+  // węzły wokół domeny (frhGeom w grid.js): jedna próbka w położeniu węzła – za węzłami siatki parametrów
+  const H = cfg.FRH, NG = NGX * NGY, all = new Float32Array((NG + (H ? H.n : 0)) * 12);
+  all.set(nodes);
+  if (H) {
+    for (let hy = 0; hy < H.ny; hy++) {
+      for (let hx = 0; hx < H.nx; hx++) {
+        const o = (NG + hy * H.nx + hx) * 12;
+        all[o] = (H.x0 + hx * H.dc - cfg.NXV / 2) * cfg.DX;
+        all[o + 1] = (H.y0 + hy * H.dcy - cfg.NYV / 2) * cfg.DY;
+        all[o + 2] = 1;
+      }
+    }
+  }
+  return { nodes: all, nodeCount: NG, frhN: H ? H.n : 0 };
 }

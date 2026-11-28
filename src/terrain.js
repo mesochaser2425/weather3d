@@ -134,7 +134,14 @@ export function paintBrush(h, cfg, x, y, r, amount, hmax, wrap = true) {
 // wznoszenia (gładka góra 150 m, wiatr 14 m/s: +25 cm/s na stopniu zamiast łagodnego wznoszenia na całym zboczu) –
 // termiki, chmury i pasma burz przyklejone do terenu. partial = false – dawny teren schodkowy (?pc=0)
 export const HF_MIN = 0.3;
-export function deriveTerrain(h, cfg, partial = true) {
+// Sztuczne dołki (fill = false, ?tfl=0 – bez): podniesienie gruntu cienkich komórek (hf < HF_MIN, nawet 2 m pod ścianą warstwy) robiło
+// wokół komórki tuż ponad progiem dołek ~0.3·dz (~25 m) głębszy niż prawdziwy teren – ściany w jej warstwie zamknięte z 2–3 stron,
+// powietrze stoi (wiatr przy gruncie z otwartych, cienkich ścian), nocą odcina się od warstwy wyżej i wychładza o kilka–kilkanaście K
+// („kwadraty zimna”, użytkownik: styczeń, −10 K; oczka zamknięte z 2–3 stron to 10% siatki i 80% zimnych oczek). Komórka z hf < HF_FILL,
+// której ≥ 2 ściany zamyka sam podniesiony grunt sąsiadów (ich prawdziwy teren niżej niż górna ściana tej warstwy), też jest podnoszona.
+// Prawdziwe zagłębienia głębsze niż ~½ warstwy (≥ 30–50 m przy gruncie) zostają
+export const HF_FILL = 0.5;
+export function deriveTerrain(h, cfg, partial = true, fill = true) {
   const { NX, NY, NZ, DX, DY } = cfg;
   const kb = new Float32Array(NX * NY), hf = new Float32Array(NX * NY).fill(1), slx = new Float32Array(NX * NY), sly = new Float32Array(NX * NY);
   let flat = true, hmax = 0;
@@ -155,6 +162,24 @@ export function deriveTerrain(h, cfg, partial = true) {
       const n = h[((j + 1) % NY) * NX + i], s = h[((j + NY - 1) % NY) * NX + i];
       slx[c] = (e - w) / (2 * DX);
       sly[c] = (n - s) / (2 * DY);
+    }
+  }
+  if (partial && fill) {
+    for (let it = 0; it < 16; it++) {
+      let changed = 0;
+      for (let j = 0; j < NY; j++) {
+        for (let i = 0; i < NX; i++) {
+          const c = j * NX + i;
+          if (hf[c] >= HF_FILL || kb[c] >= NZ - 12) continue;
+          const zt = zOfS(kb[c] + 1, cfg);
+          let n = 0;
+          for (const p of [j * NX + (i + 1) % NX, j * NX + (i + NX - 1) % NX, ((j + 1) % NY) * NX + i, ((j + NY - 1) % NY) * NX + i]) {
+            if (kb[p] > kb[c] && h[p] < zt) n++;
+          }
+          if (n >= 2) { kb[c] += 1; hf[c] = 1; changed++; }
+        }
+      }
+      if (!changed) break;
     }
   }
   return { kb, hf, slx, sly, flat, hmax };

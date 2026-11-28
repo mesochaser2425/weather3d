@@ -157,6 +157,52 @@ fn zgC(col: u32) -> f32 { let kb = u32(vg[VG_KB + col]); return vg[VG_ZW + kb + 
 // Temperatura do rozdziału deszcz / śnieg przy gruncie: ~30 m nad prawdziwym gruntem, liniowo między poziomami siatki. Temperatura samej komórki kb jest
 // na stałej wysokości środka warstwy, więc w górach była taka sama na całym tarasie o tym samym kb i skakała ~1.3 K na granicy warstw (200 m) – przy
 // przedziale deszcz–śnieg 2 K zmieniało to udział śniegu o ~65% i pokrywa śnieżna wychodziła na mapie tarasowo (?phs=0 – dawne, A/B)
+// Udział opadu stałego przy gruncie z warstw, przez które spada (Bourgouin 2000; ?bgn=0 – dawniej: z temperatury ~30 m nad gruntem,
+// liniowo −1…+1 °C): pole dodatnie PA najniższej warstwy ciepłej (T > 0 °C) i pole ujemne NA warstwy zimnej pod nią przy gruncie
+// [J/kg] ≈ g·∫(T − T0)/T0 dz, do ~5 km nad gruntem (od 2 m: T 2 m). Płatki topnieją od PA ~5.6, całe od ~13.2 J/kg; krople nad zimną
+// warstwą zamarzają z powrotem (krupa lodowa – opad stały) przy NA > 66 + 0.66·PA, zostają ciekłe (marznący deszcz) przy NA < 46 + 0.66·PA.
+// Zamiast jednego progu temperatury przy gruncie – głębokość i ciepło warstwy topnienia: +1 °C przy gruncie pod mroźną warstwą to śnieg,
+// ciepła warstwa ~0.5 km nad mroźną przy gruncie – deszcz marznący; przejście płynne
+fn snowFracB(col: u32, kb: u32) -> f32 {
+  let zg = zgC(col);
+  var zp = zg + 2.0;
+  var tp = sfc[sf(S_T2, col)] + TFRZ;
+  let cold0 = tp <= TFRZ;
+  var na = 0.0;
+  var pa = 0.0;
+  var stage = select(1u, 0u, cold0);                 // 0 – warstwa zimna przy gruncie, 1 – warstwa ciepła, 2 – koniec
+  for (var k = kb; k < NZ && stage < 2u; k++) {
+    let zk = select(vg[VG_ZC + k], zg + 0.5 * vg[VG_HF + col] * vg[VG_DZC + kb], k == kb);
+    if (zk <= zp) { continue; }
+    if (zk - zg > 5000.0) { break; }
+    let tk = (vg[VG_TC + k] + state[T_OFF + k * NXY + col]) * vg[VG_EXC + k];
+    // odcinek zp…zk dzielony na przejściu przez 0 °C
+    var za = zp;
+    var ta = tp;
+    if ((ta - TFRZ) * (tk - TFRZ) < 0.0) {
+      let zc = za + (zk - za) * (TFRZ - ta) / (tk - ta);
+      let ar = G * 0.5 * (ta - TFRZ) / TFRZ * (zc - za);
+      if (stage == 0u) { na -= ar; } else { pa += ar; }
+      stage += 1u;
+      za = zc;
+      ta = TFRZ;
+    }
+    if (stage < 2u) {
+      let ar = G * 0.5 * (ta + tk - 2.0 * TFRZ) / TFRZ * (zk - za);
+      if (stage == 0u) { na -= ar; } else { pa += ar; }
+    }
+    zp = zk;
+    tp = tk;
+  }
+  let melt = smoothstep(5.6, 13.2, pa);                 // część stopionych płatków w warstwie ciepłej
+  let refr = select(0.0, smoothstep(46.0 + 0.66 * pa, 66.0 + 0.66 * pa, na), cold0);   // zamarzanie kropel w warstwie zimnej przy gruncie
+  return clamp(1.0 - melt + melt * refr, 0.0, 1.0);
+}
+fn snowFrac(col: u32, kb: u32, tb: f32) -> f32 {
+  if (BGN > 0.0) { return snowFracB(col, kb); }
+  return clamp((TFRZ + 1.0 - tb) / 2.0, 0.0, 1.0);
+}
+
 fn tPhase(col: u32, kb: u32, th0: f32, th1: f32) -> f32 {
   let t0 = (vg[VG_TC + kb] + th0) * vg[VG_EXC + kb];
   if (PHS < 0.5) { return t0; }
@@ -490,15 +536,28 @@ fn surface(@builtin(global_invocation_id) gid: vec3u) {
     dni = direct * shd;
     sw = (direct * cosi * shd + 0.1 * direct * sv.z) * tcl;
   }
-  let ea = qv1 * ps / (0.622 + qv1) * 0.01;                // ciśnienie pary [hPa]
+  // Powietrze przy gruncie dla promieniowania: warstwa grubości całej komórki (dz) nad gruntem – w cienkiej komórce (hf < 1) jej część
+  // nad gruntem i dolna część warstwy wyżej (?kbz=0 – sama komórka przy gruncie, dawniej). Inaczej oczko, w którym teren wypada tuż pod
+  // ścianą warstwy, liczyło promieniowanie zwrotne nieba od temperatury warstwy kilkunastu–dwudziestu kilku metrów (nocą najzimniejszej:
+  // mniej promieniowania → zimniejszy grunt → zimniejsza warstwa), a wychładzanie radiacyjne warstwy ~60 m trafiało w ułamek jej masy
+  // (× 1/hf) – oczka o hf 0.3–0.5 do −17 K wobec sąsiadów, „kwadraty zimna” (użytkownik, styczeń, −10 K)
+  let hfc = vg[VG_HF + col];
+  var tR = t1;
+  var qR = qv1;
+  if (KBZ > 0.0 && kb + 1u < NZ) {
+    let c2 = c + NXY;
+    tR = mix((vg[VG_TC + kb + 1u] + state[T_OFF + c2]) * vg[VG_EXC + kb + 1u], t1, hfc);
+    qR = mix(max(state[QV_OFF + c2], 0.0), qv1, hfc);
+  }
+  let ea = qR * ps / (0.622 + qR) * 0.01;                  // ciśnienie pary [hPa]
   // emisyjność czystego nieba: Prata (1996), w = 46.5·e/T [cm wody] – latem jak Brutsaert, w mroźnym suchym
   // powietrzu ~10% większa (Brutsaert zaniżał tam promieniowanie zwrotne o ~20 W/m² – za zimne zimy)
-  let wpr = 46.5 * max(ea, 0.01) / t1;
+  let wpr = 46.5 * max(ea, 0.01) / tR;
   let epsa = 1.0 - (1.0 + wpr) * exp(-sqrt(1.2 + 3.0 * wpr));
   // promieniowanie zwrotne nieba: świeci warstwa ~0–500 m nad gruntem, nie tylko najniższe oczko –
   // w mrozowisku nad zimną poduszką leży cieplejsza inwersja (inaczej zimne powietrze w dolinach
   // wychładzało się bez końca, do −40 °C)
-  var tup = t1;
+  var tup = tR;
   for (var k = kb + 1u; k < NZ; k++) {
     if (vg[VG_ZC + k] - zgC(col) > 500.0) { break; }
     tup = max(tup, (vg[VG_TC + k] + state[T_OFF + k * NXY + col]) * vg[VG_EXC + k]);
@@ -506,7 +565,7 @@ fn surface(@builtin(global_invocation_id) gid: vec3u) {
   // tylko część nadwyżki ciepła warstwy powyżej (30%) – emisyjność nieba z temperatury przy gruncie jest już
   // dopasowana do typowych profili; pełna średnia dawała latem za słabe nocne wychłodzenie (ciepła
   // warstwa resztkowa), a 0 – zbyt mroźne mrozowiska
-  let tsky = t1 + 0.3 * max(tup - t1, 0.0);
+  let tsky = tR + 0.3 * max(tup - tR, 0.0);
   // niebo czyste z warstwy przyziemnej + chmury w „oknie” (1 − ε_czyste) z temperatury chmur
   let lwd = epsa * SIGMA * tsky * tsky * tsky * tsky + (1.0 - epsa) * SIGMA * cl4;
   var ts = sfc[sf(S_TS, col)];
@@ -515,11 +574,12 @@ fn surface(@builtin(global_invocation_id) gid: vec3u) {
   sfc[sf(S_LWN, col)] = 0.95 * (lwd - SIGMA * ts * ts * ts * ts);
   // Bilans długofalowy najniższej warstwy powietrza: emituje w górę i w dół, pochłania z gruntu
   // i z nieba (emisyjność zależna od zawartości pary). Nocą ochładza ją ~0.5–1 K/h.
-  let wvp = rho * qv1 * vg[VG_HF + col] * vg[VG_DZC + kb];  // para w warstwie [kg/m²]
+  // (warstwa grubości dz – przy cienkiej komórce część hf trafia do niej, reszta do warstwy wyżej: `advect`)
+  let wvp = rho * qR * select(hfc, 1.0, KBZ > 0.0) * vg[VG_DZC + kb];  // para w warstwie [kg/m²]
   let epsl = min(0.2, 0.06 + 0.1 * wvp);
   // powietrze zimniejsze od gruntu nie wychładza się dalej radiacyjnie (grunt świeci cieplej)
-  var qrad = epsl * (2.0 * SIGMA * t1 * t1 * t1 * t1 - 0.95 * SIGMA * ts * ts * ts * ts - lwd);
-  if (t1 < ts) { qrad = min(qrad, 0.0); }
+  var qrad = epsl * (2.0 * SIGMA * tR * tR * tR * tR - 0.95 * SIGMA * ts * ts * ts * ts - lwd);
+  if (tR < ts) { qrad = min(qrad, 0.0); }
   sfc[sf(S_QRAD, col)] = qrad;
 
   // wymiana turbulencyjna (Louis 1979)
@@ -601,10 +661,19 @@ fn surface(@builtin(global_invocation_id) gid: vec3u) {
     }
     if (ice <= 0.0) { ice = 0.0; ts = TFW + 0.2; }                  // przerębla – znów otwarta woda
   } else if (water) {
-    // woda: warstwa wymieszana HMIX (bilans: słońce, długofalowe, ciepło jawne i utajone) z powolnym
-    // powrotem do temperatury głębszej wody (τ = 30 dób); przy zamarzaniu i dalszym wychładzaniu – lód
+    // woda: warstwa wymieszana (bilans: słońce, długofalowe, ciepło jawne i utajone) z powolnym powrotem do temperatury odniesienia;
+    // przy zamarzaniu i dalszym wychładzaniu – lód. Warstwa wymieszana z głębokości wody: płytka cała (szybko za pogodą – zatoki,
+    // płytkie jeziora), głęboka ~20 m; odniesienie – klimatologia temperatury wody dla bieżącej daty (pole TWC), głęboka woda bliżej
+    // niej (τ 15 dób przy ≥ 50 m, 60 dób przy ≤ 10 m). ?wdp=0 – dawniej: 10 m wszędzie i powrót (τ 30 dób) do temperatury z dnia
+    // startu przez cały przebieg (start latem – zimą woda za ciepła, „za wolno się ochładza”, użytkownik)
+    let twc = sfc[sf(S_TWC, col)];
+    let wdOn = WDP > 0.0 && twc > 200.0;
+    let dep = max(vg[VG_WDEP + col], 1.0);
+    let hm = select(HMIX, clamp(dep, 1.0, 20.0), wdOn);
+    let tref = select(td, twc, wdOn);
+    let tauW = select(30.0, mix(60.0, 15.0, smoothstep(10.0, 50.0, dep)), wdOn) * 86400.0;
     let net = rn - hflx - le;
-    ts += dt * (net / (1000.0 * 4186.0 * HMIX) - (ts - td) / (30.0 * 86400.0)) + P.sstD;
+    ts += dt * (net / (1000.0 * 4186.0 * hm) - (ts - tref) / tauW) + P.sstD;
     sfc[sf(S_TD, col)] = td + P.sstD;
     if (ts <= TFW && net < 0.0) { ice = 0.02; }
     ts = max(ts, TFW);
@@ -819,13 +888,24 @@ fn surface(@builtin(global_invocation_id) gid: vec3u) {
     let hk = hflx / (rho * CP);
     let hold = max(sfc[sf(S_PBLH, col)], 50.0);
     let ws = pow(ust * ust * ust + 0.6 * max(G / th1 * hk * hold, 0.0), 1.0 / 3.0);
-    let thvs = thv1 + select(0.0, min(6.8 * hk / max(ws, 0.1), 3.0), hk > 0.0);
-    let zg = zgC(col);
+    // cząstka z warstwy grubości całej komórki nad gruntem (w cienkiej komórce: jej część nad gruntem i dół warstwy wyżej, start
+    // ze środka tej warstwy; ?kbz=0 – z samej komórki przy gruncie): nocą cienka komórka (~10–25 m) jest najzimniejsza, więc
+    // warstwa graniczna liczona od niej zapadała się do ~40 m przy ~290 m u sąsiadów o tym samym terenie – K-profil nie sięgał
+    // warstwy wyżej i komórka odcinała się od powietrza nad nią
+    var thv1b = thv1;
     var zp = z1;
+    if (KBZ > 0.0 && kb + 1u < NZ) {
+      let c2 = c + NXY;
+      thv1b = mix((vg[VG_TC + kb + 1u] + state[T_OFF + c2]) * (1.0 + 0.61 * max(state[QV_OFF + c2], 0.0)), thv1, vg[VG_HF + col]);
+      zp = 0.5 * vg[VG_DZC + kb];
+    }
+    let thvs = thv1b + select(0.0, min(6.8 * hk / max(ws, 0.1), 3.0), hk > 0.0);
+    let zg = zgC(col);
     var rp = 0.0;
     var hb = vg[VG_ZC + NZ - 6u] - zg;
     // poziom kondensacji cząstki z 1. poziomu (bez nadwyżki termicznej)
     var zlcl = 1e9;
+    var zq = z1;                                           // (poziom poprzedni dla poziomu kondensacji – cząstka z 1. poziomu)
     var dqp = qv1 - qsat(th1 * vg[VG_EXC + kb], vg[VG_PRS + kb]);
     for (var k = kb + 1u; k < NZ - 6u; k++) {
       let cc = k * NXY + col;
@@ -835,8 +915,9 @@ fn surface(@builtin(global_invocation_id) gid: vec3u) {
       let za = vg[VG_ZC + k] - zg;
       if (zlcl > 1e8) {
         let dq = qv1 - qsat(th1 * vg[VG_EXC + k], vg[VG_PRS + k]);
-        if (dq >= 0.0) { zlcl = zp + (za - zp) * clamp(-dqp / max(dq - dqp, 1e-9), 0.0, 1.0); }
+        if (dq >= 0.0) { zlcl = zq + (za - zq) * clamp(-dqp / max(dq - dqp, 1e-9), 0.0, 1.0); }
         dqp = dq;
+        zq = za;
       }
       let rb = G * za * (thv - thvs) / (thvs * (uk * uk + vk * vk + 100.0 * ust * ust + 0.01));
       if (rb > 0.25) { hb = zp + (za - zp) * (0.25 - rp) / max(rb - rp, 1e-6); break; }
@@ -874,7 +955,18 @@ fn surface(@builtin(global_invocation_id) gid: vec3u) {
   // za dnia bez poprawki (mieszana warstwa). Porywy jak dotąd: turbulencja (≈ 2.4·σ_u, σ_u ≈ 2u*) + zimne wypływy burz
   let z10 = max(10.0, 2.0 * z0);
   let lst = max(linv, 0.0);
-  let u10 = vh * clamp((log(z10 / z0) + 5.0 * min(z10 * lst, 1.0)) / (lz + 5.0 * min(z1 * lst, 1.0)), 0.0, 1.5);
+  // wiatr odniesienia: warstwa grubości całej komórki nad gruntem (?kbz=0 – sama komórka przy gruncie): w cienkiej komórce wiatr z cienkich,
+  // częściowo zamkniętych ścian i 1. poziom ~10–20 m zamiast ~35–45 m – U10 i porywy skakały oczko po oczku zależnie od tego, jak teren
+  // wypada względem ścian warstw (pikseloza wiatru, użytkownik); tu wiatr jej i warstwy wyżej ważony grubością, na wysokości środka całej komórki
+  var vr = vh;
+  var zr = z1;
+  if (KBZ > 0.0 && kb + 1u < NZ) {
+    let u2 = sfcU(i, j, kb + 1u);
+    let v2 = sfcV(i, j, kb + 1u);
+    vr = length(vec2f(mix(u2, u1, hfc), mix(v2, v1, hfc)));
+    zr = max(z1, 0.5 * vg[VG_DZC + kb]);
+  }
+  let u10 = vr * clamp((log(z10 / z0) + 5.0 * min(z10 * lst, 1.0)) / (log(zr / z0) + 5.0 * min(zr * lst, 1.0)), 0.0, 1.5);
   sfc[sf(S_U10, col)] = u10;
   sfc[sf(S_GUST, col)] = u10 + 4.8 * sqrt(cn * fm) * max(vh, 0.5) + 3.0 * sqrt(max(sfc[sf(S_PRCUS, col)], 0.0));
   // szorstkość cieplna do T2 jak nad krótką trawą (stacja meteorologiczna, ≤ 5 mm): nad lasem T2 szło za temperaturą
@@ -1010,8 +1102,11 @@ fn tgBil(f: u32, X: f32, Y: f32, k: u32, a: f32) -> f32 {
   return mix(mix(c00, c10, fx), mix(c01, c11, fx), fy);
 }
 
-// parametr p sondażu w punkcie (X, Y) [indeksy oczek; środek komórki i: X = i + 0.5]
+// parametr p sondażu w punkcie (X, Y) [indeksy oczek; środek komórki i: X = i + 0.5]. B-sklejane po węzłach (?pbs=0 – dwuliniowo,
+// dawniej): dwuliniowo pole ma załamania na liniach przez węzły co GS oczek (~30 km) – wznoszenie dużej skali, wilgotność i profil celu
+// z grzbietami wzdłuż tych linii, opad częściej na nich i w sumie z miesięcy kratka co GS oczek (użytkownik: „opady dociągane do linii”)
 fn parAt(p: u32, X: f32, Y: f32) -> f32 {
+  if (PBS > 0.0) { return parBsp(p, X, Y); }
   let gx = X / f32(GS);
   let gy = Y / f32(GS);
   let xf = floor(gx);
@@ -1152,13 +1247,33 @@ const FR_H: f32 = 2000.0;        // grubość zimnego klina [m nad gruntem] (pow
 // temperatura dużej skali na wysokości FR_ZR w punkcie (X, Y) [oczka]; poza liczoną domeną wartość z jej brzegu (strefa
 // wyrównania łączy przeciwległe brzegi – sztuczny gradient, który udawałby front)
 fn frT(X0: f32, Y0: f32) -> f32 {
+  var a: Air;
+  if (NE > 0u && FRHU > 0.0 && vg[VG_FRH + 7u * FRH_N] > 0.5) {
+    // parametry z węzłów wokół domeny (pe_frh, frhGeom w grid.js): duża skala także za brzegiem – front wchodzi do domeny, zamiast pojawiać
+    // się nagle ~100 km w jej głębi (wcześniej poza domeną wartość z brzegu: strefa gradientu za brzegiem płaska; styczeń, Polska 7.5 km:
+    // odcinki frontu pojawiały się pierwszy raz średnio ~105 km od brzegu). Ta sama siatka także w domenie – bez szwu na brzegu
+    let gx = clamp((X0 - FRH_X0) / FRH_DC, 0.0, f32(FRH_NX) - 1.001);
+    let gy = clamp((Y0 - FRH_Y0) / FRH_DCY, 0.0, f32(FRH_NY) - 1.001);
+    let i = u32(gx);
+    let j = u32(gy);
+    let c = j * FRH_NX + i;
+    let fx = gx - f32(i);
+    let fy = gy - f32(j);
+    a.ts = frhP(0u, c, fx, fy); a.gam = frhP(1u, c, fx, fy); a.ztr = frhP(2u, c, fx, fy); a.zi = frhP(3u, c, fx, fy); a.di = frhP(4u, c, fx, fy);
+    a.g2 = frhP(5u, c, fx, fy); a.gu = frhP(6u, c, fx, fy);
+    return airT(a, FR_ZR);
+  }
   var X = X0;
   var Y = Y0;
   if (NE > 0u) { X = clamp(X0, 0.5, f32(NXV) - 0.5); Y = clamp(Y0, 0.5, f32(NYV) - 0.5); }
-  var a: Air;
   a.ts = parAt(0u, X, Y); a.gam = parAt(1u, X, Y); a.ztr = parAt(2u, X, Y); a.zi = parAt(3u, X, Y); a.di = parAt(4u, X, Y);
   a.g2 = parAt(15u, X, Y); a.gu = parAt(24u, X, Y);
   return airT(a, FR_ZR);
+}
+// parametr q siatki wokół domeny dwuliniowo (c – węzeł lewy dolny)
+fn frhP(q: u32, c: u32, fx: f32, fy: f32) -> f32 {
+  let b = VG_FRH + q * FRH_N + c;
+  return mix(mix(vg[b], vg[b + 1u], fx), mix(vg[b + FRH_NX], vg[b + FRH_NX + 1u], fx), fy);
 }
 
 // kwadrat (pow(x, 2.0) dla ujemnego x jest w WGSL nieokreślony – na części kart NaN)
@@ -2397,10 +2512,14 @@ fn advect(@builtin(global_invocation_id) gid: vec3u, @builtin(num_workgroups) nw
     val += th0At(vg[VG_ZC + k] - dt * wd) - vg[VG_TC + k];
     val += dt * vg[VG_RCOOL + k];
     val += lsTend(T_OFF, l, k, true) + fls;
+    // wychładzanie radiacyjne warstwy przy gruncie (grubości dz): w cienkiej komórce część hf, reszta w warstwie wyżej (`surface`, ?kbz=0 – całe w niej)
+    let fqr = select(1.0, vg[VG_HF + col], KBZ > 0.0);
     if (k == kb) {
       // pierwsza komórka nad gruntem: strumień ciepła jawnego z powierzchni
-      val += dt * (sfc[sf(S_H, col)] - sfc[sf(S_QRAD, col)]) / (vg[VG_RC + k] * CP * vg[VG_HF + col] * vg[VG_DZC + k] * vg[VG_EXC + k]);
+      val += dt * (sfc[sf(S_H, col)] - fqr * sfc[sf(S_QRAD, col)]) / (vg[VG_RC + k] * CP * vg[VG_HF + col] * vg[VG_DZC + k] * vg[VG_EXC + k]);
       val += P.noiseAmp * rand11(l + P.step * NXY);
+    } else if (k == kb + 1u && fqr < 1.0) {
+      val -= dt * (1.0 - fqr) * sfc[sf(S_QRAD, col)] / (vg[VG_RC + k] * CP * vg[VG_DZC + k] * vg[VG_EXC + k]);
     }
     // warstwa tłumiąca: wygasza odchyłkę od pola docelowego (fale grawitacyjne), nie samo θ'
     let thT = tgAt(0u, l, P.ta1);
@@ -2486,7 +2605,11 @@ fn turb_k(@builtin(global_invocation_id) gid: vec3u, @builtin(num_workgroups) nw
     // schemat warstwy granicznej (K-profil, jak YSU bez członu przeciwgradientowego)
     let col = id % NXY;
     let hb = sfc[sf(S_PBLH, col)];
-    let za = vg[VG_ZC + k] - zgC(col);
+    // komórka przy gruncie: wysokość środka jej części nad gruntem (0.5·hf·dz – jak 1. poziom w `surface`), nie środka całej warstwy:
+    // ten leży (hf − 0.5)·dz nad gruntem, przy hf < 0.5 pod nim – cienka komórka nie dostawała K-profilu (przy hf tuż ponad 0.5 prawie
+    // zerowy, K ∝ wysokość), a nocą Smagorinsky w inwersji daje ~0: oddzielona od powietrza wyżej szła za wychładzanym gruntem
+    // (styczeń, −10 K: oczka o hf 0.3–0.5 do −17 K wobec sąsiadów, warstwa graniczna 32 m przy 244 m obok – „kwadraty zimna”, użytkownik)
+    let za = select(vg[VG_ZC + k] - zgC(col), 0.5 * vg[VG_HF + col] * dzc, KBZ > 0.0 && k == u32(vg[VG_KB + col]));
     if (za > 0.0 && za < hb) {
       let x = 1.0 - za / hb;
       // nocą (warstwa stała) w_s = u*/φm, φm = 1 + 5 z/L (jak YSU) – bez tego K-profil mieszał ciepło
@@ -2701,6 +2824,14 @@ fn diffuse(@builtin(global_invocation_id) gid: vec3u) {
     let hk0 = select(select(vg[VG_HF + col], aV(i, j, kbf), f == 1u), aU(i, j, kbf), f == 0u);
     kLnk = TLK * clamp(1.0 - hk0, 0.0, 1.0) * vg[VG_DZW + kbf + 1u] * vg[VG_DZW + kbf + 1u] / 900.0;
   }
+  // odległość środka komórki przy gruncie (części nad gruntem / otwartej części ściany) od środka warstwy wyżej: przy cienkiej komórce
+  // mniejsza niż odległość środków całych warstw (o 0.5·(1 − hf)·dz) – z odległością nominalną strumień między nimi był
+  // przy hf 0.3 o ~⅓ za słaby (?kbz=0 – dawniej)
+  var dEff = 0.0;
+  if (KBZ > 0.0 && f != 2u && kbf + 1u < NZ) {
+    let hk1 = select(select(vg[VG_HF + col], aV(i, j, kbf), f == 1u), aU(i, j, kbf), f == 0u);
+    dEff = vg[VG_DZW + kbf + 1u] - 0.5 * (1.0 - clamp(hk1, 0.0, 1.0)) * vg[VG_DZC + kbf];
+  }
   var cp: array<f32, NZ + 1u>;
   var dp: array<f32, NZ + 1u>;
   for (var k = 0u; k < nl; k++) {
@@ -2717,10 +2848,10 @@ fn diffuse(@builtin(global_invocation_id) gid: vec3u) {
       } else {
         // strumienie na poziomach w; zerowy strumień na gruncie i u góry
         let rc = vg[VG_RC + k];
-        if (k > kbf) { a = -dt * (0.5 * (kp[k - 1u] + kp[k]) + select(0.0, kLnk, k == kbf + 1u)) * vg[VG_RW + k] / (vg[VG_DZW + k] * vg[VG_DZC + k] * rc); }
+        if (k > kbf) { a = -dt * (0.5 * (kp[k - 1u] + kp[k]) + select(0.0, kLnk, k == kbf + 1u)) * vg[VG_RW + k] / (select(vg[VG_DZW + k], dEff, dEff > 0.0 && k == kbf + 1u) * vg[VG_DZC + k] * rc); }
         // (komórka przy gruncie: masa części nad gruntem – hf·dz dla skalarów, część otwarta ściany dla u, v)
         let hk = select(1.0, select(select(vg[VG_HF + col], aV(i, j, k), f == 1u), aU(i, j, k), f == 0u), k == kbf);
-        if (k < NZ - 1u) { c = -dt * (0.5 * (kp[k] + kp[k + 1u]) + select(0.0, kLnk, k == kbf)) * vg[VG_RW + k + 1u] / (vg[VG_DZW + k + 1u] * hk * vg[VG_DZC + k] * rc); }
+        if (k < NZ - 1u) { c = -dt * (0.5 * (kp[k] + kp[k + 1u]) + select(0.0, kLnk, k == kbf)) * vg[VG_RW + k + 1u] / (select(vg[VG_DZW + k + 1u], dEff, dEff > 0.0 && k == kbf) * hk * vg[VG_DZC + k] * rc); }
       }
       b = 1.0 - a - c;
       if (k == kbf && f < 2u) { b += drag; }
@@ -3276,7 +3407,7 @@ fn micro(@builtin(global_invocation_id) gid: vec3u) {
   }
   // opad przy gruncie: śnieg, gdy w najniższej warstwie poniżej ~1 °C
   let tb = tPhase(col, kb, thc[kb], thc[kb + 1u]);
-  let fsnow = clamp((TFRZ + 1.0 - tb) / 2.0, 0.0, 1.0);
+  let fsnow = snowFrac(col, kb, tb);
   let tot = PR_SCALE * (acc + acci);
   sfc[sf(S_PR, col)] = tot / dt * 3600.0;                // [mm/h]
   sfc[sf(S_PSN, col)] = PR_SCALE * (fsnow * acc + acci) / dt * 3600.0;
@@ -3489,6 +3620,28 @@ fn cuVirga(col: u32, kb: u32, kl: u32, pr0: f32) -> f32 {
   }
   return fl * P.dt;
 }
+// Cząstka nienasycona przechodzi warstwę od poziomu k − 1 (ciśnienie p0) do k (p1): sucho do poziomu kondensacji wewnątrz warstwy (liniowo
+// z niedosytu na dole i na górze), dalej wilgotnoadiabatycznie; zwraca (T na górze warstwy, 1 – nasycona). Wcześniej cała warstwa sucho,
+// a nasycenie sprawdzane dopiero na górze: cząstka wchodziła w chmurę do ~1 K za zimna zależnie od tego, gdzie w warstwie (~200 m na 1.5 km)
+// wypada podstawa, więc CAPE skakało piłokształtnie o setki J/kg, gdy poziom kondensacji przechodził przez poziom siatki – na mapie plamy
+// i pierścienie wędrujące rano z rosnącym poziomem kondensacji (użytkownik). fine = 0 – dawniej (cała warstwa sucho): tak zostają cząstki
+// schematu konwekcji (KF, podniesiona) – dostrojone przy tym błędzie; dokładniejsza cząstka rozkręcała schemat (zapis użytkownika, 2 VII
+// wieczór: kolumny drogi głębokiej 1545 → 5303, słaby opad schematu 558 → 1254 oczek, migające 53 → 171 na 10 min). Dokładnie: CAPE i MUCAPE
+fn parcelDry(t0: f32, q: f32, p0: f32, p1: f32, dz: f32, fine: f32) -> vec2f {
+  let t1 = t0 - G / CP * dz;
+  let d1 = qsat(t1, p1) - q;
+  if (d1 > 0.0) { return vec2f(t1, 0.0); }
+  if (fine == 0.0) { return vec2f(t1, 1.0); }
+  let d0 = max(qsat(t0, p0) - q, 0.0);
+  let fr = d0 / max(d0 - d1, 1e-12);
+  var t = t0 - G / CP * dz * fr;
+  let dzm = dz * (1.0 - fr);
+  for (var s = 0; s < 2; s++) {
+    let qs = qsat(t, p1);
+    t -= 0.5 * dzm * G * (1.0 + LV * qs / (RD * t)) / (CP + LV * LV * qs * 0.622 / (RD * t * t));
+  }
+  return vec2f(t, 1.0);
+}
 const TAU_MID: f32 = 3600.0;
 fn cuMid(col: u32, kb: u32, zg: f32, ks: u32, capes: f32, cinS: f32) -> bool {
   var hmx = -1.0;
@@ -3521,8 +3674,9 @@ fn cuMid(col: u32, kb: u32, zg: f32, ks: u32, capes: f32, cinS: f32) -> bool {
     let te = (vg[VG_TC + k] + state[T_OFF + c]) * vg[VG_EXC + k];
     let qe = max(state[QV_OFF + c], 0.0);
     if (!sat) {
-      tp -= G / CP * dz;
-      if (qp >= qsat(tp, p)) { sat = true; kl = k; }
+      let pd = parcelDry(tp, qp, vg[VG_PRS + k - 1u], p, dz, 0.0);
+      tp = pd.x;
+      if (pd.y > 0.5) { sat = true; kl = k; }
     } else {
       for (var s = 0; s < 2; s++) {
         let qs = qsat(tp, p);
@@ -3700,8 +3854,9 @@ fn cumulus(@builtin(global_invocation_id) gid: vec3u) {
     let dzp = dz * tps / tep;
     let p = vg[VG_PRS + k];
     if (!sats) {
-      tps -= G / CP * dzp;
-      if (qps >= qsat(tps, p)) { sats = true; }
+      let pd = parcelDry(tps, qps, vg[VG_PRS + k - 1u], p, dzp, LCLI);
+      tps = pd.x;
+      sats = pd.y > 0.5;
     } else {
       for (var s = 0; s < 2; s++) {
         let qs = qsat(tps, p);
@@ -3723,8 +3878,9 @@ fn cumulus(@builtin(global_invocation_id) gid: vec3u) {
     let te = (vg[VG_TC + k] + state[T_OFF + c]) * vg[VG_EXC + k];
     let qe = max(state[QV_OFF + c], 0.0);
     if (!sat) {
-      tp -= G / CP * dz;
-      if (qp >= qsat(tp, p)) { sat = true; klcl = k; }
+      let pd = parcelDry(tp, qp, vg[VG_PRS + k - 1u], p, dz, 0.0);
+      tp = pd.x;
+      if (pd.y > 0.5) { sat = true; klcl = k; }
     } else {
       for (var s = 0; s < 2; s++) {
         let qs = qsat(tp, p);
@@ -3776,8 +3932,9 @@ fn cumulus(@builtin(global_invocation_id) gid: vec3u) {
       let dzp = dz * tq / tem;
       let p = vg[VG_PRS + k];
       if (!st) {
-        tq -= G / CP * dzp;
-        if (qq >= qsat(tq, p)) { st = true; }
+        let pd = parcelDry(tq, qq, vg[VG_PRS + k - 1u], p, dzp, LCLI);
+        tq = pd.x;
+        if (pd.y > 0.5) { st = true; qq = select(qq, min(qq, qsat(tq, p)), LCLI > 0.0); }
       } else {
         for (var s = 0; s < 2; s++) {
           let qs = qsat(tq, p);
@@ -4410,7 +4567,7 @@ fn cu_spread(@builtin(global_invocation_id) gid: vec3u) {
   sfc[sf(S_PRCG, col)] = prc;
   if (prc <= 0.0) { return; }
   let tbk = tPhase(col, kb, state[T_OFF + kb * NXY + col], state[T_OFF + (kb + 1u) * NXY + col]);
-  let fsn = clamp((TFRZ + 1.0 - tbk) / 2.0, 0.0, 1.0);
+  let fsn = snowFrac(col, kb, tbk);
   sfc[sf(S_PR, col)] += prc;
   sfc[sf(S_PSN, col)] += fsn * prc;
   addPacc(col, prc * P.dt / 3600.0, fsn * prc * P.dt / 3600.0);
@@ -4432,10 +4589,21 @@ fn mon_abs(@builtin(global_invocation_id) gid: vec3u) {
 fn mon_day(@builtin(global_invocation_id) gid: vec3u) {
   let col = gid.x;
   if (col >= NXY) { return; }
-  sfc[sf(S_MTX, col)] += sfc[sf(S_TMAX, col)];
-  sfc[sf(S_MTN, col)] += sfc[sf(S_TMIN, col)];
-  sfc[sf(S_MHOT, col)] += select(0.0, 1.0, sfc[sf(S_TMAX, col)] >= 30.0);
-  sfc[sf(S_MTRO, col)] += select(0.0, 1.0, sfc[sf(S_TMIN, col)] >= 20.0);
+  let tx = sfc[sf(S_TMAX, col)];
+  let tn = sfc[sf(S_TMIN, col)];
+  sfc[sf(S_MTX, col)] += tx;
+  sfc[sf(S_MTN, col)] += tn;
+  sfc[sf(S_MHOT, col)] += select(0.0, 1.0, tx >= 30.0);
+  sfc[sf(S_MTRO, col)] += select(0.0, 1.0, tn >= 20.0);
+  // dni charakterystyczne: klasy rozłączne wg T maks. – doba liczy się tylko w najostrzejszej klasie (gorąca nie jest też ciepła);
+  // upalna 30…35 °C = MHOT − MDVH (MHOT dalej ≥ 30 °C – zgodność ze starszymi zapisami przebiegu); przymrozkowa – T min < 0 przy T maks ≥ 0
+  sfc[sf(S_MDXF, col)] += select(0.0, 1.0, tx <= -15.0);
+  sfc[sf(S_MDVF, col)] += select(0.0, 1.0, tx > -15.0 && tx <= -10.0);
+  sfc[sf(S_MDFR, col)] += select(0.0, 1.0, tx > -10.0 && tx < 0.0);
+  sfc[sf(S_MDFD, col)] += select(0.0, 1.0, tx >= 0.0 && tn < 0.0);
+  sfc[sf(S_MDWM, col)] += select(0.0, 1.0, tx >= 20.0 && tx < 25.0);
+  sfc[sf(S_MDSU, col)] += select(0.0, 1.0, tx >= 25.0 && tx < 30.0);
+  sfc[sf(S_MDVH, col)] += select(0.0, 1.0, tx >= 35.0);
 }
 
 // ======================= Rzut ciśnienia =======================
@@ -5555,7 +5723,7 @@ fn lite_col(@builtin(global_invocation_id) gid: vec3u) {
   // (bez cumulusów: na obrazie dawały mleczną zasłonę albo pola kłębów – użytkownik: w trybie lekkim bez nich)
   // -- opad: przy gruncie (rodzaj z temperatury ~30 m nad gruntem), krople do radaru od gruntu do wierzchołka chmur --
   let tb = tPhase(col, kb, state[T_OFF + kb * NXY + col], state[T_OFF + min(kb + 1u, NZ - 1u) * NXY + col]);
-  let fsnow = clamp((TFRZ + 1.0 - tb) / 2.0, 0.0, 1.0);
+  let fsnow = snowFrac(col, kb, tb);
   sfc[sf(S_PR, col)] = pr;
   sfc[sf(S_PSN, col)] = fsnow * pr;
   addPacc(col, pr * dt / 3600.0, fsnow * pr * dt / 3600.0);

@@ -39,6 +39,10 @@ struct PP {
   tcDt: f32,       // … czas od poprzedniej listy [s] (0 – pierwsza albo ponowna w tej samej chwili)
   dhx: f32,        // … połowa wymiarów liczonej domeny [m]
   dhy: f32,
+  frhOff: u32,     // parametry profilu T wokół domeny (pe_frh – wykrywanie frontów w domenie): przesunięcie w buforze vg domeny
+  frhN: u32,       // … liczba węzłów (w tablicy węzłów za nodeCount węzłami siatki parametrów)
+  frhX1: f32,
+  frhX2: f32,
 }
 
 @group(0) @binding(0) var<uniform> P: PP;
@@ -1667,6 +1671,25 @@ fn pe_params(@builtin(global_invocation_id) gid: vec3u) {
     for (var p = 0u; p < 25u; p++) { acc[p] += wgt * A.p[p]; }
   }
   for (var p = 0u; p < 25u; p++) { nest[P.pgOff + p * P.nodeCount + n] = acc[p]; }
+}
+
+// parametry profilu temperatury (0, 1, 2, 3, 4, 15, 24 – jak frT w sim.wgsl) w węzłach wokół domeny: wykrywanie frontów w domenie widzi
+// dużą skalę także za brzegiem (wcześniej wartość z brzegu – front za brzegiem był niewidoczny i pojawiał się nagle w głębi domeny).
+// Za tablicą: znacznik 1 – policzone (domena czyta zwykłą siatkę parametrów, dopóki go nie ma: stała masa powietrza, wczytany zapis)
+@compute @workgroup_size(64)
+fn pe_frh(@builtin(global_invocation_id) gid: vec3u) {
+  let h = gid.x;
+  if (h >= P.frhN) { return; }
+  let o = VZ_NODES + (P.nodeCount + h) * 12u;
+  var A = air(P.cx + vz[o], P.cy + vz[o + 1u]);
+  nest[P.frhOff + h] = A.p[0];
+  nest[P.frhOff + P.frhN + h] = A.p[1];
+  nest[P.frhOff + 2u * P.frhN + h] = A.p[2];
+  nest[P.frhOff + 3u * P.frhN + h] = A.p[3];
+  nest[P.frhOff + 4u * P.frhN + h] = A.p[4];
+  nest[P.frhOff + 5u * P.frhN + h] = A.p[15];
+  nest[P.frhOff + 6u * P.frhN + h] = A.p[24];
+  if (h == 0u) { nest[P.frhOff + 7u * P.frhN] = 1.0; }
 }
 
 // wektor środka domeny (do interfejsu) i trajektoria wsteczna 3 doby (historia wiatru ~1.5 km)

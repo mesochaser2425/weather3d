@@ -127,15 +127,16 @@
     #anaKind button { flex: 1; }
     .mongrid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
     .mongrid .btn { padding: 7px 2px; font-size: 11.5px; }
-    #monTab { width: 100%; border-collapse: collapse; font-size: 11px; font-variant-numeric: tabular-nums; }
-    #monTab th { color: var(--dim); font-weight: 700; text-align: right; padding: 3px 2px; border-bottom: 1px solid var(--line); white-space: nowrap; }
-    #monTab td { text-align: right; padding: 3px 2px; color: var(--muted); white-space: nowrap; }
-    #monTab th:first-child, #monTab td:first-child { text-align: left; }
-    #monTab tbody tr { cursor: pointer; }
-    #monTab tbody tr:hover td { background: var(--panel3); color: var(--text); }
-    #monTab tbody tr.on td { background: var(--tile); color: var(--tile-ink); }
-    #monTab tbody tr.sec td { cursor: default; background: none; color: var(--dim); font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; padding-top: 8px; }
-    #monTab tfoot td { border-top: 1px solid var(--line); color: var(--text); font-weight: 700; }
+    #monTab, #dayTab { width: 100%; border-collapse: collapse; font-size: 11px; font-variant-numeric: tabular-nums; }
+    #monTab th, #dayTab th { color: var(--dim); font-weight: 700; text-align: right; padding: 3px 2px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+    #monTab td, #dayTab td { text-align: right; padding: 3px 2px; color: var(--muted); white-space: nowrap; }
+    #monTab th:first-child, #monTab td:first-child, #dayTab th:first-child, #dayTab td:first-child { text-align: left; }
+    #monTab tbody tr, #dayTab tbody tr { cursor: pointer; }
+    #monTab tbody tr:hover td, #dayTab tbody tr:hover td { background: var(--panel3); color: var(--text); }
+    #monTab tbody tr.on td, #dayTab tbody tr.on td { background: var(--tile); color: var(--tile-ink); }
+    #monTab tbody tr.sec td, #dayTab tbody tr.sec td { cursor: default; background: none; color: var(--dim); font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; padding-top: 8px; }
+    #monTab tfoot td, #dayTab tfoot td { border-top: 1px solid var(--line); color: var(--text); font-weight: 700; }
+    #dayTab th { font-size: 10px; padding: 3px 1px; }
     #cprev { width: 100%; aspect-ratio: 1.15; background: var(--panel); display: block; }
     #sndIdx { display: grid; grid-template-columns: 1fr; gap: 3px; font-size: 12px; }
     #sndIdx div { display: flex; justify-content: space-between; color: var(--muted); }
@@ -444,7 +445,7 @@
       and convection. The domain lies inside it: air from this model enters through the boundaries, together with clouds and precipitation.</div>
     <h4>Data and licences</h4>
     <div class="hint">Terrain: Terrain Tiles on AWS (SRTM, GMTED, ETOPO1, EU-DEM and others). Land cover: © ESA WorldCover project 2021 / Contains modified Copernicus Sentinel data (2021)
-      processed by ESA WorldCover consortium (CC BY 4.0), read from Microsoft Planetary Computer. Places: GeoNames (CC BY 4.0). Climate: weather data by
+      processed by ESA WorldCover consortium (CC BY 4.0), read from Microsoft Planetary Computer. Forest leaf type: © ESA Climate Change Initiative – Land Cover / Copernicus Climate Change Service (C3S Land Cover 2020), read from Microsoft Planetary Computer. Places: GeoNames (CC BY 4.0). Climate: weather data by
       <a href="https://open-meteo.com/" target="_blank" rel="noopener">Open-Meteo.com</a> (CC BY 4.0; ERA5, Copernicus Climate Change Service); NCEP/NCAR Reanalysis, GHCN_CAMS, GPCC and GPCP data
       provided by the NOAA PSL, Boulder, Colorado, USA, from their website at <a href="https://psl.noaa.gov" target="_blank" rel="noopener">https://psl.noaa.gov</a>.
       Weather3D is free software under the MIT licence: <a href="https://github.com/mesochaser2425/weather3d" target="_blank" rel="noopener">source code, all sources and licences</a>.</div>
@@ -461,7 +462,7 @@
       <div class="tt-map">
         <canvas id="ttMap" title="Wheel – zoom · drag – pan · click – move the area here · drag the area or its corners – move / resize · double-click – fit the area"></canvas>
         <div class="tt-hint">Wheel – zoom · drag the map – pan · click – move the area here · drag the white frame or its corners – move / resize</div>
-        <div class="tt-hint">Terrain: Terrain Tiles on AWS · Land cover: © ESA WorldCover project 2021 / Contains modified Copernicus Sentinel data (2021) processed by ESA WorldCover consortium · <a href="https://github.com/mesochaser2425/weather3d#data-sources" target="_blank" rel="noopener">All sources and licences</a></div>
+        <div class="tt-hint">Terrain: Terrain Tiles on AWS · Land cover: © ESA WorldCover project 2021 / Contains modified Copernicus Sentinel data (2021) processed by ESA WorldCover consortium · Leaf type: ESA CCI / C3S Land Cover · <a href="https://github.com/mesochaser2425/weather3d#data-sources" target="_blank" rel="noopener">All sources and licences</a></div>
         <div class="tt-net" id="ttNet" style="display:none">Terrain tiles are not available (no internet?). You can still start on flat terrain.</div>
       </div>
       <div class="tt-side">
@@ -520,6 +521,7 @@
         <button data-tab="ter" title="Terrain, brush and surface">Terrain</button>
         <button data-tab="view" title="All map layers">Layers</button>
         <button data-tab="mon" title="Climate analysis: months, seasons and years">Climate<br>analysis</button>
+        <button data-tab="days" title="Characteristic days: frosty, frost, warm and hot days, tropical nights">Charact.<br>days</button>
         <button data-tab="set" title="Place, date, grid, map overlays, save and load">Settings</button>
       </div>
     </nav>
@@ -705,6 +707,28 @@
             <tbody></tbody><tfoot></tfoot></table>
           <div class="hint">Domain means: T, mean daily max Tx and min Tn [<span class="uT">°C</span>], precipitation P and snow S (water) [<span class="uP">mm</span>]. Extremes anywhere in the domain: absolute TXx and TNn [<span class="uT">°C</span>], highest daily precipitation Rx1d [<span class="uP">mm</span>].
             * – period in progress. Click a row – map of that period. “Total” – the whole run. A restart clears the saved months.</div>
+        </div>
+      </div>
+
+      <div class="tab" data-panel="days">
+        <div class="thead"><i class="tmark"></i><span class="ttl">Characteristic days</span><button class="tclose" title="Close the menu (Esc)">×</button></div>
+        <div class="box">
+          <div class="seg" id="dayKind"><button data-k="m" class="on">Months</button><button data-k="s">Seasons</button><button data-k="y">Years</button></div>
+          <label><span class="lbl">Period <b id="dayV"></b></span>
+            <input id="daySel" type="range" min="0" max="0" step="1" value="0" /></label>
+        </div>
+        <div class="box">
+          <h4>Map</h4>
+          <div class="mongrid" id="dayBtns"></div>
+        </div>
+        <div class="box">
+          <h4>Visible domain – mean number of days</h4>
+          <table id="dayTab"><thead><tr></tr></thead><tbody></tbody><tfoot></tfoot></table>
+          <div class="hint">Mean number of full days per grid cell. Classes by daily T max are exclusive – a day counts only in the most extreme class it reaches
+            (a hot day is not also a warm day): T max ≤ <span class="dT0"></span> extremely frosty, ≤ <span class="dT1"></span> very frosty, &lt; <span class="dT2"></span> frosty;
+            ≥ <span class="dT3"></span> warm, ≥ <span class="dT4"></span> summer, ≥ <span class="dT5"></span> hot, ≥ <span class="dT6"></span> very hot.
+            Frost days: T min &lt; <span class="dT2"></span> with T max ≥ <span class="dT2"></span>. Tropical nights: T min ≥ <span class="dT3"></span>.
+            * – period in progress. Click a row – map of that period. The period is shared with Climate analysis.</div>
         </div>
       </div>
 

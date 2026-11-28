@@ -191,6 +191,9 @@ export function createStations(ctx) {
       sunh: v('SUNH'), tmaxS: v('TMAX'), tminS: v('TMIN'),
       // parowanie terenowe [mm/h] z ciepła utajonego; wilgotność objętościowa warstw gleby [%] (θs = 45%)
       et: v('LE') / 2.5e6 * 3600, sm1: 45 * v('SM1'), sm2: 45 * v('SM2'), sm3: 45 * v('SM3'), corr: false };
+    // śnieg na gruncie z gęstej pokrywy w punkcie stacji (snowhi.wgsl: prawdziwa wysokość, stok), gdy jest – inaczej z oczka
+    const sh = ctx.snow ? ctx.snow(s) : null;
+    if (sh && Number.isFinite(sh.swe) && Number.isFinite(sh.snd)) { h.swe = sh.swe; h.snd = sh.snd; }
     if (s.zs == null) return h;
     const dz = s.zs - ctx.modelH(c);
     if (dz > 25) {
@@ -410,6 +413,7 @@ export function createStations(ctx) {
     get addMode() { return addMode; },
     addAt,
     airReq,
+    snowPts: () => list,
     markers,                 // ponowne rozmieszczenie znaczników (zoom mapy)
     setCities: (arr) => { cities = arr || []; markers(); },
     exportList,

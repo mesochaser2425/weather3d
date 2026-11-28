@@ -78,6 +78,18 @@ export const CFG = {
   W_SH: clamp01((DX0 - 300) / 1200),   // konwekcja płytka (cumulusy) – od ~0.5 km pełna przy 1.5 km
   Z0: 0.1,                 // szorstkość aerodynamiczna podłoża [m]
 };
+// Siatka parametrów profilu temperatury wokół domeny – do wykrywania frontów (tgt_build, frT w sim.wgsl). Model synoptyczny (pe_frh) liczy
+// w węzłach co hs (~25–50 km, jak węzły siatki parametrów, nie gęściej niż 25 km – model ma 75 km) do HR poza liczoną domeną: FR_J = 24
+// kroki przeszukiwania × max(dx, 8 km) + 100 km. Wcześniej poza domeną brana była wartość z brzegu – front za brzegiem był niewidoczny i
+// wykrywanie łapało go dopiero ~100 km w głębi domeny (użytkownik: fronty pojawiają się nad domeną nagle, zamiast do niej wchodzić)
+export function frhGeom(c) {
+  const hs = Math.min(Math.max(c.GS * c.DX, 25000), 50000);
+  const HR = 24 * Math.max(c.DX, 8000) + 100000;
+  const dc = hs / c.DX, dcy = hs / c.DY, nh = Math.ceil(HR / hs);
+  const nx = Math.ceil(c.NXV / dc) + 2 * nh + 1, ny = Math.ceil(c.NYV / dcy) + 2 * nh + 1;
+  return { dc, dcy, nh, x0: -nh * dc, y0: -nh * dcy, nx, ny, n: nx * ny };
+}
+CFG.FRH = frhGeom(CFG);
 
 export const G = 9.81, CP = 1004.0, RD = 287.0, P0 = 100000.0, LV = 2.5e6;
 
@@ -95,11 +107,18 @@ export const SFC = ['TS', 'TD', 'W', 'H', 'LE', 'CDU', 'T2', 'TD2', 'PR', 'PACC'
   'MTS', 'MTX', 'MTN', 'MPR', 'MSN', 'MV',
   // widok „Miesiące”: liczniki pełnych dób z T maks. ≥ 30 °C (dni upalne) i T min. ≥ 20 °C (noce tropikalne)
   'MHOT', 'MTRO',
+  // zakładka „Characteristic days”: liczniki pełnych dób w klasach rozłącznych wg T maks. (doba tylko w najostrzejszej klasie) – ekstremalnie
+  // mroźne (≤ −15 °C), bardzo mroźne (−15…−10), mroźne (−10…0), ciepłe (20…25), gorące (25…30), bardzo upalne (≥ 35; upalne 30…35 = MHOT − MDVH);
+  // przymrozkowe: T min < 0 przy T maks ≥ 0
+  'MDXF', 'MDVF', 'MDFR', 'MDFD', 'MDWM', 'MDSU', 'MDVH',
   // ekstrema bieżącego miesiąca do analiz (aktualizowane o północy, 0 – brak danych): T maks. absolutna + 1000, 1000 − T min. absolutna [°C],
   // największy opad dobowy [mm]; PD0 – suma opadu PACC o ostatniej północy
   'MXA', 'MNA', 'MPD', 'PD0',
   // grubość pokrywy śnieżnej [m] (gęstość = SWE / SND: świeży śnieg wg temperatury powietrza, potem osiadanie)
   'SND',
+  // klimatologia temperatury wody dla bieżącej daty [K] (morze – SST modelu synoptycznego, jeziora – z klimatu, suwak ustawiony ręcznie – jego
+  // wartość; + anomalia temperatury morza z manipulacji) – wpisywana z JS o północy i na starcie (main.js twcUpdate); woda dąży do niej
+  'TWC',
   // część kopuły zimnego powietrza pochodząca z prądów zstępujących schematu (źródło WKSRC; dwa bufory jak ORG / ORGB)
   'ORGS', 'ORGSB',
   // wiatr na wysokości chmur piętra średniego (2–6 km nad gruntem, ważony wodą chmur) – ruch ich wzoru na satelicie i w 3D
@@ -244,6 +263,7 @@ export function buildGrid(c, snd) {
     ['TWD', 2 * c.NX + 2 * c.NY],  // tablice cos/sin dla DFT
     ['KB', NXY],                   // liczba podziemnych komórek w kolumnie
     ['HF', NXY],                   // część najniższej komórki nad gruntem (oczka przycięte do terenu, 0.3…1)
+    ['WDEP', NXY],                 // głębokość wody [m] (morze z batymetrii kafli Terrarium, jeziora i bez danych – domyślna; main.js waterDepth)
     ['HGT', NXY],                  // wysokość terenu (gładka) [m]
     ['SLX', NXY], ['SLY', NXY],    // nachylenie terenu dz/dx, dz/dy
     ['LAND', NXY],                 // użytkowanie: 0 otwarte, 1 las, 2 zabudowa, 3 woda
@@ -254,6 +274,8 @@ export function buildGrid(c, snd) {
     ['CCG', 8 * 36],               // korekta klimatu w węzłach (miejsce na 6 × 6, ccN daje ≤ 4 × 4): 4 temperatury [K], wykładnik wilgotności przy gruncie, mnożniki 850 i 700 hPa, mnożnik opadu (tryb lekki: norma opadu; main.js ccUpload)
     ['CCE', 36],                   // wysokość danych normy klimatu w węzłach korekty [m] (tryb lekki: opad z wysokością)
     ['TCL', 8 * 24],               // cyklony tropikalne z modelu synoptycznego dla drobnego jądra w celu (pe_tcdom → tgt_build): 8 × 24
+    // parametry profilu T (0, 1, 2, 3, 4, 15, 24) w węzłach wokół domeny (frhGeom; pe_frh) + znacznik ważności (1 – policzone w tym przebiegu)
+    ['FRH', 7 * (c.FRH ? c.FRH.n : 1) + 1],
   ];
   const off = {};
   let total = 0;
@@ -354,6 +376,9 @@ export function wgslHeader(c, grid) {
     `const NXV: u32 = ${c.NXV}u;`, `const NYV: u32 = ${c.NYV}u;`, `const NE: u32 = ${c.NE}u;`, `const NI: u32 = ${c.NI}u;`,
     `const MG: u32 = ${c.MG}u;`, `const NXD: u32 = ${c.NXD}u;`, `const NYD: u32 = ${c.NYD}u;`,
     `const GS: u32 = ${c.GS}u;`, `const NGX: u32 = ${c.NX / c.GS}u;`, `const NGY: u32 = ${c.NY / c.GS}u;`,
+    `const FRH_NX: u32 = ${c.FRH ? c.FRH.nx : 1}u;`, `const FRH_NY: u32 = ${c.FRH ? c.FRH.ny : 1}u;`, `const FRH_N: u32 = ${c.FRH ? c.FRH.n : 1}u;`,
+    `const FRH_X0: f32 = ${f(c.FRH ? c.FRH.x0 : 0)};`, `const FRH_Y0: f32 = ${f(c.FRH ? c.FRH.y0 : 0)};`,
+    `const FRH_DC: f32 = ${f(c.FRH ? c.FRH.dc : 1)};`, `const FRH_DCY: f32 = ${f(c.FRH ? c.FRH.dcy : 1)};`,
     `const NPAR: u32 = ${NPAR}u;`, `const MEB: u32 = ${c.MEB}u;`,
     // pola docelowe (jeden z 3 slotów terminów z modelu synoptycznego): θ', q_v, u, v (3D), przy gruncie u_g, v_g, p, w, geometria
     // frontu (8 pól) i diagnostyka wykrywania (gradient, skupienie, kontrast)
@@ -434,8 +459,18 @@ export function wgslHeader(c, grid) {
   lines.push(`const PSD: f32 = ${f(qnum('psd', 1))};`);
   // słaby opad schematu konwekcji (średnia z oczka poniżej ~RMN mm/h) paruje pod podstawą chmury (?rmn=0 – dawniej; sim.wgsl cu_spread)
   lines.push(`const RMN: f32 = ${f(qnum('rmn', 1.5))};`);
-  lines.push(`const MBL: f32 = ${f(qnum('mbl', 1))};`);
-  lines.push(`const MRN: f32 = ${f(qnum('mrn', 1))};`);   // konwekcja podniesiona bez opadu przy ciepłej podstawie na siatkach ≤ 10 km (0 – dawniej)   // konwekcja podniesiona słabnie, gdzie cząstka przy gruncie ma swobodne CAPE (0 – dawniej)
+  lines.push(`const MBL: f32 = ${f(qnum('mbl', 1))};`);   // konwekcja podniesiona słabnie, gdzie cząstka przy gruncie ma swobodne CAPE (0 – dawniej)
+  lines.push(`const MRN: f32 = ${f(qnum('mrn', 1))};`);   // konwekcja podniesiona bez opadu przy ciepłej podstawie na siatkach ≤ 10 km (0 – dawniej)
+  lines.push(`const LCLI: f32 = ${f(qnum('lcl', 1))};`);  // poziom kondensacji cząstek wewnątrz warstwy siatki (0 – dawniej: nasycenie dopiero na poziomie)
+  lines.push(`const FRHU: f32 = ${f(qnum('frh', 1))};`);  // wykrywanie frontów z siatki parametrów wokół domeny (0 – dawniej: za brzegiem wartość z brzegu)
+  // K-profil komórki przy gruncie na wysokości środka jej części nad gruntem (0 – dawniej: środek całej warstwy, przy hf < 0.5 pod gruntem; sim.wgsl turb_k)
+  lines.push(`const KBZ: f32 = ${f(qnum('kbz', 1))};`);
+  // parametry sondażu dużej skali B-sklejane po węzłach co GS oczek (0 – dwuliniowo, dawniej: kratka co GS oczek w sumach opadu; sim.wgsl parAt)
+  lines.push(`const PBS: f32 = ${f(qnum('pbs', 1))};`);
+  // woda z głębokością: warstwa wymieszana z głębokości, powrót do klimatologii daty (0 – dawniej: 10 m wszędzie, powrót do temperatury ze startu; sim.wgsl surface)
+  lines.push(`const WDP: f32 = ${f(qnum('wdp', 1))};`);
+  // rodzaj opadu przy gruncie z warstw, przez które spada (Bourgouin 2000; 0 – dawniej: z temperatury ~30 m nad gruntem, −1…+1 °C; sim.wgsl snowFracB)
+  lines.push(`const BGN: f32 = ${f(qnum('bgn', 1))};`);
   // cyklony tropikalne – drobne jądro w celu (sim.wgsl tgt_build): kształt profilu Hollanda B = TCB0 + 0.009·Δp [hPa], mnożnik wiatru wiru, ?tcj=0 – bez jądra (wir modelu synoptycznego)
   lines.push(`const TCB0: f32 = ${f(qnum('tcb', 1.4))};`, `const TCV: f32 = ${f(qnum('tcvw', 1))};`, `const TCSZ: f32 = ${f(qnum('tcsz', 0))};`, `const TCJ: f32 = ${f(qnum('tcj', 1))};`,
     `const TCN: f32 = ${f(qnum('tcn', 0.3))};`);

@@ -1,7 +1,7 @@
 import { wxLegendCss, wxOf, WX_INDEX } from './wxscales.js';
 import { VEG_COLORS } from './climate.js';
 // Pola do wyświetlenia, ich jednostki, skale kolorów i sposób dobierania zakresu.
-// Numeracja zgodna z shaderami: 0–13 pola 3D, od 20 mapy przy gruncie (80–90 – analizy okresów).
+// Numeracja zgodna z shaderami: 0–13 pola 3D, od 20 mapy przy gruncie (80–88 – analizy okresów, 89–97 – dni charakterystyczne okresów).
 //   cmap: numer skali kolorów – legenda w legendCss niżej, mapa w render.wgsl (cmapOf – osobna tabela pole → skala,
 //         przy zmianie skali poprawiać oba miejsca); od WX_CMAP0 skale WX Charts z wxscales.js
 //   range: 'static' (stała skala z wysokości mapy, wierzchu przekroju i oczka siatki – staticRange), 'zero' (od zera do maksimum
@@ -67,11 +67,11 @@ export const FIELDS = {
   49: { name: 'Wind gusts (10 m)', unit: 'm/s', cmap: 23, range: 'fixed', fixed: [0, 40] },
   50: { name: 'Wind 10 m above ground (with arrows)', unit: 'm/s', cmap: 23, range: 'fixed', fixed: [0, 30] },
   55: { name: 'Storm parameters: CAPE + SRH 0–3 km + shear 0–6 km', unit: 'J/kg', cmap: 27, range: 'fixed', fixed: [0, 3000] },
-  51: { name: 'Wind shear 0–6 km (with arrows)', unit: 'm/s', cmap: 23, range: 'fixed', fixed: [0, 40] },
-  52: { name: 'Wind shear 0–1 km', unit: 'm/s', cmap: 23, range: 'fixed', fixed: [0, 25] },
-  53: { name: 'SRH 0–3 km (storm-relative helicity)', unit: 'm²/s²', cmap: 21, range: 'fixed', fixed: [-200, 600] },
-  54: { name: 'SRH 0–1 km', unit: 'm²/s²', cmap: 21, range: 'fixed', fixed: [-200, 600] },
-  56: { name: 'SCP – supercell composite', unit: '', cmap: 8, range: 'fixed', fixed: [0, 10] },
+  51: { name: 'Wind shear 0–6 km (with arrows)', unit: 'm/s', cmap: 41, range: 'fixed', fixed: [0, 40] },
+  52: { name: 'Wind shear 0–1 km', unit: 'm/s', cmap: 41, range: 'fixed', fixed: [0, 25] },
+  53: { name: 'SRH 0–3 km (storm-relative helicity)', unit: 'm²/s²', cmap: 42, range: 'fixed', fixed: [-200, 600] },
+  54: { name: 'SRH 0–1 km', unit: 'm²/s²', cmap: 42, range: 'fixed', fixed: [-200, 600] },
+  56: { name: 'SCP – supercell composite', unit: '', cmap: 43, range: 'fixed', fixed: [0, 10] },
   34: { name: 'Mean sea level pressure', unit: 'hPa', cmap: 40, range: 'fixed', fixed: [900, 1050], iso: true, isoMin: 1 },
   // analizy klimatyczne (zakładka – poza listą warstw): wybrany okres – miesiąc, pora roku albo rok symulacji; w toku – do tej chwili
   80: { name: 'Period: mean temperature', unit: '°C', cmap: 22, range: 'fixed', fixed: [-50, 50], iso: true },
@@ -83,8 +83,16 @@ export const FIELDS = {
   86: { name: 'Period: absolute T max', unit: '°C', cmap: 22, range: 'fixed', fixed: [-50, 50], iso: true },
   87: { name: 'Period: absolute T min', unit: '°C', cmap: 22, range: 'fixed', fixed: [-50, 50], iso: true },
   88: { name: 'Period: highest daily precipitation', unit: 'mm', cmap: 24, range: 'fixed', fixed: [0, 2000] },
-  89: { name: 'Period: hot days (T max ≥ 30 °C)', unit: 'days', cmap: 0, range: 'zero', minHi: 10 },
+  // dni charakterystyczne (zakładka „Characteristic days”): klasy rozłączne wg T maks. – doba liczy się tylko w najostrzejszej klasie
+  89: { name: 'Period: hot days (30 ≤ T max < 35 °C)', unit: 'days', cmap: 0, range: 'zero', minHi: 10 },
   90: { name: 'Period: tropical nights (T min ≥ 20 °C)', unit: 'days', cmap: 0, range: 'zero', minHi: 10 },
+  91: { name: 'Period: extremely frosty days (T max ≤ −15 °C)', unit: 'days', cmap: 0, range: 'zero', minHi: 10 },
+  92: { name: 'Period: very frosty days (−15 < T max ≤ −10 °C)', unit: 'days', cmap: 0, range: 'zero', minHi: 10 },
+  93: { name: 'Period: frosty days (−10 < T max < 0 °C)', unit: 'days', cmap: 0, range: 'zero', minHi: 10 },
+  94: { name: 'Period: frost days (T min < 0 °C, T max ≥ 0 °C)', unit: 'days', cmap: 0, range: 'zero', minHi: 10 },
+  95: { name: 'Period: warm days (20 ≤ T max < 25 °C)', unit: 'days', cmap: 0, range: 'zero', minHi: 10 },
+  96: { name: 'Period: summer days (25 ≤ T max < 30 °C)', unit: 'days', cmap: 0, range: 'zero', minHi: 10 },
+  97: { name: 'Period: very hot days (T max ≥ 35 °C)', unit: 'days', cmap: 0, range: 'zero', minHi: 10 },
 };
 
 export const FIELDS_3D = [0, 1, 2, 3, 4, 5, 13, 6, 12, 7, 8, 9, 10, 11];
@@ -117,7 +125,7 @@ export const LAYER_GROUPS = [
   ...LAYER_LEVELS.map(([p, z]) => ({ name: `Pressure level – ${p} hPa / ${z}`, p, items: LEVEL_FIELDS })),
   { name: 'Any height (slider above the map)', z: true, items: FIELDS_3D },
 ];
-export const FIELDS_MAP = [20, 21, 46, 47, 48, 50, 49, 34, 22, 38, 42, 43, 55, 44, 57, 65, 68, 66, 67, 69, 70, 71, 51, 52, 53, 54, 56, 23, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 45, 32, 40, 41, 24, 25, 26, 27, 28, 62, 63, 64, 33, 29, 58, 37, 31, 39, 30, 79];
+export const FIELDS_MAP = [20, 21, 46, 47, 48, 50, 49, 34, 22, 38, 42, 43, 55, 44, 57, 65, 68, 66, 67, 69, 70, 71, 51, 52, 53, 54, 56, 23, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 45, 32, 40, 41, 24, 25, 26, 27, 28, 62, 63, 64, 33, 29, 58, 37, 31, 39, 30, 79];
 
 // "Ładny" krok skali/izolinii: najmniejszy z 1, 2, 5 × 10^n nie mniejszy niż x
 export function niceStep(x) {

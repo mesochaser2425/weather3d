@@ -372,6 +372,91 @@ function lcTiff(name, tok) {
   return lcFiles.get(name);
 }
 
+// Typ liści lasu: ESA CCI Land Cover 2020 (v2.1.1, 300 m, kafle 45° × 45° COG w Planetary Computer, token SAS jak WorldCover – bez konta,
+// każda przeglądarka własny; Access-Control-Allow-Origin: *). Klasy: 50–62 liściaste (zimozielone i zrzucające), 70–82 iglaste, 90 mieszane,
+// 160 / 170 lasy zalewowe (liściaste). WorldCover ma tylko „drzewa” bez typu liści.
+const CCI_URL = 'https://landcoverdata.blob.core.windows.net/esa-cci-lc/cog/v2.1.1';
+const CCI_TOKEN = 'https://planetarycomputer.microsoft.com/api/sas/v1/token/landcoverdata/esa-cci-lc';
+const cciFiles = new Map();
+let cciTok = null;
+async function cciToken() {
+  if (!cciTok || Date.parse(cciTok['msft:expiry']) - Date.now() < 300000) {
+    const r = await fetch(CCI_TOKEN, { signal: AbortSignal.timeout(FETCH_MS) });
+    if (!r.ok) throw new Error(`leaf-type token: HTTP ${r.status}`);
+    cciTok = await r.json();
+    cciFiles.clear();
+  }
+  return cciTok.token;
+}
+function cciTiff(name, tok) {
+  if (!cciFiles.has(name)) {
+    const p = fromUrl(`${CCI_URL}/${name}/2020/C3S-LC-L4-LCCS-Map-300m-P1Y-2020-v2.1.1-${name}-lccs_class.tif?${tok}`, { allowFullFile: false }).catch(() => null);
+    cciFiles.set(name, p);
+    p.then((t) => { if (!t) cciFiles.delete(name); });
+  }
+  return cciFiles.get(name);
+}
+// kod typu liści: 0 liściaste, 1 iglaste, 2 mieszane, 255 – nie las / brak danych
+const leafCode = (k) => (k >= 70 && k <= 82 ? 1 : (k >= 50 && k <= 62) || k === 160 || k === 170 ? 0 : k === 90 ? 2 : 255);
+// Udział lasu iglastego w lesie oczek siatki nx × ny (jak fetchLandCover): { ndl: Float32Array (0…1, NaN – brak lasu w danych),
+// hi (hiF ≥ 2): Uint8Array kodów typu liści w punktach gęstej mapy (wiersze S→N, jak fetchLandCover.hi) }
+export async function fetchLeafType(lat0, lon0, nx, ny, dx, hiF = 0) {
+  const kx = 111320 * Math.cos(lat0 * Math.PI / 180);
+  const ll = (x, y) => [lat0 + y / 111320, lon0 + x / kx];
+  const [laS] = ll(0, -ny * dx / 2), [laN] = ll(0, ny * dx / 2);
+  const loW = ll(-nx * dx / 2, 0)[1], loE = ll(nx * dx / 2, 0)[1];
+  const tiles = [];
+  for (let la = Math.floor(laS / 45) * 45; la < laN; la += 45) for (let lo = Math.floor(loW / 45) * 45; lo < loE; lo += 45) tiles.push([la, lo]);
+  // poziom z pikselem ≈ min(dx/5, punkt gęstej mapy / 2) (pełna rozdzielczość 300 m – 16 200 pikseli na kafel)
+  const needW = 45 * 111320 * Math.max(5, 2 * hiF) / dx;
+  const tok = await cciToken();
+  const got = [];
+  for (const [la, lo] of tiles) {
+    const tiff = await cciTiff(lcName(la, lo), tok);
+    if (!tiff) continue;
+    const n = await tiff.getImageCount();
+    let img = await tiff.getImage(0);
+    for (let i = n - 1; i >= 0; i--) { const im = await tiff.getImage(i); if (im.getWidth() >= needW) { img = im; break; } }
+    const W = img.getWidth(), H = img.getHeight();
+    const x0 = Math.max(0, Math.floor((loW - lo) / 45 * W)), x1 = Math.min(W, Math.ceil((loE - lo) / 45 * W));
+    const y0 = Math.max(0, Math.floor((la + 45 - laN) / 45 * H)), y1 = Math.min(H, Math.ceil((la + 45 - laS) / 45 * H));
+    if (x1 <= x0 || y1 <= y0) continue;
+    const r = await img.readRasters({ window: [x0, y0, x1, y1], samples: [0], interleave: true });
+    got.push({ la, lo, W, H, x0, y0, w: x1 - x0, h: y1 - y0, d: r });
+  }
+  if (!got.length) throw new Error('could not download the leaf-type map');
+  const cls = (la, lo) => {
+    for (const t of got) {
+      if (la < t.la || la >= t.la + 45 || lo < t.lo || lo >= t.lo + 45) continue;
+      const X = Math.floor((lo - t.lo) / 45 * t.W) - t.x0, Y = Math.floor((t.la + 45 - la) / 45 * t.H) - t.y0;
+      return X < 0 || Y < 0 || X >= t.w || Y >= t.h ? 0 : t.d[Y * t.w + X];
+    }
+    return 0;
+  };
+  const ndl = new Float32Array(nx * ny).fill(NaN), sub = [-0.4, -0.2, 0, 0.2, 0.4];
+  for (let j = 0; j < ny; j++) {
+    for (let i = 0; i < nx; i++) {
+      let nN = 0, nB = 0, nM = 0;
+      for (const sy of sub) for (const sx of sub) {
+        const [la, lo] = ll((i + 0.5 + sx - nx / 2) * dx, (j + 0.5 + sy - ny / 2) * dx);
+        const c = leafCode(cls(la, lo));
+        if (c === 1) nN++; else if (c === 0) nB++; else if (c === 2) nM++;
+      }
+      if (nN + nB + nM >= 2) ndl[j * nx + i] = (nN + 0.5 * nM) / (nN + nB + nM);
+    }
+  }
+  let hi = null;
+  if (hiF >= 2) {
+    const W = nx * hiF, H = ny * hiF;
+    hi = new Uint8Array(W * H);
+    for (let j = 0; j < H; j++) {
+      const la = ll(0, ((j + 0.5) / hiF - ny / 2) * dx)[0];
+      for (let i = 0; i < W; i++) hi[j * W + i] = leafCode(cls(la, ll(((i + 0.5) / hiF - nx / 2) * dx, 0)[1]));
+    }
+  }
+  return { ndl, hi };
+}
+
 // Udziały pokrycia w oczkach siatki nx × ny (oczko dx [m], środek lat0, lon0 – jak fetchTerrain):
 // { tree, built, water, wet, valid } – Float32Array (0…1); valid = udział próbek z danymi.
 // hiF ≥ 2 – dodatkowo gęsta mapa klas do obrazu (out.hi: hiF × hiF punktów na oczko, wiersze S→N): 0 otwarte (pola, łąki, krzewy, mokradła),

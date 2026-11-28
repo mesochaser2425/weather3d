@@ -1,6 +1,7 @@
 // Skale kolorów – klasy progowe [od wartości → kolor]: temperatura i punkt rosy, suma opadu, pokrywa śnieżna (cm) – z obrazków
-// użytkownika; wiatr (km/h), natężenie opadu i CAPE – jak na WX Charts (wxcharts.com). Jedna definicja dla mapy (WGSL),
-// legend (CSS) i map rysowanych na CPU (mapa synoptyczna).
+// użytkownika; wiatr (km/h), natężenie opadu i CAPE – jak na WX Charts (wxcharts.com); uskok wiatru, SRH i SCP – jak na Meteologix
+// (obrazki użytkownika). Jedna definicja dla mapy (WGSL), legend (CSS) i map rysowanych na CPU (mapa synoptyczna).
+// step: true – klasy stałe (jeden kolor w klasie, jak na Meteologix); bez – kolor płynnie między progami (kolor progu = kolor klasy).
 
 const hex = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16) / 255);
 
@@ -67,20 +68,38 @@ export const WXS = [
     t: [-2.5, 0, 2.5, 5, 7.5, 10, 12.5, 15, 17.5, 20, 22.5, 25, 27.5, 30, 32.5, 35, 37.5, 40, 42.5, 45, 47.5, 50, 52.5, 55, 57.5, 60, 62.5, 65, 67.5],
     c: ['#ffffff', '#f3eaf8', '#e3d6ea', '#ccc3d5', '#b1b1bb', '#9095a8', '#6c739e', '#48529b', '#232f9f', '#0b47c9', '#0b81fc', '#449ae8',
       '#7cb2d6', '#b4cbc3', '#ece3af', '#e8cb7c', '#e2b347', '#db971d', '#c8691d', '#b53a1e', '#b72428', '#d73643', '#ef3378', '#d21bd2', '#db48db', '#e475e4', '#eda2ed', '#f6d1f6', '#fffeff'] },
+  // uskok wiatru 0–6 i 0–1 km [m/s] – skala Meteologix z obrazka użytkownika (XI 2026): klasy stałe, kolory odczytane z pikseli;
+  // podziałka – co druga granica klas (na Meteologix podpisy na zmianę nad i pod paskiem)
+  { key: 'shear', unit: 'm/s', step: true, tk: [10, 20, 30, 40, 60, 80, 100],
+    t: [0, 5, 10, 15, 20, 25, 30, 35, 40, 50, 60, 70, 80, 90, 100, 120],
+    c: ['#ffffff', '#d3ecff', '#6eb6ff', '#0182ff', '#148f1f', '#1acd04', '#67ef07', '#fff72e', '#eade04', '#ff7d2a', '#f71d55', '#b3050f',
+      '#c200ff', '#e169ff', '#ecabff', '#f3e1f8'] },
+  // SRH 0–3 i 0–1 km [m²/s²] – Meteologix (obrazek użytkownika), klasy stałe; −300 to tylko początek najniższej klasy (< −250)
+  { key: 'srh', unit: 'm²/s²', step: true, tk: [-200, -100, -25, 50, 150, 250, 350, 500, 700, 1000],
+    t: [-300, -250, -200, -150, -100, -50, -25, 25, 50, 100, 150, 200, 250, 300, 350, 400, 500, 600, 700, 800, 1000, 1250, 1500],
+    c: ['#003887', '#006eda', '#0484ff', '#399dff', '#7abcff', '#daefff', '#ffffff', '#abee5c', '#5cec00', '#19c505', '#a1c90f', '#e4d700',
+      '#f7ec1c', '#fca06c', '#f84979', '#f81b52', '#c8050e', '#8b0000', '#670074', '#cc00ff', '#dc63ff', '#f1adff', '#ffffff'] },
+  // SCP (supercell composite parameter) – Meteologix (obrazek użytkownika), klasy stałe; ujemne (lewoskrętne) – biel jak < 0.2
+  { key: 'scp', unit: '', step: true, tk: [0.5, 1, 2, 3, 4, 6, 8, 10, 15, 20, 30, 50],
+    t: [0, 0.2, 0.5, 1, 2, 3, 4, 6, 8, 10, 15, 20, 25, 30, 40, 50],
+    c: ['#ffffff', '#d3ecff', '#6eb6ff', '#0067d4', '#16920d', '#65ec06', '#fff42d', '#e8dc00', '#fd8823', '#f91959', '#870000', '#650086',
+      '#c800ff', '#e169ff', '#ecabff', '#b27550'] },
 ];
 for (const s of WXS) s.rgb = s.c.map(hex);
 export const WX_INDEX = Object.fromEntries(WXS.map((s, i) => [s.key, i]));
 // identyfikatory skal w render.wgsl / fields.js (cmap): 22 + numer skali (0–7); ciśnienie – cmap 40 (30 i 31 zajęte: fronty, typ powierzchni)
 export const WX_CMAP0 = 22;
 export const WX_MSLP = 40;
-export const wxOf = (cm) => (cm === WX_MSLP ? WX_INDEX.mslp : cm >= WX_CMAP0 && cm < WX_CMAP0 + 8 ? cm - WX_CMAP0 : -1);
+// skale Meteologix: cmap 41 uskok wiatru, 42 SRH, 43 SCP (render.wgsl: cmapOf i wxPal z WX_SHEAR, WX_SRH, WX_SCP)
+const WX_EXTRA = { 41: 'shear', 42: 'srh', 43: 'scp' };
+export const wxOf = (cm) => (cm === WX_MSLP ? WX_INDEX.mslp : cm >= WX_CMAP0 && cm < WX_CMAP0 + 8 ? cm - WX_CMAP0 : WX_EXTRA[cm] ? WX_INDEX[WX_EXTRA[cm]] : -1);
 
 // kolor płynnie interpolowany między progami (kolor progu = kolor klasy z WX Charts)
 export function wxColor(key, v) {
   const s = WXS[WX_INDEX[key]];
   let n = 0;
   while (n < s.t.length - 1 && v >= s.t[n + 1]) n++;
-  if (n >= s.t.length - 1) return s.rgb[n];
+  if (n >= s.t.length - 1 || s.step) return s.rgb[n];
   const f = Math.min(1, Math.max(0, (v - s.t[n]) / (s.t[n + 1] - s.t[n])));
   return s.rgb[n].map((c, k) => c + (s.rgb[n + 1][k] - c) * f);
 }
@@ -88,11 +107,14 @@ const rgbCss = (c) => `rgb(${c.map((x) => Math.round(255 * x)).join(',')})`;
 // pasek legendy: równe klasy (jak na WX Charts)
 export function wxLegendCss(i) {
   const s = WXS[i], n = s.rgb.length;
+  if (s.step) return 'linear-gradient(90deg,' + s.rgb.map((c, k) => `${rgbCss(c)} ${(100 * k / n).toFixed(2)}% ${(100 * (k + 1) / n).toFixed(2)}%`).join(',') + ')';
   return 'linear-gradient(90deg,' + s.rgb.map((c, k) => `${rgbCss(c)} ${(100 * k / (n - 1)).toFixed(2)}%`).join(',') + ')';
 }
 // podziałka legendy: co któryś próg (albo wybrane progi tk), położenie na początku klasy
 export function wxTicks(i) {
   const s = WXS[i], n = s.t.length, step = n > 26 ? 3 : 2;
+  // klasy stałe: granica klas k − 1 i k (próg t[k]) w k/n paska
+  if (s.step) return (s.tk || s.t.slice(1)).map((v) => [v, s.t.indexOf(v) / n]);
   if (s.tk) return s.tk.map((v) => [v, s.t.indexOf(v) / (n - 1)]);
   return s.t.map((t, k) => [t, k / (n - 1)]).filter((x, k) => k > 0 && k < n - 1 && k % step === 0);
 }
@@ -100,8 +122,8 @@ export function wxTicks(i) {
 export const WX_WGSL = WXS.map((s, i) => `var<private> WXT${i}: array<f32, ${s.t.length}> = array<f32, ${s.t.length}>(${s.t.map((v) => v.toFixed(2)).join(', ')});\n`
   + `var<private> WXC${i}: array<vec3f, ${s.t.length}> = array<vec3f, ${s.t.length}>(${s.rgb.map((c) => `vec3f(${c.map((x) => x.toFixed(4)).join(', ')})`).join(', ')});\n`).join('')
   + `fn wxPal(p: u32, v: f32) -> vec3f {\n  switch p {\n`
-  + WXS.map((s, i) => `    case ${i}u: { var n = 0u; for (var k = 1u; k < ${s.t.length}u; k++) { if (v >= WXT${i}[k]) { n = k; } } let m = min(n + 1u, ${s.t.length - 1}u); return mix(WXC${i}[n], WXC${i}[m], clamp((v - WXT${i}[n]) / max(WXT${i}[m] - WXT${i}[n], 1e-6), 0.0, 1.0)); }\n`).join('')
+  + WXS.map((s, i) => `    case ${i}u: { var n = 0u; for (var k = 1u; k < ${s.t.length}u; k++) { if (v >= WXT${i}[k]) { n = k; } } `
+    + (s.step ? `return WXC${i}[n]; }\n` : `let m = min(n + 1u, ${s.t.length - 1}u); return mix(WXC${i}[n], WXC${i}[m], clamp((v - WXT${i}[n]) / max(WXT${i}[m] - WXT${i}[n], 1e-6), 0.0, 1.0)); }\n`)).join('')
   + `    default: { return vec3f(0.5); }\n  }\n}\n`
-  + `const WX_RADAR: u32 = ${WX_INDEX.radar}u;
-`
+  + `const WX_RADAR: u32 = ${WX_INDEX.radar}u;\nconst WX_SHEAR: u32 = ${WX_INDEX.shear}u;\nconst WX_SRH: u32 = ${WX_INDEX.srh}u;\nconst WX_SCP: u32 = ${WX_INDEX.scp}u;\n`
   + `fn wxMin(p: u32) -> f32 {\n  switch p {\n` + WXS.map((s, i) => `    case ${i}u: { return ${s.t[0].toFixed(2)}; }\n`).join('') + `    default: { return 0.0; }\n  }\n}\n`;
